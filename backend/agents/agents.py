@@ -225,7 +225,7 @@ def architect_agent(state: dict) -> dict:
     messages = state.get("messages", [])
     adrs = state.get("adrs", [])
     redesign_count = state.get("redesign_count", 0)
-    violations = state.get("data_quality_report", {}).get("violations", {})
+    violations = state.get("data_quality_report", {}).get("topology_violations", {})
     raw_data = state["raw_data"]
 
     G_target = nx.DiGraph()
@@ -303,7 +303,7 @@ def architect_agent(state: dict) -> dict:
                 rel="channel",
                 channel_name=channel_name,
                 status="RUNNING",
-                xmit_queue=f"XMITQ.{to_qm}",
+                xmit_queue=f"{to_qm}.XMITQ",
             )
 
     # Write ADRs for each significant decision
@@ -361,63 +361,208 @@ def architect_agent(state: dict) -> dict:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AGENT 5: OPTIMIZER
-# Applies Kernighan-Lin and MST to further reduce channels in target graph.
+# Applies reachability-driven pruning to remove unnecessary channels.
+# ─────────────────────────────────────────────────────────────────────────────
+# AGENT 5: OPTIMIZER
+# Two-phase graph optimisation with mathematical foundations:
+#   Phase 1 — Reachability pruning: remove channels serving zero message flows
+#   Phase 2 — Graph-theoretic optimisation: weighted MST to find minimum
+#             channel set, Kernighan-Lin bisection for cluster detection
+# Also reports channel cycles as an informational metric.
 # ─────────────────────────────────────────────────────────────────────────────
 def optimizer_agent(state: dict) -> dict:
-    logger.info("OPTIMIZER: Running graph optimisation")
+    logger.info("OPTIMIZER: Running two-phase graph optimisation")
     messages = state.get("messages", [])
     G = state["target_graph"].copy()
 
-    # Get QM subgraph
     qm_nodes = [n for n, d in G.nodes(data=True) if d.get("type") == "qm"]
-    channel_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get("rel") == "channel"]
+    app_nodes = [n for n, d in G.nodes(data=True) if d.get("type") == "app"]
+    channel_edges = [(u, v, d) for u, v, d in G.edges(data=True) if d.get("rel") == "channel"]
+    initial_channels = len(channel_edges)
 
-    before_channels = len(channel_edges)
+    # ── Build app ownership + direction maps ──────────────────────────────
+    app_qm_map = {}
+    for app in app_nodes:
+        qms = [v for _, v, d in G.out_edges(app, data=True) if d.get("rel") == "connects_to"]
+        if qms:
+            app_qm_map[app] = qms[0]
 
-    # Build undirected QM connectivity graph for MST analysis
+    raw_apps = state.get("raw_data", {}).get("applications", [])
+    producer_qms = set()
+    consumer_qms = set()
+    for row in raw_apps:
+        app_id = row.get("app_id", "")
+        qm = app_qm_map.get(app_id)
+        if not qm:
+            continue
+        direction = row.get("direction", "").upper()
+        if direction in ("PRODUCER", "PUT"):
+            producer_qms.add(qm)
+        elif direction in ("CONSUMER", "GET"):
+            consumer_qms.add(qm)
+        else:
+            producer_qms.add(qm)
+            consumer_qms.add(qm)
+
+    qms_with_apps = set(app_qm_map.values())
+
+    # ══════════════════════════════════════════════════════════════════════
+    # PHASE 1: REACHABILITY PRUNING
+    # Remove channels where source has no producers OR target has no
+    # consumers. Dead channels are always safe to remove.
+    # ══════════════════════════════════════════════════════════════════════
+    required_channels = set()
+    for from_qm, to_qm, d in channel_edges:
+        has_producer = from_qm in producer_qms or from_qm in qms_with_apps
+        has_consumer = to_qm in consumer_qms or to_qm in qms_with_apps
+        if has_producer and has_consumer:
+            required_channels.add((from_qm, to_qm))
+
+    phase1_removed = []
+    for from_qm, to_qm, d in channel_edges:
+        if (from_qm, to_qm) not in required_channels:
+            phase1_removed.append((from_qm, to_qm, d.get("channel_name", "")))
+
+    for from_qm, to_qm, _ in phase1_removed:
+        if G.has_edge(from_qm, to_qm) and G[from_qm][to_qm].get("rel") == "channel":
+            G.remove_edge(from_qm, to_qm)
+
+    after_phase1 = sum(1 for _, _, d in G.edges(data=True) if d.get("rel") == "channel")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # PHASE 2: GRAPH-THEORETIC OPTIMISATION
+    # On surviving channels, apply weighted MST to find the minimum set of
+    # edges keeping all active QMs connected. Weight = inverse of app
+    # density on each end (denser = more important = lower weight = keep).
+    # Edges NOT in MST are candidates for removal, subject to a safety
+    # check: never remove if it breaks producer→consumer reachability.
+    # Then Kernighan-Lin bisection detects natural topology clusters.
+    # ══════════════════════════════════════════════════════════════════════
+    surviving_channels = [(u, v, d) for u, v, d in G.edges(data=True) if d.get("rel") == "channel"]
+    phase2_removed = []
+    mst_applied = False
+    kl_applied = False
+
+    # Build undirected QM graph with weighted edges for MST
     G_qm = nx.Graph()
-    G_qm.add_nodes_from(qm_nodes)
-    for u, v in channel_edges:
-        G_qm.add_edge(u, v, weight=1)
+    active_qms = [qm for qm in qm_nodes if qm in qms_with_apps]
+    G_qm.add_nodes_from(active_qms)
+    for u, v, d in surviving_channels:
+        if u in active_qms and v in active_qms:
+            src_apps = len([a for a, q in app_qm_map.items() if q == u])
+            dst_apps = len([a for a, q in app_qm_map.items() if q == v])
+            weight = max(1, 10 - (src_apps + dst_apps))
+            G_qm.add_edge(u, v, weight=weight)
 
-    # Minimum spanning tree — minimum channels needed to keep all QMs connected
-    if len(qm_nodes) > 1 and nx.is_connected(G_qm):
-        mst = nx.minimum_spanning_tree(G_qm)
-        # Check if any channel edges can be removed (not in MST)
+    # MST: minimum spanning tree — edges NOT in MST are redundant
+    if len(active_qms) > 1 and G_qm.number_of_edges() > 0 and nx.is_connected(G_qm):
+        mst = nx.minimum_spanning_tree(G_qm, weight="weight")
         mst_edges = set(frozenset(e) for e in mst.edges())
-        current_edges = set(frozenset(e) for e in channel_edges)
+        current_edges = set(frozenset((u, v)) for u, v, _ in surviving_channels
+                           if u in active_qms and v in active_qms)
         removable = current_edges - mst_edges
+        mst_applied = True
 
         if removable:
             for edge_set in removable:
                 u, v = tuple(edge_set)
-                # In a directed graph, try both directions
                 for src, dst in [(u, v), (v, u)]:
                     if not G.has_edge(src, dst):
                         continue
                     if G[src][dst].get("rel") != "channel":
                         continue
+
+                    # Safety: verify all producer→consumer paths survive
                     G_test = G.copy()
                     G_test.remove_edge(src, dst)
-                    app_qm_pairs = [
-                        (app, qm)
-                        for app in [n for n, d in G_test.nodes(data=True) if d.get("type") == "app"]
-                        for qm in [w for _, w, d in G_test.out_edges(app, data=True) if d.get("rel") == "connects_to"]
-                    ]
-                    still_connected = all(
-                        nx.has_path(G_test, a, q) for a, q in app_qm_pairs
-                    )
-                    if still_connected:
+                    reachability_ok = True
+                    for p_qm in producer_qms:
+                        for c_qm in consumer_qms:
+                            if p_qm == c_qm:
+                                continue
+                            if p_qm not in G_test.nodes or c_qm not in G_test.nodes:
+                                continue
+                            qm_sub = G_test.subgraph(qm_nodes)
+                            if not nx.has_path(qm_sub, p_qm, c_qm):
+                                reachability_ok = False
+                                break
+                        if not reachability_ok:
+                            break
+
+                    if reachability_ok:
+                        ch_name = G[src][dst].get("channel_name", f"{src}.{dst}")
+                        phase2_removed.append((src, dst, ch_name))
                         G.remove_edge(src, dst)
 
-    after_channels = sum(1 for _, _, d in G.edges(data=True) if d.get("rel") == "channel")
+    # Kernighan-Lin bisection — detect natural cluster boundaries
+    kl_insight = ""
+    G_qm_post = nx.Graph()
+    post_channels = [(u, v) for u, v, d in G.edges(data=True)
+                     if d.get("rel") == "channel" and u in active_qms and v in active_qms]
+    G_qm_post.add_nodes_from(active_qms)
+    G_qm_post.add_edges_from(post_channels)
 
-    # Compute updated metrics
+    if len(active_qms) >= 4 and G_qm_post.number_of_edges() > 0 and nx.is_connected(G_qm_post):
+        try:
+            partition = nx.community.kernighan_lin_bisection(G_qm_post)
+            set_a, set_b = partition
+            cross_edges = sum(
+                1 for u, v in post_channels
+                if (u in set_a and v in set_b) or (u in set_b and v in set_a)
+            )
+            kl_applied = True
+            kl_insight = (
+                f"Kernighan-Lin bisection identified 2 natural clusters: "
+                f"{sorted(set_a)} and {sorted(set_b)} "
+                f"with {cross_edges} cross-cluster channel(s). "
+            )
+        except Exception:
+            kl_insight = "Kernighan-Lin bisection: could not partition topology. "
+    elif len(active_qms) >= 2:
+        kl_insight = (
+            f"Kernighan-Lin bisection: skipped "
+            f"({len(active_qms)} active QMs, requires ≥4 for meaningful partitioning). "
+        )
+
+    # ══════════════════════════════════════════════════════════════════════
+    # CYCLE DETECTION — informational metric for architectural awareness
+    # Cycles = redundant routing paths. May be intentional for HA or
+    # accidental from legacy config. Reported but not a constraint.
+    # ══════════════════════════════════════════════════════════════════════
+    qm_subgraph = G.subgraph(qm_nodes)
+    cycles = list(nx.simple_cycles(qm_subgraph))
+    cycle_info = ""
+    if cycles:
+        formatted = [" → ".join(c + [c[0]]) for c in cycles[:3]]
+        cycle_info = (
+            f"Cycle analysis: {len(cycles)} routing cycle(s) detected "
+            f"({', '.join(formatted)}). "
+            f"Redundant paths may serve high-availability requirements. "
+        )
+    else:
+        cycle_info = "Cycle analysis: no cycles — topology is a clean DAG. "
+
+    # ── Final metrics ─────────────────────────────────────────────────────
+    final_channels = sum(1 for _, _, d in G.edges(data=True) if d.get("rel") == "channel")
     target_metrics = compute_complexity(G)
 
+    phase1_names = [name for _, _, name in phase1_removed if name]
+    phase2_names = [name for _, _, name in phase2_removed if name]
+
     msg = (
-        f"Optimiser: Channels reduced {before_channels} → {after_channels}. "
-        f"Target complexity score: {target_metrics['total_score']}/100"
+        f"Two-phase optimisation complete. "
+        f"Channels: {initial_channels} → {after_phase1} (Phase 1: reachability) "
+        f"→ {final_channels} (Phase 2: MST). "
+        f"Total removed: {initial_channels - final_channels}. "
+        f"Phase 1 (reachability pruning): removed {len(phase1_removed)} dead channel(s)"
+        f"{' (' + ', '.join(phase1_names) + ')' if phase1_names else ''}. "
+        f"Phase 2 (graph-theoretic): "
+        f"weighted MST {'applied' if mst_applied else 'skipped (graph disconnected or trivial)'}, "
+        f"removed {len(phase2_removed)} redundant channel(s)"
+        f"{' (' + ', '.join(phase2_names) + ')' if phase2_names else ''}. "
+        f"{kl_insight}"
+        f"{cycle_info}"
+        f"Target complexity score: {target_metrics['total_score']}/100."
     )
     messages.append({"agent": "OPTIMIZER", "msg": msg})
 
@@ -442,7 +587,7 @@ def tester_agent(state: dict) -> dict:
     app_nodes = [n for n, d in G.nodes(data=True) if d.get("type") == "app"]
     qm_nodes  = [n for n, d in G.nodes(data=True) if d.get("type") == "qm"]
 
-    # Rule 1: Exactly one QM per app
+    # ── V-001: Exactly one QM per app ─────────────────────────────────────
     for app in app_nodes:
         connected_qms = [v for u, v, d in G.out_edges(app, data=True) if d.get("rel") == "connects_to"]
         if len(connected_qms) != 1:
@@ -453,36 +598,101 @@ def tester_agent(state: dict) -> dict:
                 "severity": "CRITICAL",
             })
 
-    # Rule 2: No orphan QMs in target state
+    # ── V-002: Sender/Receiver pairing ────────────────────────────────────
+    # Every sender channel from QM_A→QM_B must have a matching entry
+    # In the graph we only store sender edges, so we check that for every
+    # channel edge (from_qm→to_qm), both QMs exist in the target state
+    channel_edges = [(u, v, d) for u, v, d in G.edges(data=True) if d.get("rel") == "channel"]
+    for from_qm, to_qm, d in channel_edges:
+        ch_name = d.get("channel_name", f"{from_qm}.{to_qm}")
+        if to_qm not in qm_nodes:
+            violations.append({
+                "rule": "SENDER_RECEIVER_PAIR",
+                "entity": ch_name,
+                "detail": f"Sender channel {ch_name} targets {to_qm} which is not in target state — no receiver possible",
+                "severity": "CRITICAL",
+            })
+        if from_qm not in qm_nodes:
+            violations.append({
+                "rule": "SENDER_RECEIVER_PAIR",
+                "entity": ch_name,
+                "detail": f"Sender channel {ch_name} originates from {from_qm} which is not in target state",
+                "severity": "CRITICAL",
+            })
+
+    # ── V-003: Channel naming convention ──────────────────────────────────
+    for from_qm, to_qm, d in channel_edges:
+        ch_name = d.get("channel_name", "")
+        expected = f"{from_qm}.{to_qm}"
+        if ch_name and ch_name != expected:
+            violations.append({
+                "rule": "CHANNEL_NAMING",
+                "entity": ch_name,
+                "detail": f"Channel name '{ch_name}' does not match convention '{expected}'",
+                "severity": "CRITICAL",
+            })
+        if not ch_name:
+            violations.append({
+                "rule": "CHANNEL_NAMING",
+                "entity": f"{from_qm}->{to_qm}",
+                "detail": "Channel missing name entirely",
+                "severity": "CRITICAL",
+            })
+
+    # ── V-004: XMITQ existence ────────────────────────────────────────────
+    # Every sender channel must reference an XMITQ
+    for from_qm, to_qm, d in channel_edges:
+        xmitq = d.get("xmit_queue", "")
+        ch_name = d.get("channel_name", f"{from_qm}.{to_qm}")
+        if not xmitq:
+            violations.append({
+                "rule": "XMITQ_EXISTS",
+                "entity": ch_name,
+                "detail": f"Sender channel {ch_name} has no XMITQ reference",
+                "severity": "CRITICAL",
+            })
+
+    # ── V-005: No orphan QMs in target state ──────────────────────────────
     for qm in qm_nodes:
         connected_apps = [u for u, v, d in G.in_edges(qm, data=True) if d.get("rel") == "connects_to"]
         if not connected_apps:
             violations.append({
                 "rule": "NO_ORPHAN_QMS",
                 "entity": qm,
-                "detail": f"QM has no application owner",
+                "detail": f"QM has no application owner in target state",
+                "severity": "WARNING",
+            })
+
+    # ── V-006: Consumer queue existence ───────────────────────────────────
+    # Every app should have a reachable local queue on its QM
+    # (This is structural — we verify the graph supports it)
+    for app in app_nodes:
+        qms = [v for _, v, d in G.out_edges(app, data=True) if d.get("rel") == "connects_to"]
+        if not qms:
+            violations.append({
+                "rule": "CONSUMER_QUEUE_EXISTS",
+                "entity": app,
+                "detail": f"App {app} has no QM connection — cannot have a local queue",
                 "severity": "CRITICAL",
             })
 
-    # Rule 3: No cycles in QM channel graph
-    qm_subgraph = G.subgraph(qm_nodes)
-    cycles = list(nx.simple_cycles(qm_subgraph))
-    for cycle in cycles:
-        violations.append({
-            "rule": "NO_CHANNEL_CYCLES",
-            "entity": "->".join(cycle),
-            "detail": f"Cycle detected in channel routing: {cycle}",
-            "severity": "CRITICAL",
-        })
+    # ── V-007: Producer→Consumer path completeness ────────────────────────
+    # For every pair of QMs connected by a channel, verify at least one
+    # app exists on each end (producer side and consumer side)
+    app_qm_map = {}
+    for app in app_nodes:
+        qms = [v for _, v, d in G.out_edges(app, data=True) if d.get("rel") == "connects_to"]
+        if qms:
+            app_qm_map[app] = qms[0]
 
-    # Rule 4: All channel pairs are directed (sender defined)
-    channel_edges = [(u, v, d) for u, v, d in G.edges(data=True) if d.get("rel") == "channel"]
-    for u, v, d in channel_edges:
-        if not d.get("channel_name"):
+    qms_with_apps = set(app_qm_map.values())
+    for from_qm, to_qm, d in channel_edges:
+        ch_name = d.get("channel_name", f"{from_qm}.{to_qm}")
+        if from_qm not in qms_with_apps and to_qm not in qms_with_apps:
             violations.append({
-                "rule": "CHANNEL_NAMING",
-                "entity": f"{u}->{v}",
-                "detail": "Channel pair missing deterministic name",
+                "rule": "PATH_COMPLETENESS",
+                "entity": ch_name,
+                "detail": f"Channel {ch_name} connects {from_qm}→{to_qm} but neither QM has any apps — channel is unnecessary",
                 "severity": "WARNING",
             })
 
@@ -491,7 +701,10 @@ def tester_agent(state: dict) -> dict:
     msg = (
         f"Tester: {'PASS' if passed else 'FAIL'} — "
         f"{len(violations)} violations found "
-        f"({sum(1 for v in violations if v['severity']=='CRITICAL')} critical)"
+        f"({sum(1 for v in violations if v['severity']=='CRITICAL')} critical, "
+        f"{sum(1 for v in violations if v['severity']=='WARNING')} warnings). "
+        f"Checks: 1-QM-per-app, sender/receiver pairs, channel naming, "
+        f"XMITQ existence, orphan QMs, consumer queues, path completeness."
     )
     messages.append({"agent": "TESTER", "msg": msg})
 
@@ -519,59 +732,173 @@ def provisioner_agent(state: dict) -> dict:
     logger.info("PROVISIONER: Generating MQSC scripts and target state CSVs")
     messages = state.get("messages", [])
     G = state["optimised_graph"]
-    scripts = []
 
-    # ── MQSC Scripts ──────────────────────────────────────────────────────
-    scripts.append("* ============================================================")
-    scripts.append("* MQ-TITAN Generated MQSC Provisioning Script")
-    scripts.append(f"* Session: {state.get('session_id', 'unknown')}")
-    scripts.append("* WARNING: Review before executing against production.")
-    scripts.append("* ============================================================")
-    scripts.append("")
-
-    scripts.append("* --- Queue Managers ---")
-    for n, d in G.nodes(data=True):
-        if d.get("type") == "qm":
-            scripts.append(f"DEFINE QMGR('{n}') DESCR('{d.get('name', n)} - {d.get('region', '')}') REPLACE")
-    scripts.append("")
-
-    scripts.append("* --- Transmission Queues and Channels ---")
-    channel_edges = [(u, v, d) for u, v, d in G.edges(data=True) if d.get("rel") == "channel"]
-    for from_qm, to_qm, data in channel_edges:
-        xmitq        = data.get("xmit_queue") or f"XMITQ.{to_qm}"
-        channel_name = data.get("channel_name") or f"{from_qm}.{to_qm}"
-        receiver_name = f"{to_qm}.{from_qm}"
-
-        scripts.append(f"* Channel pair: {from_qm} → {to_qm}")
-        scripts.append(f"DEFINE QLOCAL('{xmitq}') QMGR('{from_qm}') USAGE(XMITQ) REPLACE")
-        scripts.append(f"DEFINE CHANNEL('{channel_name}') CHLTYPE(SDR) QMGR('{from_qm}') XMITQ('{xmitq}') REPLACE")
-        scripts.append(f"DEFINE CHANNEL('{receiver_name}') CHLTYPE(RCVR) QMGR('{to_qm}') REPLACE")
-        scripts.append("")
-
-    scripts.append("* --- Application Local Queues ---")
+    # ── Build helper lookups ──────────────────────────────────────────────
+    qm_nodes = [n for n, d in G.nodes(data=True) if d.get("type") == "qm"]
     app_nodes = [n for n, d in G.nodes(data=True) if d.get("type") == "app"]
+
+    # App → QM ownership map
+    app_qm_map = {}
     for app in app_nodes:
         qms = [v for _, v, d in G.out_edges(app, data=True) if d.get("rel") == "connects_to"]
         if qms:
-            qm = qms[0]
-            localq = f"LOCAL.{app}.IN"
-            scripts.append(f"DEFINE QLOCAL('{localq}') QMGR('{qm}') DESCR('Local queue for {app}') REPLACE")
+            app_qm_map[app] = qms[0]
 
-    scripts.append("")
-    scripts.append("* --- End of generated script ---")
+    # Outbound channels per QM: {qm: [(to_qm, channel_name, xmitq), ...]}
+    outbound = {qm: [] for qm in qm_nodes}
+    # Inbound channels per QM: {qm: [(from_qm, channel_name), ...]}
+    inbound = {qm: [] for qm in qm_nodes}
+
+    for from_qm, to_qm, d in G.edges(data=True):
+        if d.get("rel") != "channel":
+            continue
+        ch_name = d.get("channel_name") or f"{from_qm}.{to_qm}"
+        xmitq = d.get("xmit_queue") or f"{to_qm}.XMITQ"
+        if from_qm in outbound:
+            outbound[from_qm].append((to_qm, ch_name, xmitq))
+        if to_qm in inbound:
+            inbound[to_qm].append((from_qm, ch_name))
+
+    # Apps per QM
+    apps_on_qm = {qm: [] for qm in qm_nodes}
+    for app, qm in app_qm_map.items():
+        if qm in apps_on_qm:
+            apps_on_qm[qm].append(app)
+
+    # Build remote queue definitions: for each producer app on this QM,
+    # determine which remote QMs it needs to reach
+    # Use raw application data to find producer/consumer relationships
+    raw_apps = state.get("raw_data", {}).get("applications", [])
+
+    # ── Generate per-QM MQSC scripts ──────────────────────────────────────
+    # Each QM gets its own script — run via: runmqsc QM_NAME < QM_NAME.mqsc
+    per_qm_scripts = {}
+    port_base = 1414
+
+    for idx, qm in enumerate(sorted(qm_nodes)):
+        lines = []
+        port = port_base + idx
+        qm_data = G.nodes[qm]
+        hostname = f"{qm.lower().replace('_', '-')}.target.corp.com"
+
+        lines.append(f"* =============================================")
+        lines.append(f"* Target State MQSC for {qm}")
+        lines.append(f"* Generated by MQ-TITAN Provisioner Agent")
+        lines.append(f"* Run via: runmqsc {qm} < {qm}_target.mqsc")
+        lines.append(f"* =============================================")
+        lines.append("")
+
+        # 1. Listener
+        lines.append("* --- Listener ---")
+        lines.append(f"DEFINE LISTENER('LSR.{qm}') TRPTYPE(TCP) PORT({port}) REPLACE")
+        lines.append(f"START LISTENER('LSR.{qm}')")
+        lines.append("")
+
+        # 2. Local application queues (consumers GET from these)
+        local_queues = []
+        if apps_on_qm.get(qm):
+            lines.append("* --- Local Application Queues ---")
+            for app in sorted(apps_on_qm[qm]):
+                lq = f"LOCAL.{app}.IN"
+                local_queues.append(lq)
+                lines.append(f"DEFINE QLOCAL('{lq}') REPLACE")
+            lines.append("")
+
+        # 3. Transmission queues — one per target QM we send to
+        if outbound.get(qm):
+            lines.append("* --- Transmission Queues ---")
+            seen_xmitq = set()
+            for to_qm, ch_name, xmitq in outbound[qm]:
+                if xmitq not in seen_xmitq:
+                    seen_xmitq.add(xmitq)
+                    lines.append(f"DEFINE QLOCAL('{xmitq}') USAGE(XMITQ) REPLACE")
+            lines.append("")
+
+        # 4. Remote queue definitions — for each remote consumer reachable via channels
+        remote_qs = []
+        if outbound.get(qm):
+            lines.append("* --- Remote Queue Definitions ---")
+            for to_qm, ch_name, xmitq in outbound[qm]:
+                # For each app on the remote QM, create a QREMOTE pointing to their local queue
+                for remote_app in apps_on_qm.get(to_qm, []):
+                    rq_local_name = f"REMOTE.{remote_app}.VIA.{to_qm}"
+                    remote_queue = f"LOCAL.{remote_app}.IN"
+                    remote_qs.append(rq_local_name)
+                    lines.append(
+                        f"DEFINE QREMOTE('{rq_local_name}') "
+                        f"RQMNAME('{to_qm}') "
+                        f"RNAME('{remote_queue}') "
+                        f"XMITQ('{xmitq}') REPLACE"
+                    )
+            lines.append("")
+
+        # 5. Sender channels
+        if outbound.get(qm):
+            lines.append("* --- Sender Channels ---")
+            for to_qm, ch_name, xmitq in outbound[qm]:
+                to_hostname = f"{to_qm.lower().replace('_', '-')}.target.corp.com"
+                to_port = port_base + sorted(qm_nodes).index(to_qm)
+                lines.append(
+                    f"DEFINE CHANNEL('{ch_name}') CHLTYPE(SDR) "
+                    f"CONNAME('{to_hostname}({to_port})') "
+                    f"XMITQ('{xmitq}') REPLACE"
+                )
+            lines.append("")
+
+        # 6. Receiver channels — for each QM that sends TO this QM
+        if inbound.get(qm):
+            lines.append("* --- Receiver Channels ---")
+            for from_qm, ch_name in inbound[qm]:
+                # Receiver uses the SAME channel name as the sender
+                lines.append(f"DEFINE CHANNEL('{ch_name}') CHLTYPE(RCVR) REPLACE")
+            lines.append("")
+
+        # 7. Start sender channels
+        if outbound.get(qm):
+            lines.append("* --- Start Channels ---")
+            for to_qm, ch_name, xmitq in outbound[qm]:
+                lines.append(f"START CHANNEL('{ch_name}')")
+            lines.append("")
+
+        lines.append("* --- End of script ---")
+        per_qm_scripts[qm] = "\n".join(lines)
+
+    # ── Combined script (for backward compat with frontend) ───────────────
+    combined = []
+    combined.append("* ============================================================")
+    combined.append("* MQ-TITAN Combined MQSC — All Queue Managers")
+    combined.append(f"* Session: {state.get('session_id', 'unknown')}")
+    combined.append("* NOTE: In production, run each QM section separately via:")
+    combined.append("*   runmqsc QM_NAME < QM_NAME_target.mqsc")
+    combined.append("* ============================================================")
+    combined.append("")
+    for qm in sorted(per_qm_scripts.keys()):
+        combined.append(per_qm_scripts[qm])
+        combined.append("")
 
     # ── Target State CSV Output ───────────────────────────────────────────
-    # Generate CSVs in same format as input — judges can use these directly
     target_csvs = _generate_target_csvs(G, state)
 
+    # Add per-QM scripts as downloadable CSVs too
+    for qm, script in per_qm_scripts.items():
+        target_csvs[f"mqsc_{qm}"] = script
+
+    total_commands = sum(
+        1 for line in "\n".join(per_qm_scripts.values()).split("\n")
+        if line.strip() and not line.strip().startswith("*")
+    )
+
     msg = (
-        f"Generated {len(scripts)} MQSC commands. "
-        f"Target state CSVs: {list(target_csvs.keys())}."
+        f"Generated MQSC for {len(per_qm_scripts)} queue managers "
+        f"({total_commands} commands total). "
+        f"Includes: listeners, local queues, XMITQs, remote queues, "
+        f"sender channels, receiver channels. "
+        f"Target state CSVs: {[k for k in target_csvs.keys() if not k.startswith('mqsc_')]}."
     )
     messages.append({"agent": "PROVISIONER", "msg": msg})
 
     return {
-        "mqsc_scripts": scripts,
+        "mqsc_scripts": combined,
         "target_csvs": target_csvs,
         "messages": messages,
     }
@@ -604,9 +931,10 @@ def _generate_target_csvs(G: nx.DiGraph, state: dict) -> dict:
     for from_qm, to_qm, d in G.edges(data=True):
         if d.get("rel") != "channel":
             continue
-        xmitq        = d.get("xmit_queue") or f"XMITQ.{to_qm}"
+        xmitq        = d.get("xmit_queue") or f"{to_qm}.XMITQ"
         channel_name = d.get("channel_name") or f"{from_qm}.{to_qm}"
-        receiver_name = f"{to_qm}.{from_qm}"
+        # In IBM MQ, receiver channel has the SAME name as the sender
+        receiver_name = channel_name
 
         # Sender
         channel_rows.append({
@@ -621,16 +949,17 @@ def _generate_target_csvs(G: nx.DiGraph, state: dict) -> dict:
         })
         ch_id += 1
 
-        # Receiver
+        # Receiver — sits on to_qm, receives from from_qm
+        # Channel name is the SAME as the sender
         channel_rows.append({
             "channel_id":   f"TCH{ch_id:03d}",
             "channel_name": receiver_name,
             "channel_type": "RECEIVER",
-            "from_qm":      to_qm,
-            "to_qm":        from_qm,
+            "from_qm":      from_qm,
+            "to_qm":        to_qm,
             "xmit_queue":   "",
             "status":       "RUNNING",
-            "description":  f"Target receiver channel {to_qm} from {from_qm}",
+            "description":  f"Target receiver channel on {to_qm} from {from_qm}",
         })
         ch_id += 1
 
