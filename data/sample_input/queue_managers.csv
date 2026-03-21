@@ -1,0 +1,12 @@
+qm_id,qm_name,region,host,description
+QM_PAYMENTS_01,Payments Primary,EAST,pay-host-01.corp.com,Core payments processing QM
+QM_PAYMENTS_02,Payments Secondary,EAST,pay-host-02.corp.com,Payments overflow QM - legacy
+QM_ORDERS_01,Orders Manager,WEST,ord-host-01.corp.com,Order management QM
+QM_ORDERS_02,Orders Secondary,WEST,ord-host-02.corp.com,Duplicate orders QM - unused
+QM_INVENTORY_01,Inventory QM,CENTRAL,inv-host-01.corp.com,Inventory updates QM
+QM_NOTIFICATIONS_01,Notifications QM,EAST,notif-host-01.corp.com,Customer notifications
+QM_FRAUD_01,Fraud Detection QM,EAST,fraud-host-01.corp.com,Fraud detection service
+QM_AUDIT_01,Audit QM,CENTRAL,audit-host-01.corp.com,Audit trail and compliance
+QM_LEGACY_01,Legacy Integration QM,CENTRAL,legacy-host-01.corp.com,Old mainframe bridge - orphan
+QM_REPORTING_01,Reporting QM,WEST,report-host-01.corp.com,Analytics and reporting
+QM_SHARED_01,Shared Services QM,CENTRAL,shared-host-01.corp.com,Shared by multiple apps - violation

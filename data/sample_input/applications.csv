@@ -1,0 +1,17 @@
+app_id,app_name,qm_id,direction,queue_id,description
+APP_PAY_PROCESSOR,Payment Processor,QM_PAYMENTS_01,PRODUCER,Q002,Sends payment requests to orders
+APP_PAY_PROCESSOR,Payment Processor,QM_PAYMENTS_01,CONSUMER,Q001,Receives payment confirmations
+APP_PAY_PROCESSOR,QM_PAYMENTS_02,QM_PAYMENTS_02,PRODUCER,Q006,Legacy duplicate connection - violation
+APP_ORDER_MGR,Order Manager,QM_ORDERS_01,CONSUMER,Q008,Receives payment requests
+APP_ORDER_MGR,Order Manager,QM_ORDERS_01,PRODUCER,Q009,Sends inventory updates
+APP_ORDER_MGR,Order Manager,QM_ORDERS_01,PRODUCER,Q011,Sends notifications
+APP_INVENTORY,Inventory Service,QM_INVENTORY_01,CONSUMER,Q014,Receives inventory updates
+APP_INVENTORY,Inventory Service,QM_INVENTORY_01,PRODUCER,Q015,Sends to reporting
+APP_NOTIFICATIONS,Notification Service,QM_NOTIFICATIONS_01,CONSUMER,Q017,Receives notification requests
+APP_FRAUD_DETECTOR,Fraud Detector,QM_FRAUD_01,CONSUMER,Q018,Receives transactions to check
+APP_FRAUD_DETECTOR,Fraud Detector,QM_FRAUD_01,PRODUCER,Q019,Sends results back to payments
+APP_FRAUD_DETECTOR,Fraud Detector,QM_SHARED_01,CONSUMER,Q023,Also reads from shared QM - violation
+APP_AUDITOR,Audit Service,QM_AUDIT_01,CONSUMER,Q021,Consumes all audit events
+APP_REPORTER,Reporting Service,QM_REPORTING_01,CONSUMER,Q022,Consumes reporting data
+APP_X,App X Service,QM_SHARED_01,PRODUCER,Q023,Produces to shared QM
+APP_Y,App Y Service,QM_SHARED_01,PRODUCER,Q024,Also produces to shared QM - violation
