@@ -45,6 +45,7 @@ class MQTitanState(TypedDict):
     adrs: Optional[list]               # list[ADR]
     redesign_count: int
     human_feedback: Optional[str]      # feedback from human rejection
+    architect_method: Optional[str]    # "llm" or "rules_fallback" — tracks which path was used
 
     # ── Optimizer output ───────────────────────────────
     optimised_graph: Optional[Any]     # nx.DiGraph
@@ -57,10 +58,15 @@ class MQTitanState(TypedDict):
     # ── Human review gate ──────────────────────────────
     awaiting_human_review: bool        # True when pipeline is paused
     human_approved: Optional[bool]     # True=approved False=rejected None=pending
+    human_aborted: Optional[bool]      # True = human killed the pipeline entirely
 
     # ── Provisioner output ─────────────────────────────
     mqsc_scripts: Optional[list]
     target_csvs: Optional[dict]
+
+    # ── Migration Planner output ───────────────────────
+    migration_plan: Optional[dict]     # Ordered steps with forward/rollback MQSC
+    topology_diff: Optional[dict]      # Before/after diff for review panel
 
     # ── Doc Expert output ──────────────────────────────
     final_report: Optional[str]

@@ -59,7 +59,8 @@ responses: dict = {}       # session_id -> API response (for GET endpoints)
 # ── Pydantic model for review submission ─────────────────────────────────────
 class ReviewDecision(BaseModel):
     approved: bool
-    feedback: Optional[str] = ""   # required if approved=False
+    abort: bool = False            # True = stop pipeline entirely, generate failure report
+    feedback: Optional[str] = ""   # required if approved=False and abort=False
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -85,6 +86,10 @@ def _build_response(session_id: str, result: dict) -> dict:
         "data_quality":          result.get("data_quality_report", {}),
         "awaiting_human_review": result.get("awaiting_human_review", False),
         "human_approved":        result.get("human_approved"),
+        "human_aborted":         result.get("human_aborted", False),
+        "architect_method":      result.get("architect_method"),
+        "migration_plan":        result.get("migration_plan"),
+        "topology_diff":         result.get("topology_diff"),
     })
 
 
@@ -209,21 +214,19 @@ def get_pending_review(session_id: str):
 
     asis   = result.get("as_is_metrics", {}) or {}
     target = result.get("target_metrics", {}) or {}
-    before = asis.get("total_score", 0)
-    after  = target.get("total_score", 0)
-    pct    = round(((before - after) / before) * 100, 1) if before else 0
 
     return sanitise({
         "session_id":            session_id,
         "awaiting_human_review": True,
         "as_is_metrics":         asis,
         "target_metrics":        target,
-        "complexity_reduction":  {"before": before, "after": after, "reduction_pct": pct},
+        "complexity_reduction":  _calc_reduction(result),
         "adrs":                  result.get("adrs", []),
         "constraint_violations": result.get("constraint_violations", []),
         "validation_passed":     result.get("validation_passed"),
         "redesign_count":        result.get("redesign_count", 0),
         "agent_trace":           result.get("messages", []),
+        "architect_method":      result.get("architect_method"),
         "as_is_graph":           graph_to_dict(result["as_is_graph"])     if result.get("as_is_graph")     else {},
         "target_graph":          graph_to_dict(result["optimised_graph"]) if result.get("optimised_graph") else {},
     })
@@ -232,10 +235,11 @@ def get_pending_review(session_id: str):
 @app.post("/api/review/{session_id}")
 def submit_review(session_id: str, decision: ReviewDecision):
     """
-    Human submits approve or reject decision.
+    Human submits one of three decisions:
 
-    Approve:  pipeline continues → provisioner → doc_expert → returns final output
-    Reject:   feedback injected into state → reruns from architect → pauses again at review gate
+    Approve:  pipeline continues → provisioner → migration_planner → doc_expert → final output
+    Revise:   feedback injected → reruns from architect → pauses again at review gate
+    Abort:    pipeline stops → doc_expert generates failure/cancellation report → final output
     """
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -245,12 +249,13 @@ def submit_review(session_id: str, decision: ReviewDecision):
     if not result.get("awaiting_human_review"):
         raise HTTPException(status_code=400, detail="Session is not awaiting human review")
 
-    if not decision.approved and not decision.feedback:
-        raise HTTPException(status_code=400, detail="Rejection requires a feedback reason")
+    if not decision.approved and not decision.abort and not decision.feedback:
+        raise HTTPException(status_code=400, detail="Revision requires a feedback reason")
 
     # Inject human decision into stored state
     result["human_approved"]        = decision.approved
     result["human_feedback"]        = decision.feedback or ""
+    result["human_aborted"]         = decision.abort
     result["awaiting_human_review"] = False
 
     # Resume pipeline from human_review node
