@@ -1,181 +1,602 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import * as d3 from "d3";
 
 const API = "http://localhost:8000";
 
-// ── Colour map by node type ──────────────────────────────────────────────
-const NODE_COLOR = {
-  qm:    "#185FA5",
-  app:   "#1D9E75",
-  queue: "#BA7517",
+
+
+const T = {
+  // Core palette
+  bg0: "#0B0E11",        // deepest black-blue
+  bg1: "#111519",        // panels
+  bg2: "#181D23",        // cards
+  bg3: "#1F262E",        // elevated cards / hover
+  bg4: "#283140",        // active states
+  border0: "#1E2530",    // subtle
+  border1: "#2A3545",    // visible
+  border2: "#3A4A5C",    // prominent
+
+  // Text
+  t1: "#F0F2F4",         // primary
+  t2: "#A0AABB",         // secondary
+  t3: "#5E6D80",         // tertiary
+  t4: "#3A4A5C",         // disabled
+
+  // Accents
+  cyan: "#00D4FF",
+  cyanDim: "#00A0CC",
+  cyanBg: "rgba(0,212,255,0.08)",
+  cyanBorder: "rgba(0,212,255,0.2)",
+  green: "#00E08A",
+  greenDim: "#00B870",
+  greenBg: "rgba(0,224,138,0.08)",
+  greenBorder: "rgba(0,224,138,0.2)",
+  red: "#FF4466",
+  redDim: "#CC3355",
+  redBg: "rgba(255,68,102,0.08)",
+  redBorder: "rgba(255,68,102,0.2)",
+  amber: "#FFB020",
+  amberDim: "#CC8C18",
+  amberBg: "rgba(255,176,32,0.08)",
+  amberBorder: "rgba(255,176,32,0.2)",
+  purple: "#A78BFA",
+  purpleBg: "rgba(167,139,250,0.08)",
+
+  // Typography
+  fontMono: "'JetBrains Mono', 'Fira Code', 'SF Mono', 'Cascadia Code', monospace",
+  fontSans: "'DM Sans', 'General Sans', system-ui, -apple-system, sans-serif",
+  fontDisplay: "'Space Grotesk', 'Outfit', 'DM Sans', system-ui, sans-serif",
+
+  // Radii
+  r1: "6px",
+  r2: "10px",
+  r3: "14px",
+
+  // Shadows
+  glow: (c, a = 0.3) => `0 0 20px rgba(${c},${a}), 0 0 60px rgba(${c},${a * 0.5})`,
+  shadow1: "0 1px 3px rgba(0,0,0,0.4), 0 1px 2px rgba(0,0,0,0.3)",
+  shadow2: "0 4px 16px rgba(0,0,0,0.5), 0 2px 4px rgba(0,0,0,0.3)",
+  shadow3: "0 12px 40px rgba(0,0,0,0.6), 0 4px 12px rgba(0,0,0,0.4)",
 };
 
-// ── D3 Force Graph Component ─────────────────────────────────────────────
-function TopologyGraph({ graphData, title, height = 340 }) {
+// Inject fonts & global styles
+const STYLE_TAG = `
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700&family=JetBrains+Mono:wght@300;400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { font-size: 14px; }
+body {
+  background: ${T.bg0};
+  color: ${T.t1};
+  font-family: ${T.fontSans};
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow-x: hidden;
+}
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: ${T.border2}; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: ${T.t3}; }
+::selection { background: rgba(0,212,255,0.25); }
+
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+@keyframes slideIn {
+  from { opacity: 0; transform: translateX(-8px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+@keyframes scaleIn {
+  from { opacity: 0; transform: scale(0.95); }
+  to { opacity: 1; transform: scale(1); }
+}
+@keyframes countUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes borderGlow {
+  0%, 100% { border-color: rgba(0,212,255,0.2); }
+  50% { border-color: rgba(0,212,255,0.5); }
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+`;
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   UTILITY COMPONENTS
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function Badge({ children, color = T.cyan, bg, style = {} }) {
+  return (
+    <span style={{
+      display: "inline-flex", alignItems: "center", gap: 4,
+      padding: "2px 8px", borderRadius: 20,
+      fontSize: 11, fontWeight: 600, letterSpacing: "0.02em",
+      fontFamily: T.fontMono,
+      color,
+      background: bg || `${color}15`,
+      border: `1px solid ${color}30`,
+      ...style,
+    }}>{children}</span>
+  );
+}
+
+function Stat({ label, value, color = T.t1, sub, delay = 0 }) {
+  return (
+    <div style={{
+      animation: `countUp 0.5s ease-out ${delay}s both`,
+      textAlign: "center", padding: "16px 12px",
+    }}>
+      <div style={{
+        fontSize: 32, fontWeight: 700, fontFamily: T.fontDisplay,
+        color, lineHeight: 1,
+        textShadow: color !== T.t1 ? `0 0 30px ${color}40` : "none",
+      }}>{value}</div>
+      {sub && <div style={{ fontSize: 11, color: T.t3, fontFamily: T.fontMono, marginTop: 4 }}>{sub}</div>}
+      <div style={{ fontSize: 11, color: T.t3, marginTop: 6, fontWeight: 500, textTransform: "uppercase", letterSpacing: "0.08em" }}>{label}</div>
+    </div>
+  );
+}
+
+function Card({ children, style = {}, glow, hover, delay = 0, ...props }) {
+  return (
+    <div style={{
+      background: T.bg2,
+      border: `1px solid ${glow ? `${glow}30` : T.border0}`,
+      borderRadius: T.r2,
+      overflow: "hidden",
+      animation: `fadeUp 0.4s ease-out ${delay}s both`,
+      boxShadow: glow ? `0 0 20px ${glow}10` : T.shadow1,
+      transition: "border-color 0.2s, box-shadow 0.2s",
+      ...style,
+    }} {...props}>{children}</div>
+  );
+}
+
+function CardHeader({ children, right, style = {} }) {
+  return (
+    <div style={{
+      padding: "12px 16px",
+      borderBottom: `1px solid ${T.border0}`,
+      display: "flex", alignItems: "center", justifyContent: "space-between",
+      background: `${T.bg3}60`,
+      ...style,
+    }}>
+      <span style={{ fontSize: 12, fontWeight: 600, color: T.t2, textTransform: "uppercase", letterSpacing: "0.06em" }}>{children}</span>
+      {right && <span>{right}</span>}
+    </div>
+  );
+}
+
+function ProgressBar({ value, max = 100, color = T.cyan, height = 4 }) {
+  const pct = Math.min((value / max) * 100, 100);
+  return (
+    <div style={{ height, background: T.bg4, borderRadius: height / 2, overflow: "hidden" }}>
+      <div style={{
+        width: `${pct}%`, height: "100%",
+        background: `linear-gradient(90deg, ${color}, ${color}CC)`,
+        borderRadius: height / 2,
+        transition: "width 0.8s cubic-bezier(0.16, 1, 0.3, 1)",
+        boxShadow: `0 0 8px ${color}40`,
+      }} />
+    </div>
+  );
+}
+
+function DownloadButton({ onClick, label = "Download", icon = "↓" }) {
+  return (
+    <button onClick={onClick} style={{
+      display: "inline-flex", alignItems: "center", gap: 6,
+      padding: "6px 14px", borderRadius: T.r1,
+      background: "transparent", border: `1px solid ${T.border1}`,
+      color: T.t2, fontSize: 11, fontWeight: 500, fontFamily: T.fontMono,
+      cursor: "pointer", transition: "all 0.15s",
+    }}
+      onMouseEnter={e => { e.target.style.borderColor = T.cyan; e.target.style.color = T.cyan; }}
+      onMouseLeave={e => { e.target.style.borderColor = T.border1; e.target.style.color = T.t2; }}
+    >
+      <span style={{ fontSize: 13 }}>{icon}</span> {label}
+    </button>
+  );
+}
+
+function SectionTitle({ children, count, delay = 0 }) {
+  return (
+    <div style={{
+      display: "flex", alignItems: "center", gap: 10,
+      marginBottom: 16, animation: `fadeIn 0.4s ease-out ${delay}s both`,
+    }}>
+      <h3 style={{ fontSize: 13, fontWeight: 600, color: T.t2, textTransform: "uppercase", letterSpacing: "0.06em", fontFamily: T.fontSans }}>{children}</h3>
+      {count != null && <Badge color={T.t3}>{count}</Badge>}
+      <div style={{ flex: 1, height: 1, background: T.border0 }} />
+    </div>
+  );
+}
+
+function EmptyState({ icon = "◇", message }) {
+  return (
+    <div style={{
+      padding: "60px 20px", textAlign: "center",
+      animation: "fadeIn 0.5s ease-out",
+    }}>
+      <div style={{ fontSize: 36, marginBottom: 12, opacity: 0.3 }}>{icon}</div>
+      <div style={{ fontSize: 13, color: T.t3, maxWidth: 320, margin: "0 auto", lineHeight: 1.6 }}>{message}</div>
+    </div>
+  );
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   D3 TOPOLOGY GRAPH
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+const NODE_COLORS = {
+  qm:    T.cyan,
+  app:   T.green,
+  queue: T.amber,
+};
+
+function TopologyGraph({ graphData, title, height = 360, badge }) {
   const svgRef = useRef(null);
+  const containerRef = useRef(null);
 
   useEffect(() => {
-    if (!graphData?.nodes?.length) return;
+    if (!graphData?.nodes?.length || !svgRef.current) return;
     const svg = d3.select(svgRef.current);
     svg.selectAll("*").remove();
 
-    const w = svgRef.current.clientWidth || 600;
+    const w = containerRef.current?.clientWidth || 600;
     const h = height;
 
-    const sim = d3.forceSimulation(graphData.nodes)
-      .force("link",   d3.forceLink(graphData.edges).id(d => d.id).distance(90))
-      .force("charge", d3.forceManyBody().strength(-300))
+    const nodes = graphData.nodes.map(d => ({ ...d }));
+    const edges = graphData.edges.map(d => ({ ...d }));
+
+    const sim = d3.forceSimulation(nodes)
+      .force("link", d3.forceLink(edges).id(d => d.id).distance(100))
+      .force("charge", d3.forceManyBody().strength(-350))
       .force("center", d3.forceCenter(w / 2, h / 2))
-      .force("collide", d3.forceCollide(30));
+      .force("collide", d3.forceCollide(35));
 
     const g = svg.append("g");
+    svg.call(d3.zoom().scaleExtent([0.2, 4]).on("zoom", e => g.attr("transform", e.transform)));
 
-    svg.call(d3.zoom().scaleExtent([0.3, 3]).on("zoom", e => g.attr("transform", e.transform)));
+    // Glow filters
+    const defs = svg.append("defs");
+    ["qm", "app"].forEach(type => {
+      const filter = defs.append("filter").attr("id", `glow-${type}`);
+      filter.append("feGaussianBlur").attr("stdDeviation", 4).attr("result", "blur");
+      filter.append("feMerge").selectAll("feMergeNode")
+        .data(["blur", "SourceGraphic"]).join("feMergeNode")
+        .attr("in", d => d);
+    });
 
     // Arrow markers
-    svg.append("defs").selectAll("marker")
-      .data(["channel", "connects_to", "owns"])
-      .join("marker")
-      .attr("id", d => `arrow-${d}`)
-      .attr("viewBox", "0 0 10 10")
-      .attr("refX", 22).attr("refY", 5)
-      .attr("markerWidth", 6).attr("markerHeight", 6)
-      .attr("orient", "auto-start-reverse")
-      .append("path")
-      .attr("d", "M2 1L8 5L2 9")
-      .attr("fill", "none")
-      .attr("stroke", d => d === "channel" ? "#185FA5" : d === "connects_to" ? "#1D9E75" : "#888")
-      .attr("stroke-width", 1.5);
+    ["channel", "connects_to"].forEach(rel => {
+      defs.append("marker")
+        .attr("id", `arrow-${rel}-${title}`)
+        .attr("viewBox", "0 0 10 10")
+        .attr("refX", 25).attr("refY", 5)
+        .attr("markerWidth", 5).attr("markerHeight", 5)
+        .attr("orient", "auto")
+        .append("path")
+        .attr("d", "M1 2L7 5L1 8")
+        .attr("fill", rel === "channel" ? T.cyan : T.green)
+        .attr("opacity", 0.6);
+    });
 
-    // Links
-    const link = g.selectAll("line")
-      .data(graphData.edges.filter(e => e.rel === "channel" || e.rel === "connects_to"))
-      .join("line")
-      .attr("stroke", d => d.rel === "channel" ? "#185FA5" : "#1D9E75")
+    // Edges
+    g.selectAll("line.edge")
+      .data(edges.filter(e => e.rel === "channel" || e.rel === "connects_to"))
+      .join("line").attr("class", "edge")
+      .attr("stroke", d => d.rel === "channel" ? `${T.cyan}50` : `${T.green}40`)
       .attr("stroke-width", d => d.rel === "channel" ? 1.5 : 0.8)
-      .attr("stroke-dasharray", d => d.rel === "connects_to" ? "4 2" : null)
-      .attr("stroke-opacity", 0.7)
-      .attr("marker-end", d => `url(#arrow-${d.rel})`);
+      .attr("stroke-dasharray", d => d.rel === "connects_to" ? "3 3" : null)
+      .attr("marker-end", d => `url(#arrow-${d.rel}-${title})`);
 
     // Nodes
     const node = g.selectAll("g.node")
-      .data(graphData.nodes.filter(n => n.type === "qm" || n.type === "app"))
-      .join("g")
-      .attr("class", "node")
-      .style("cursor", "pointer")
+      .data(nodes.filter(n => n.type === "qm" || n.type === "app"))
+      .join("g").attr("class", "node")
+      .style("cursor", "grab")
       .call(d3.drag()
         .on("start", (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
-        .on("drag",  (e, d) => { d.fx = e.x; d.fy = e.y; })
-        .on("end",   (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; })
+        .on("drag", (e, d) => { d.fx = e.x; d.fy = e.y; })
+        .on("end", (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; })
       );
 
+    // Glow circle (behind)
     node.append("circle")
-      .attr("r", d => d.type === "qm" ? 20 : 14)
-      .attr("fill", d => NODE_COLOR[d.type] || "#888")
-      .attr("stroke", "#fff")
+      .attr("r", d => d.type === "qm" ? 22 : 15)
+      .attr("fill", d => `${NODE_COLORS[d.type]}15`)
+      .attr("stroke", "none");
+
+    // Main circle
+    node.append("circle")
+      .attr("r", d => d.type === "qm" ? 18 : 12)
+      .attr("fill", T.bg1)
+      .attr("stroke", d => NODE_COLORS[d.type])
       .attr("stroke-width", 2);
 
+    // Icon text
     node.append("text")
-      .text(d => d.type === "qm" ? "QM" : "APP")
-      .attr("text-anchor", "middle")
-      .attr("dy", "0.35em")
-      .attr("fill", "#fff")
-      .attr("font-size", "9px")
-      .attr("font-weight", "600");
+      .text(d => d.type === "qm" ? "◆" : "●")
+      .attr("text-anchor", "middle").attr("dy", "0.35em")
+      .attr("fill", d => NODE_COLORS[d.type])
+      .attr("font-size", d => d.type === "qm" ? "10px" : "8px");
 
+    // Label
     node.append("text")
-      .text(d => (d.name || d.id).replace("QM_", "").replace("APP_", "").slice(0, 14))
-      .attr("text-anchor", "middle")
-      .attr("dy", "2.4em")
-      .attr("fill", "currentColor")
-      .attr("font-size", "9px");
+      .text(d => (d.name || d.id).replace("QM_", "").replace("APP_", "").slice(0, 16))
+      .attr("text-anchor", "middle").attr("dy", d => d.type === "qm" ? "2.8em" : "2.4em")
+      .attr("fill", T.t3)
+      .attr("font-size", "9px").attr("font-family", T.fontMono);
 
     node.append("title").text(d => `${d.id}\nType: ${d.type}\nRegion: ${d.region || "-"}`);
 
+    const link = g.selectAll("line.edge");
     sim.on("tick", () => {
-      link
-        .attr("x1", d => d.source.x).attr("y1", d => d.source.y)
-        .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
+      link.attr("x1", d => d.source.x).attr("y1", d => d.source.y)
+           .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
       node.attr("transform", d => `translate(${d.x},${d.y})`);
     });
-  }, [graphData, height]);
+  }, [graphData, height, title]);
 
   return (
-    <div style={{ background: "var(--color-background-secondary)", borderRadius: 8, padding: "8px 12px" }}>
-      <p style={{ margin: "0 0 6px", fontSize: 13, fontWeight: 500, color: "var(--color-text-secondary)" }}>{title}</p>
+    <div ref={containerRef} style={{ background: T.bg1, borderRadius: T.r2, border: `1px solid ${T.border0}`, overflow: "hidden" }}>
+      <div style={{
+        padding: "10px 14px", display: "flex", alignItems: "center", justifyContent: "space-between",
+        borderBottom: `1px solid ${T.border0}`, background: `${T.bg3}40`,
+      }}>
+        <span style={{ fontSize: 11, fontWeight: 600, color: T.t3, textTransform: "uppercase", letterSpacing: "0.06em", fontFamily: T.fontMono }}>{title}</span>
+        {badge}
+      </div>
       <svg ref={svgRef} width="100%" height={height} style={{ display: "block" }} />
-      <div style={{ display: "flex", gap: 16, fontSize: 11, color: "var(--color-text-tertiary)", marginTop: 4 }}>
-        <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 10, height: 10, borderRadius: "50%", background: NODE_COLOR.qm, display: "inline-block" }}/> Queue Manager</span>
-        <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 10, height: 10, borderRadius: "50%", background: NODE_COLOR.app, display: "inline-block" }}/> Application</span>
+      <div style={{ padding: "8px 14px", display: "flex", gap: 16, borderTop: `1px solid ${T.border0}` }}>
+        {[["Queue Manager", T.cyan, "◆"], ["Application", T.green, "●"]].map(([l, c, i]) => (
+          <span key={l} style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 10, color: T.t3 }}>
+            <span style={{ color: c, fontSize: 10 }}>{i}</span> {l}
+          </span>
+        ))}
       </div>
     </div>
   );
 }
 
-// ── Metrics Card ─────────────────────────────────────────────────────────
-function MetricRow({ label, before, after }) {
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SCORE GAUGE — Radial ring
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function ScoreGauge({ label, score, max = 100, color, delay = 0 }) {
+  const pct = Math.min((score / max) * 100, 100);
+  const c = color || (score < 35 ? T.green : score < 65 ? T.amber : T.red);
+  const r = 46;
+  const circ = 2 * Math.PI * r;
+  const offset = circ - (pct / 100) * circ;
+
+  return (
+    <div style={{ textAlign: "center", animation: `scaleIn 0.5s ease-out ${delay}s both` }}>
+      <svg width="110" height="110" viewBox="0 0 110 110" style={{ display: "block", margin: "0 auto" }}>
+        <circle cx="55" cy="55" r={r} fill="none" stroke={T.border0} strokeWidth="6" />
+        <circle cx="55" cy="55" r={r} fill="none" stroke={c} strokeWidth="6"
+          strokeDasharray={circ} strokeDashoffset={offset}
+          strokeLinecap="round" transform="rotate(-90 55 55)"
+          style={{ transition: "stroke-dashoffset 1s cubic-bezier(0.16, 1, 0.3, 1)" }}
+        />
+        <text x="55" y="52" textAnchor="middle" fill={c} fontSize="24" fontWeight="700" fontFamily={T.fontDisplay}>{score}</text>
+        <text x="55" y="68" textAnchor="middle" fill={T.t3} fontSize="9" fontFamily={T.fontMono}>/100</text>
+      </svg>
+      <div style={{ fontSize: 11, color: T.t3, marginTop: 6, fontWeight: 500, textTransform: "uppercase", letterSpacing: "0.06em" }}>{label}</div>
+    </div>
+  );
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   METRIC ROW
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function MetricRow({ label, before, after, delay = 0 }) {
   const improved = after < before;
   const delta = before - after;
+  const pctChange = before > 0 ? Math.round((delta / before) * 100) : 0;
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "1fr 80px 80px 80px", gap: 8, padding: "8px 0", borderBottom: "1px solid var(--color-border-tertiary)", alignItems: "center", fontSize: 13 }}>
-      <span style={{ color: "var(--color-text-primary)" }}>{label}</span>
-      <span style={{ textAlign: "right", color: "var(--color-text-secondary)" }}>{before}</span>
-      <span style={{ textAlign: "right", fontWeight: 500, color: improved ? "var(--color-text-success)" : "var(--color-text-primary)" }}>{after}</span>
-      <span style={{ textAlign: "right", fontSize: 11, color: improved ? "var(--color-text-success)" : "var(--color-text-tertiary)" }}>
-        {improved ? `↓ ${delta}` : delta === 0 ? "—" : `↑ ${Math.abs(delta)}`}
+    <div style={{
+      display: "grid", gridTemplateColumns: "1.5fr 80px 80px 100px",
+      gap: 8, padding: "10px 16px", alignItems: "center",
+      borderBottom: `1px solid ${T.border0}`,
+      animation: `slideIn 0.3s ease-out ${delay}s both`,
+      fontSize: 12,
+    }}>
+      <span style={{ color: T.t2, fontWeight: 500 }}>{label}</span>
+      <span style={{ textAlign: "right", color: T.t3, fontFamily: T.fontMono }}>{before}</span>
+      <span style={{ textAlign: "right", fontWeight: 600, fontFamily: T.fontMono, color: improved ? T.green : T.t1 }}>{after}</span>
+      <span style={{ textAlign: "right", fontFamily: T.fontMono, fontSize: 11 }}>
+        {improved
+          ? <span style={{ color: T.green }}>↓ {delta} <span style={{ opacity: 0.7 }}>({pctChange}%)</span></span>
+          : delta === 0 ? <span style={{ color: T.t4 }}>—</span> : <span style={{ color: T.red }}>↑ {Math.abs(delta)}</span>}
       </span>
     </div>
   );
 }
 
-// ── Score Gauge ───────────────────────────────────────────────────────────
-function ScoreGauge({ label, score, max = 100 }) {
-  const pct = Math.min((score / max) * 100, 100);
-  const color = score < 40 ? "#1D9E75" : score < 70 ? "#BA7517" : "#E24B4A";
-  return (
-    <div style={{ textAlign: "center" }}>
-      <div style={{ fontSize: 28, fontWeight: 600, color }}>{score}</div>
-      <div style={{ height: 6, background: "var(--color-border-tertiary)", borderRadius: 3, margin: "4px 0" }}>
-        <div style={{ width: `${pct}%`, height: "100%", background: color, borderRadius: 3, transition: "width 0.6s" }} />
-      </div>
-      <div style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>{label}</div>
-    </div>
-  );
-}
 
-// ── ADR Card ──────────────────────────────────────────────────────────────
-function ADRCard({ adr }) {
+/* ═══════════════════════════════════════════════════════════════════════════
+   ADR CARD
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function ADRCard({ adr, delay = 0 }) {
   const [open, setOpen] = useState(false);
   return (
-    <div style={{ border: "1px solid var(--color-border-tertiary)", borderRadius: 8, overflow: "hidden", marginBottom: 8 }}>
-      <div onClick={() => setOpen(!open)} style={{ padding: "10px 14px", cursor: "pointer", display: "flex", justifyContent: "space-between", background: "var(--color-background-secondary)" }}>
-        <span style={{ fontSize: 13, fontWeight: 500 }}>{adr.id} — {adr.decision}</span>
-        <span style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>{open ? "▲" : "▼"}</span>
+    <div style={{
+      border: `1px solid ${open ? T.cyanBorder : T.border0}`,
+      borderRadius: T.r2, overflow: "hidden",
+      marginBottom: 8,
+      animation: `fadeUp 0.3s ease-out ${delay}s both`,
+      transition: "border-color 0.2s",
+    }}>
+      <div onClick={() => setOpen(!open)} style={{
+        padding: "12px 16px", cursor: "pointer",
+        display: "flex", justifyContent: "space-between", alignItems: "center",
+        background: open ? `${T.bg3}80` : T.bg2,
+        transition: "background 0.2s",
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <Badge color={T.cyan} style={{ fontSize: 10 }}>{adr.id}</Badge>
+          <span style={{ fontSize: 12, fontWeight: 500, color: T.t1 }}>{adr.decision || adr.title}</span>
+        </div>
+        <span style={{
+          fontSize: 10, color: T.t3,
+          transform: open ? "rotate(180deg)" : "rotate(0deg)",
+          transition: "transform 0.2s",
+        }}>▼</span>
       </div>
       {open && (
-        <div style={{ padding: "10px 14px", fontSize: 12, color: "var(--color-text-secondary)", lineHeight: 1.6 }}>
-          <p><strong>Context:</strong> {adr.context}</p>
-          <p><strong>Rationale:</strong> {adr.rationale}</p>
-          <p><strong>Consequences:</strong> {adr.consequences}</p>
+        <div style={{ padding: "14px 16px", fontSize: 12, color: T.t2, lineHeight: 1.7, borderTop: `1px solid ${T.border0}`, animation: "fadeIn 0.2s" }}>
+          {[["Context", adr.context], ["Rationale", adr.rationale], ["Consequences", adr.consequences]].map(([k, v]) => v && (
+            <div key={k} style={{ marginBottom: 10 }}>
+              <span style={{ fontSize: 10, fontWeight: 600, color: T.t3, textTransform: "uppercase", letterSpacing: "0.06em" }}>{k}</span>
+              <p style={{ margin: "4px 0 0", color: T.t2 }}>{v}</p>
+            </div>
+          ))}
         </div>
       )}
     </div>
   );
 }
 
-// ── Violation Badge ───────────────────────────────────────────────────────
-function ViolationBadge({ v }) {
-  const bg = v.severity === "CRITICAL" ? "var(--color-background-danger)" : "var(--color-background-warning)";
-  const color = v.severity === "CRITICAL" ? "var(--color-text-danger)" : "var(--color-text-warning)";
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   VIOLATION BADGE
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function ViolationBadge({ v, delay = 0 }) {
+  const isCrit = v.severity === "CRITICAL";
+  const c = isCrit ? T.red : T.amber;
   return (
-    <div style={{ padding: "8px 12px", borderRadius: 6, marginBottom: 6, background: bg, fontSize: 12 }}>
-      <span style={{ fontWeight: 600, color }}>[{v.severity}] {v.rule}</span>
-      <span style={{ color: "var(--color-text-secondary)", marginLeft: 8 }}>{v.entity} — {v.detail}</span>
+    <div style={{
+      padding: "10px 14px", borderRadius: T.r1, marginBottom: 6,
+      background: isCrit ? T.redBg : T.amberBg,
+      border: `1px solid ${isCrit ? T.redBorder : T.amberBorder}`,
+      display: "flex", alignItems: "flex-start", gap: 10,
+      animation: `slideIn 0.3s ease-out ${delay}s both`,
+      fontSize: 12,
+    }}>
+      <span style={{ fontSize: 10, fontWeight: 700, color: c, fontFamily: T.fontMono, flexShrink: 0, marginTop: 1 }}>{v.severity}</span>
+      <span style={{ color: T.t2 }}><strong style={{ color: T.t1 }}>{v.rule}</strong> — {v.entity}: {v.detail}</span>
     </div>
   );
 }
 
-// ── Main App ──────────────────────────────────────────────────────────────
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   PHASE BADGE for Migration Plan
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+const PHASE_STYLES = {
+  CREATE:  { color: T.cyan,   icon: "+" },
+  REROUTE: { color: T.amber,  icon: "⇄" },
+  DRAIN:   { color: T.purple, icon: "◎" },
+  CLEANUP: { color: T.red,    icon: "×" },
+};
+
+function PhaseBadge({ phase }) {
+  const s = PHASE_STYLES[phase] || { color: T.t3, icon: "?" };
+  return (
+    <span style={{
+      display: "inline-flex", alignItems: "center", gap: 4,
+      padding: "2px 8px", borderRadius: 4,
+      fontSize: 10, fontWeight: 600, fontFamily: T.fontMono,
+      color: s.color, background: `${s.color}15`, border: `1px solid ${s.color}25`,
+    }}>
+      {s.icon} {phase}
+    </span>
+  );
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   LOADING SPINNER
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function LoadingOverlay() {
+  const [dots, setDots] = useState(0);
+  const [step, setStep] = useState(0);
+  const steps = [
+    "Validating session...",
+    "Sanitising CSV data...",
+    "Building topology graph...",
+    "Analysing complexity...",
+    "LLM designing target state...",
+    "Optimising channels...",
+    "Running constraint tests...",
+    "Awaiting review...",
+  ];
+
+  useEffect(() => {
+    const i1 = setInterval(() => setDots(d => (d + 1) % 4), 400);
+    const i2 = setInterval(() => setStep(s => Math.min(s + 1, steps.length - 1)), 2800);
+    return () => { clearInterval(i1); clearInterval(i2); };
+  }, []);
+
+  return (
+    <div style={{
+      padding: "80px 20px", textAlign: "center",
+      animation: "fadeIn 0.3s ease-out",
+    }}>
+      <div style={{
+        width: 48, height: 48, margin: "0 auto 24px",
+        border: `3px solid ${T.border1}`, borderTopColor: T.cyan,
+        borderRadius: "50%", animation: "spin 0.8s linear infinite",
+      }} />
+      <div style={{ fontSize: 12, color: T.cyan, fontFamily: T.fontMono, animation: "pulse 2s infinite" }}>
+        {steps[step]}
+      </div>
+      <div style={{ marginTop: 20, maxWidth: 300, margin: "20px auto 0" }}>
+        <ProgressBar value={(step + 1) / steps.length * 100} color={T.cyan} height={3} />
+      </div>
+      <div style={{ fontSize: 11, color: T.t4, marginTop: 12 }}>This may take 10-30 seconds</div>
+    </div>
+  );
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   TABS CONFIGURATION
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+const TAB_CONFIG = [
+  { id: "upload",    label: "Upload",    icon: "⬆" },
+  { id: "review",    label: "Review",    icon: "◎" },
+  { id: "topology",  label: "Topology",  icon: "◇" },
+  { id: "metrics",   label: "Metrics",   icon: "▤" },
+  { id: "adrs",      label: "ADRs",      icon: "◈" },
+  { id: "migration", label: "Migration", icon: "⇄" },
+  { id: "mqsc",      label: "MQSC",      icon: "▸" },
+  { id: "csvs",      label: "CSVs",      icon: "⊞" },
+  { id: "report",    label: "Report",    icon: "◫" },
+  { id: "trace",     label: "Trace",     icon: "⋯" },
+];
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   MAIN APP
+   ═══════════════════════════════════════════════════════════════════════════ */
+
 export default function App() {
   const [tab, setTab] = useState("upload");
   const [loading, setLoading] = useState(false);
@@ -184,381 +605,1116 @@ export default function App() {
   const [reviewFeedback, setReviewFeedback] = useState("");
   const [reviewLoading, setReviewLoading] = useState(false);
 
-  async function submitReview(approved) {
-    if (!approved && !reviewFeedback.trim()) {
-      setError("Please provide a reason for rejection.");
+  // ── LOCAL approval tracking ──
+  // The backend pipeline re-runs from start on resume (Known Limitation #1).
+  // This can reset human_approved to null and awaiting_human_review to true.
+  // So we track the user's decision locally — this is the SOURCE OF TRUTH.
+  const [userDecision, setUserDecision] = useState(null); // null | "approved" | "rejected" | "aborted"
+
+  // Inject styles once
+  useEffect(() => {
+    const existing = document.getElementById("mq-titan-styles");
+    if (!existing) {
+      const el = document.createElement("style");
+      el.id = "mq-titan-styles";
+      el.textContent = STYLE_TAG;
+      document.head.appendChild(el);
+    }
+  }, []);
+
+  const architectMethod = result?.architect_method;
+
+  // ── Derived state flags — LOCAL userDecision is the source of truth ──
+  // The backend may return contradictory flags because the pipeline re-runs
+  // from start, so we never trust awaiting_human_review or human_approved
+  // from the response alone.
+  const isApproved = userDecision === "approved";
+  const isAborted = userDecision === "aborted";
+  const isRejected = userDecision === "rejected";
+  const isAwaitingReview = result && !isApproved && !isAborted && !isRejected;
+
+  // Check if post-approval data actually exists in the response
+  const hasOutputs = !!(
+    (result?.mqsc_scripts?.length) ||
+    (result?.target_csvs && Object.keys(result.target_csvs).length > 0) ||
+    result?.migration_plan ||
+    result?.final_report
+  );
+
+  async function submitReview(approved, abort = false) {
+    if (!approved && !abort && !reviewFeedback.trim()) {
+      setError("Please provide a reason when rejecting — the Architect needs your feedback to redesign.");
       return;
     }
+    // Track the decision locally BEFORE the API call
+    if (approved) setUserDecision("approved");
+    else if (abort) setUserDecision("aborted");
+    else setUserDecision("rejected");
+
+    // Show full loading spinner — pipeline re-runs and takes 10-30s
+    setLoading(true);
     setReviewLoading(true);
     setError(null);
     try {
-      const sessionId = result?.session_id;
-      const res = await fetch(`${API}/api/review/${sessionId}`, {
+      const res = await fetch(`${API}/api/review/${result?.session_id}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ approved, feedback: reviewFeedback }),
+        body: JSON.stringify({ approved, feedback: reviewFeedback, abort }),
       });
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
+
+      console.log("[MQ-TITAN] Review response keys:", Object.keys(data));
+      console.log("[MQ-TITAN] Review response flags:", {
+        human_approved: data.human_approved,
+        awaiting_human_review: data.awaiting_human_review,
+        has_mqsc: Array.isArray(data.mqsc_scripts) && data.mqsc_scripts.length > 0,
+        has_csvs: data.target_csvs && Object.keys(data.target_csvs).length > 0,
+        has_migration: !!data.migration_plan,
+        has_report: !!data.final_report,
+      });
+
       setResult(data);
       setReviewFeedback("");
-      // After approval go to topology, after rejection stay on review
+
       if (approved) setTab("topology");
+      else if (abort) setTab("trace");
+      // rejected: stay on review — pipeline will come back with new design
     } catch (e) {
+      // Roll back the local decision on error
+      setUserDecision(null);
       setError(e.message);
     } finally {
+      setLoading(false);
       setReviewLoading(false);
     }
   }
 
-  const tabs = ["upload", "review", "topology", "metrics", "adrs", "mqsc", "csvs", "trace"];
-
   async function runDemo() {
-    setLoading(true);
-    setError(null);
+    setLoading(true); setError(null); setUserDecision(null);
     try {
       const res = await fetch(`${API}/api/demo`, { method: "POST" });
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
+      console.log("[MQ-TITAN] Demo response keys:", Object.keys(data));
       setResult(data);
-      setTab(data.awaiting_human_review ? "review" : "topology");
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setLoading(false);
-    }
+      setTab("review"); // Always go to review first — that's the pipeline flow
+    } catch (e) { setError(e.message); } finally { setLoading(false); }
   }
 
   async function handleUpload(e) {
     e.preventDefault();
     const form = new FormData(e.target);
-    setLoading(true);
-    setError(null);
+    setLoading(true); setError(null); setUserDecision(null);
     try {
       const res = await fetch(`${API}/api/analyse`, { method: "POST", body: form });
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
       setResult(data);
-      setTab(data.awaiting_human_review ? "review" : "topology");
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setLoading(false);
-    }
+      setTab("review");
+    } catch (e) { setError(e.message); } finally { setLoading(false); }
+  }
+
+  function downloadFile(content, filename, mime = "text/plain") {
+    const blob = new Blob([content], { type: mime });
+    const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
+    a.download = filename; a.click();
   }
 
   return (
-    <div style={{ maxWidth: 1100, margin: "0 auto", padding: "24px 20px", fontFamily: "var(--font-sans)" }}>
-      {/* Header */}
-      <div style={{ marginBottom: 24 }}>
-        <h1 style={{ fontSize: 22, fontWeight: 600, margin: "0 0 4px", color: "var(--color-text-primary)" }}>MQ-TITAN</h1>
-        <p style={{ fontSize: 13, color: "var(--color-text-secondary)", margin: 0 }}>MQ Topology Intelligence & Transformation Agent Network</p>
-      </div>
-
-      {/* Tab bar */}
-      <div style={{ display: "flex", gap: 4, marginBottom: 20, borderBottom: "1px solid var(--color-border-tertiary)", paddingBottom: 0 }}>
-        {tabs.map(t => (
-          <button key={t} onClick={() => setTab(t)} style={{
-            padding: "7px 14px", fontSize: 12, fontWeight: 500, border: "none", cursor: "pointer",
-            background: tab === t ? "var(--color-background-primary)" : "transparent",
-            borderBottom: tab === t ? "2px solid var(--color-text-info)" : "2px solid transparent",
-            color: tab === t ? "var(--color-text-info)" : "var(--color-text-secondary)",
-            textTransform: "capitalize",
-          }}>
-            {t}
-            {t === "adrs" && result?.adrs?.length ? ` (${result.adrs.length})` : ""}
-            {t === "topology" && result ? " ✓" : ""}
-          </button>
-        ))}
-      </div>
-
-      {/* Error */}
-      {error && (
-        <div style={{ background: "var(--color-background-danger)", color: "var(--color-text-danger)", padding: "10px 14px", borderRadius: 8, marginBottom: 16, fontSize: 13 }}>
-          {error}
+    <div style={{ minHeight: "100vh", background: T.bg0 }}>
+      {/* ── HEADER ── */}
+      <header style={{
+        borderBottom: `1px solid ${T.border0}`,
+        background: `linear-gradient(180deg, ${T.bg1} 0%, ${T.bg0} 100%)`,
+        padding: "0 24px",
+        position: "sticky", top: 0, zIndex: 100,
+        backdropFilter: "blur(12px)",
+      }}>
+        <div style={{ maxWidth: 1280, margin: "0 auto", display: "flex", alignItems: "center", justifyContent: "space-between", height: 56 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            {/* Logo mark */}
+            <div style={{
+              width: 32, height: 32, borderRadius: 8,
+              background: `linear-gradient(135deg, ${T.cyan}20, ${T.cyan}05)`,
+              border: `1px solid ${T.cyan}30`,
+              display: "flex", alignItems: "center", justifyContent: "center",
+              fontSize: 14, color: T.cyan,
+            }}>◆</div>
+            <div>
+              <h1 style={{
+                fontSize: 16, fontWeight: 700, fontFamily: T.fontDisplay, color: T.t1,
+                letterSpacing: "0.04em", margin: 0, lineHeight: 1,
+              }}>
+                MQ-TITAN
+              </h1>
+              <p style={{ fontSize: 9, color: T.t3, margin: 0, fontFamily: T.fontMono, letterSpacing: "0.08em", textTransform: "uppercase" }}>
+                Topology Intelligence & Transformation
+              </p>
+            </div>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            {architectMethod && (
+              <Badge
+                color={architectMethod === "llm" ? T.cyan : T.amber}
+                style={{ fontSize: 9 }}
+              >
+                {architectMethod === "llm" ? "◆ AI ARCHITECT" : "◇ RULES ENGINE"}
+              </Badge>
+            )}
+            {result && (
+              <Badge color={result.validation_passed ? T.green : T.red} style={{ fontSize: 9 }}>
+                {result.validation_passed ? "✓ VALID" : "✗ VIOLATIONS"}
+              </Badge>
+            )}
+          </div>
         </div>
-      )}
+      </header>
 
-      {/* Loading */}
-      {loading && (
-        <div style={{ padding: "40px 0", textAlign: "center", color: "var(--color-text-secondary)", fontSize: 13 }}>
-          Running 9-agent pipeline... this may take 10-30 seconds.
-        </div>
-      )}
+      <div style={{ maxWidth: 1280, margin: "0 auto", padding: "0 24px" }}>
+        {/* ── TAB BAR ── */}
+        <nav style={{
+          display: "flex", gap: 2, paddingTop: 16, paddingBottom: 0,
+          borderBottom: `1px solid ${T.border0}`,
+          overflowX: "auto",
+        }}>
+          {TAB_CONFIG.map(t => {
+            const active = tab === t.id;
+            const hasData = t.id === "adrs" && result?.adrs?.length;
+            return (
+              <button key={t.id} onClick={() => setTab(t.id)} style={{
+                padding: "8px 14px", fontSize: 11, fontWeight: 500,
+                border: "none", cursor: "pointer",
+                background: active ? T.bg2 : "transparent",
+                borderBottom: active ? `2px solid ${T.cyan}` : "2px solid transparent",
+                color: active ? T.cyan : T.t3,
+                fontFamily: T.fontMono, letterSpacing: "0.02em",
+                display: "flex", alignItems: "center", gap: 6,
+                transition: "all 0.15s", flexShrink: 0,
+                borderRadius: active ? `${T.r1} ${T.r1} 0 0` : undefined,
+              }}
+                onMouseEnter={e => { if (!active) e.target.style.color = T.t2; }}
+                onMouseLeave={e => { if (!active) e.target.style.color = T.t3; }}
+              >
+                <span style={{ fontSize: 11, opacity: 0.7 }}>{t.icon}</span>
+                {t.label}
+                {hasData ? <span style={{ fontSize: 9, padding: "1px 5px", borderRadius: 10, background: T.cyanBg, color: T.cyan }}>{result.adrs.length}</span> : null}
+              </button>
+            );
+          })}
+        </nav>
 
-      {/* ── UPLOAD TAB ── */}
-      {tab === "upload" && !loading && (
-        <div style={{ maxWidth: 500 }}>
-          <p style={{ fontSize: 13, color: "var(--color-text-secondary)", marginBottom: 20 }}>
-            Upload 4 CSV files representing your MQ environment, or run the built-in demo dataset.
-          </p>
-          <button onClick={runDemo} style={{
-            width: "100%", padding: "12px", marginBottom: 20, borderRadius: 8,
-            background: "var(--color-background-info)", color: "var(--color-text-info)",
-            border: "1px solid var(--color-border-info)", fontSize: 14, fontWeight: 500, cursor: "pointer",
+        {/* ── ERROR ── */}
+        {error && (
+          <div style={{
+            margin: "16px 0", padding: "12px 16px", borderRadius: T.r2,
+            background: T.redBg, border: `1px solid ${T.redBorder}`,
+            display: "flex", alignItems: "center", gap: 10,
+            animation: "fadeUp 0.3s ease-out",
           }}>
-            Run Demo (synthetic data)
-          </button>
-          <div style={{ borderTop: "1px solid var(--color-border-tertiary)", paddingTop: 20 }}>
-            <form onSubmit={handleUpload}>
-              {["queue_managers", "queues", "applications", "channels"].map(name => (
-                <div key={name} style={{ marginBottom: 12 }}>
-                  <label style={{ display: "block", fontSize: 12, fontWeight: 500, marginBottom: 4, color: "var(--color-text-secondary)", textTransform: "capitalize" }}>
-                    {name.replace("_", " ")} CSV
-                  </label>
-                  <input type="file" name={name} accept=".csv" required style={{ fontSize: 12, width: "100%" }} />
+            <span style={{ fontSize: 16, color: T.red }}>⚠</span>
+            <span style={{ fontSize: 12, color: T.t1 }}>{error}</span>
+            <button onClick={() => setError(null)} style={{
+              marginLeft: "auto", background: "none", border: "none",
+              color: T.t3, cursor: "pointer", fontSize: 14,
+            }}>×</button>
+          </div>
+        )}
+
+        {/* ── LOADING ── */}
+        {loading && <LoadingOverlay />}
+
+        {/* ── CONTENT ── */}
+        <div style={{ padding: "24px 0 60px" }}>
+
+          {/* ━━━ UPLOAD TAB ━━━ */}
+          {tab === "upload" && !loading && (
+            <UploadTab runDemo={runDemo} handleUpload={handleUpload} />
+          )}
+
+          {/* ━━━ REVIEW TAB ━━━ */}
+          {tab === "review" && result && !loading && (
+            <div style={{ animation: "fadeUp 0.4s ease-out" }}>
+              {result.awaiting_human_review ? (
+                <>
+                  {/* Status banner */}
+                  <div style={{
+                    padding: "16px 20px", borderRadius: T.r2, marginBottom: 24,
+                    background: T.amberBg, border: `1px solid ${T.amberBorder}`,
+                    display: "flex", alignItems: "center", gap: 14,
+                    animation: "borderGlow 3s infinite",
+                    borderColor: T.amberBorder,
+                  }}>
+                    <div style={{
+                      width: 10, height: 10, borderRadius: "50%",
+                      background: T.amber, animation: "pulse 2s infinite", flexShrink: 0,
+                    }} />
+                    <div>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: T.amber }}>Pipeline Paused — Awaiting Human Review</div>
+                      <div style={{ fontSize: 11, color: T.t3, marginTop: 2 }}>Review the proposed redesign. Approve to generate outputs, reject to iterate, or abort to cancel.</div>
+                    </div>
+                    {architectMethod && (
+                      <Badge color={architectMethod === "llm" ? T.cyan : T.amber} style={{ marginLeft: "auto", fontSize: 9, flexShrink: 0 }}>
+                        {architectMethod === "llm" ? "◆ AI" : "◇ RULES"}
+                      </Badge>
+                    )}
+                  </div>
+
+                  {/* Score cards */}
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 24 }}>
+                    {[
+                      { label: "As-Is Score", value: result.as_is_metrics?.total_score, color: T.red },
+                      { label: "Target Score", value: result.target_metrics?.total_score, color: T.green },
+                      { label: "Reduction", value: `${result.complexity_reduction?.reduction_pct}%`, color: T.cyan },
+                    ].map((s, i) => (
+                      <Card key={i} delay={0.1 * i}>
+                        <Stat label={s.label} value={s.value} color={s.color} delay={0.1 * i} />
+                      </Card>
+                    ))}
+                  </div>
+
+                  {/* ADR summary */}
+                  {result.adrs?.length > 0 && (
+                    <div style={{ marginBottom: 24 }}>
+                      <SectionTitle count={result.adrs.length}>Architecture Decisions</SectionTitle>
+                      {result.adrs.map((adr, i) => (
+                        <div key={i} style={{
+                          padding: "10px 14px", borderRadius: T.r1,
+                          background: T.bg2, border: `1px solid ${T.border0}`,
+                          marginBottom: 6, display: "flex", alignItems: "center", gap: 10,
+                          animation: `slideIn 0.3s ease-out ${0.05 * i}s both`,
+                        }}>
+                          <Badge color={T.cyan} style={{ fontSize: 9 }}>{adr.id}</Badge>
+                          <span style={{ fontSize: 12, color: T.t2 }}>{adr.decision || adr.title}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Topology preview */}
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 24 }}>
+                    <TopologyGraph graphData={result.as_is_graph} title="As-Is Topology" height={260} />
+                    <TopologyGraph graphData={result.target_graph} title="Proposed Target" height={260}
+                      badge={<Badge color={T.green} style={{ fontSize: 9 }}>PROPOSED</Badge>} />
+                  </div>
+
+                  {/* Decision panel */}
+                  <Card glow={T.cyan}>
+                    <CardHeader>Your Decision</CardHeader>
+                    <div style={{ padding: 20 }}>
+                      <textarea
+                        value={reviewFeedback}
+                        onChange={e => setReviewFeedback(e.target.value)}
+                        placeholder="Feedback for the Architect (required for rejection)..."
+                        rows={3}
+                        style={{
+                          width: "100%", padding: "10px 12px", borderRadius: T.r1,
+                          border: `1px solid ${T.border1}`, fontSize: 12,
+                          background: T.bg1, color: T.t1, resize: "vertical",
+                          fontFamily: T.fontSans, lineHeight: 1.6,
+                          outline: "none",
+                        }}
+                        onFocus={e => e.target.style.borderColor = T.cyan}
+                        onBlur={e => e.target.style.borderColor = T.border1}
+                      />
+                      <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
+                        <button onClick={() => submitReview(true)} disabled={reviewLoading} style={{
+                          flex: 2, padding: "12px 16px", borderRadius: T.r1, border: "none",
+                          background: `linear-gradient(180deg, ${T.green}, ${T.greenDim})`,
+                          color: "#fff", fontSize: 13, fontWeight: 600, cursor: reviewLoading ? "not-allowed" : "pointer",
+                          opacity: reviewLoading ? 0.6 : 1, fontFamily: T.fontSans,
+                          boxShadow: `0 2px 12px ${T.green}40`,
+                          transition: "all 0.15s",
+                        }}>
+                          {reviewLoading ? "Processing..." : "✓ Approve — Generate Outputs"}
+                        </button>
+                        <button onClick={() => submitReview(false)} disabled={reviewLoading} style={{
+                          flex: 1, padding: "12px 16px", borderRadius: T.r1,
+                          border: `1px solid ${T.amber}50`, background: T.amberBg,
+                          color: T.amber, fontSize: 13, fontWeight: 600,
+                          cursor: reviewLoading ? "not-allowed" : "pointer",
+                          opacity: reviewLoading ? 0.6 : 1, fontFamily: T.fontSans,
+                          transition: "all 0.15s",
+                        }}>
+                          {reviewLoading ? "..." : "↻ Reject"}
+                        </button>
+                        <button onClick={() => submitReview(false, true)} disabled={reviewLoading} style={{
+                          padding: "12px 16px", borderRadius: T.r1,
+                          border: `1px solid ${T.red}40`, background: T.redBg,
+                          color: T.red, fontSize: 13, fontWeight: 600,
+                          cursor: reviewLoading ? "not-allowed" : "pointer",
+                          opacity: reviewLoading ? 0.6 : 1, fontFamily: T.fontSans,
+                          transition: "all 0.15s",
+                        }}>
+                          ✗ Abort
+                        </button>
+                      </div>
+                    </div>
+                  </Card>
+                </>
+              ) : (
+                <EmptyState
+                  icon={result.human_approved ? "✓" : result.human_aborted ? "⊘" : "◇"}
+                  message={
+                    result.human_approved ? "Design approved. Outputs are available in the other tabs."
+                      : result.human_aborted ? "Pipeline aborted. Check the Trace tab for details."
+                      : result.human_approved === false ? "Design rejected. The Architect is redesigning with your feedback."
+                      : "No review pending. Run an analysis first."
+                  }
+                />
+              )}
+            </div>
+          )}
+
+          {/* ━━━ TOPOLOGY TAB ━━━ */}
+          {tab === "topology" && result && !loading && (
+            <div style={{ animation: "fadeUp 0.4s ease-out" }}>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 16 }}>
+                <TopologyGraph graphData={result.as_is_graph} title="As-Is Topology" height={380}
+                  badge={<Badge color={T.t3} style={{ fontSize: 9 }}>CURRENT</Badge>} />
+                <TopologyGraph graphData={result.target_graph} title="Target State" height={380}
+                  badge={<Badge color={T.green} style={{ fontSize: 9 }}>OPTIMISED</Badge>} />
+              </div>
+
+              {/* Summary bar */}
+              <Card glow={result.validation_passed ? T.green : T.red} delay={0.1}>
+                <div style={{ padding: "14px 20px", display: "flex", alignItems: "center", gap: 20, flexWrap: "wrap" }}>
+                  <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+                    <span style={{ fontSize: 22, fontWeight: 700, fontFamily: T.fontDisplay, color: T.green }}>
+                      {result.complexity_reduction?.reduction_pct}%
+                    </span>
+                    <span style={{ fontSize: 12, color: T.t3 }}>complexity reduction</span>
+                  </div>
+                  <div style={{ width: 1, height: 24, background: T.border1 }} />
+                  <div style={{ fontSize: 12, color: T.t2, fontFamily: T.fontMono }}>
+                    {result.complexity_reduction?.before} → {result.complexity_reduction?.after}
+                  </div>
+                  <div style={{ width: 1, height: 24, background: T.border1 }} />
+                  <Badge color={result.validation_passed ? T.green : T.red}>
+                    {result.validation_passed ? "✓ All constraints satisfied" : "✗ Violations found"}
+                  </Badge>
+                  {architectMethod && (
+                    <>
+                      <div style={{ width: 1, height: 24, background: T.border1 }} />
+                      <Badge color={architectMethod === "llm" ? T.cyan : T.amber}>
+                        {architectMethod === "llm" ? "◆ AI Architect" : "◇ Rules Engine"}
+                      </Badge>
+                    </>
+                  )}
                 </div>
-              ))}
+              </Card>
+
+              {/* Topology diff if available */}
+              {result.topology_diff && (
+                <div style={{ marginTop: 16, display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12 }}>
+                  {[
+                    { label: "QMs Removed", value: result.topology_diff.qms_removed?.length || 0, color: T.red },
+                    { label: "Channels Added", value: result.topology_diff.channels_added?.length || 0, color: T.green },
+                    { label: "Channels Removed", value: result.topology_diff.channels_removed?.length || 0, color: T.red },
+                    { label: "Apps Reassigned", value: result.topology_diff.apps_reassigned?.length || 0, color: T.amber },
+                  ].map((d, i) => (
+                    <Card key={i} delay={0.2 + i * 0.05}>
+                      <div style={{ padding: "14px 16px", textAlign: "center" }}>
+                        <div style={{ fontSize: 24, fontWeight: 700, fontFamily: T.fontDisplay, color: d.color }}>{d.value}</div>
+                        <div style={{ fontSize: 10, color: T.t3, marginTop: 4, fontFamily: T.fontMono, textTransform: "uppercase", letterSpacing: "0.06em" }}>{d.label}</div>
+                      </div>
+                    </Card>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ━━━ METRICS TAB ━━━ */}
+          {tab === "metrics" && result && !loading && (
+            <div style={{ animation: "fadeUp 0.4s ease-out" }}>
+              <div style={{ display: "flex", justifyContent: "center", gap: 48, marginBottom: 32 }}>
+                <ScoreGauge label="As-Is Score" score={result.as_is_metrics?.total_score || 0} delay={0} />
+                <div style={{ display: "flex", flexDirection: "column", justifyContent: "center", alignItems: "center" }}>
+                  <span style={{ fontSize: 28, color: T.green, animation: "fadeIn 0.5s ease-out 0.3s both" }}>→</span>
+                  <span style={{
+                    fontSize: 11, fontFamily: T.fontMono, color: T.green, fontWeight: 600,
+                    animation: "countUp 0.5s ease-out 0.5s both",
+                  }}>-{result.complexity_reduction?.reduction_pct}%</span>
+                </div>
+                <ScoreGauge label="Target Score" score={result.target_metrics?.total_score || 0} delay={0.2} />
+              </div>
+
+              <Card delay={0.3}>
+                <CardHeader>Factor Breakdown</CardHeader>
+                {/* Table header */}
+                <div style={{
+                  display: "grid", gridTemplateColumns: "1.5fr 80px 80px 100px",
+                  gap: 8, padding: "8px 16px",
+                  borderBottom: `1px solid ${T.border0}`,
+                  fontSize: 10, fontWeight: 600, color: T.t4,
+                  fontFamily: T.fontMono, textTransform: "uppercase", letterSpacing: "0.06em",
+                }}>
+                  <span>Metric</span><span style={{ textAlign: "right" }}>Before</span>
+                  <span style={{ textAlign: "right" }}>After</span><span style={{ textAlign: "right" }}>Delta</span>
+                </div>
+                {[
+                  ["Channel Count", "channel_count", "30%"],
+                  ["Coupling Index", "coupling_index", "25%"],
+                  ["Routing Depth", "routing_depth", "20%"],
+                  ["Fan-Out Score", "fan_out_score", "15%"],
+                  ["Orphan Objects", "orphan_objects", "10%"],
+                ].map(([label, key, weight], i) => (
+                  <MetricRow key={key}
+                    label={`${label} (${weight})`}
+                    before={result.as_is_metrics?.[key] ?? "—"}
+                    after={result.target_metrics?.[key] ?? "—"}
+                    delay={0.05 * i} />
+                ))}
+              </Card>
+
+              {result.constraint_violations?.length > 0 && (
+                <div style={{ marginTop: 24 }}>
+                  <SectionTitle count={result.constraint_violations.length} delay={0.4}>Constraint Violations</SectionTitle>
+                  {result.constraint_violations.map((v, i) => (
+                    <ViolationBadge key={i} v={v} delay={0.05 * i} />
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ━━━ ADRs TAB ━━━ */}
+          {tab === "adrs" && result && !loading && (
+            <div style={{ animation: "fadeUp 0.4s ease-out", maxWidth: 800 }}>
+              <div style={{ marginBottom: 20, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <div>
+                  <h2 style={{ fontSize: 16, fontWeight: 600, fontFamily: T.fontDisplay, color: T.t1, marginBottom: 4 }}>
+                    Architecture Decision Records
+                  </h2>
+                  <p style={{ fontSize: 12, color: T.t3 }}>Every design decision with full context, rationale, and consequences.</p>
+                </div>
+                {result.adrs?.length > 0 && <Badge color={T.cyan}>{result.adrs.length} decisions</Badge>}
+              </div>
+              {result.adrs?.length
+                ? result.adrs.map((adr, i) => <ADRCard key={i} adr={adr} delay={0.05 * i} />)
+                : <EmptyState icon="◈" message="No architecture decisions recorded." />}
+            </div>
+          )}
+
+          {/* ━━━ MIGRATION TAB ━━━ */}
+          {tab === "migration" && result && !loading && (
+            <div style={{ animation: "fadeUp 0.4s ease-out" }}>
+              {result.migration_plan ? (
+                <>
+                  {/* Diff summary */}
+                  {result.topology_diff && (
+                    <Card delay={0.1} style={{ marginBottom: 20 }}>
+                      <CardHeader right={<Badge color={T.cyan}>{result.migration_plan.total_steps} steps</Badge>}>
+                        Topology Changes
+                      </CardHeader>
+                      <div style={{ padding: 16, display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16 }}>
+                        {result.topology_diff.qms_removed?.length > 0 && (
+                          <div>
+                            <div style={{ fontSize: 10, fontWeight: 600, color: T.red, fontFamily: T.fontMono, marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.06em" }}>QMs Removed</div>
+                            {result.topology_diff.qms_removed.map(qm => (
+                              <div key={qm} style={{ fontSize: 12, color: T.t2, padding: "3px 0", fontFamily: T.fontMono }}>{qm}</div>
+                            ))}
+                          </div>
+                        )}
+                        {result.topology_diff.apps_reassigned?.length > 0 && (
+                          <div>
+                            <div style={{ fontSize: 10, fontWeight: 600, color: T.amber, fontFamily: T.fontMono, marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.06em" }}>Apps Reassigned</div>
+                            {result.topology_diff.apps_reassigned.map((a, i) => (
+                              <div key={i} style={{ fontSize: 11, color: T.t2, padding: "3px 0", fontFamily: T.fontMono }}>
+                                {a.app_id}: <span style={{ color: T.red }}>{a.old_qm}</span> → <span style={{ color: T.green }}>{a.new_qm}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        {result.topology_diff.channels_added?.length > 0 && (
+                          <div>
+                            <div style={{ fontSize: 10, fontWeight: 600, color: T.green, fontFamily: T.fontMono, marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.06em" }}>Channels Added</div>
+                            {result.topology_diff.channels_added.map((ch, i) => (
+                              <div key={i} style={{ fontSize: 11, color: T.t2, padding: "3px 0", fontFamily: T.fontMono }}>
+                                {ch[0]} → {ch[1]}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </Card>
+                  )}
+
+                  {/* Phase timeline */}
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: 20 }}>
+                    {["CREATE", "REROUTE", "DRAIN", "CLEANUP"].map((phase, i) => {
+                      const steps = result.migration_plan.phases?.[phase] || [];
+                      const ps = PHASE_STYLES[phase];
+                      return (
+                        <Card key={phase} delay={0.1 + i * 0.05} glow={steps.length > 0 ? ps.color : undefined}>
+                          <div style={{ padding: "14px 16px", textAlign: "center" }}>
+                            <div style={{ fontSize: 22, color: ps.color, marginBottom: 4 }}>{ps.icon}</div>
+                            <div style={{ fontSize: 10, fontWeight: 600, fontFamily: T.fontMono, color: ps.color, textTransform: "uppercase", letterSpacing: "0.06em" }}>{phase}</div>
+                            <div style={{ fontSize: 20, fontWeight: 700, fontFamily: T.fontDisplay, color: T.t1, marginTop: 6 }}>{steps.length}</div>
+                            <div style={{ fontSize: 10, color: T.t4 }}>steps</div>
+                          </div>
+                        </Card>
+                      );
+                    })}
+                  </div>
+
+                  {/* Steps list */}
+                  <Card delay={0.3}>
+                    <CardHeader right={
+                      <DownloadButton label="Download Plan" onClick={() => {
+                        const text = result.migration_plan.steps?.map(s =>
+                          `Step ${s.step_number} [${s.phase}] — ${s.description}\nTarget: ${s.target_qm}\nForward MQSC:\n${s.mqsc_forward || "N/A"}\nRollback MQSC:\n${s.mqsc_rollback || "N/A"}\nVerification:\n${s.verification || "N/A"}\n${"─".repeat(60)}`
+                        ).join("\n\n") || "No steps";
+                        downloadFile(text, "migration_plan.txt");
+                      }} />
+                    }>Migration Steps</CardHeader>
+                    {result.migration_plan.steps?.map((step, i) => (
+                      <MigrationStep key={i} step={step} delay={0.03 * i} />
+                    ))}
+                  </Card>
+                </>
+              ) : (
+                <EmptyState icon="⇄" message={
+                  result.awaiting_human_review
+                    ? "Approve the design in the Review tab first. The migration plan is generated after approval."
+                    : "No migration plan data was returned. Check the Trace tab for pipeline details."
+                } />
+              )}
+            </div>
+          )}
+
+          {/* ━━━ MQSC TAB ━━━ */}
+          {tab === "mqsc" && result && !loading && (
+            <div style={{ animation: "fadeUp 0.4s ease-out" }}>
+              {result.mqsc_scripts?.length > 0 ? (
+                <>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+                    <div>
+                      <h2 style={{ fontSize: 16, fontWeight: 600, fontFamily: T.fontDisplay, color: T.t1, marginBottom: 4 }}>
+                        MQSC Provisioning Scripts
+                      </h2>
+                      <p style={{ fontSize: 12, color: T.t3 }}>Per-QM runmqsc commands for the target state. Ready to execute.</p>
+                    </div>
+                    <DownloadButton label="Download All" onClick={() => {
+                      downloadFile(result.mqsc_scripts?.join("\n") || "", "mq_titan_target.mqsc");
+                    }} />
+                  </div>
+                  <Card>
+                    <pre style={{
+                      padding: 20, fontSize: 11, lineHeight: 1.8,
+                      fontFamily: T.fontMono, color: T.t2,
+                      overflowX: "auto", maxHeight: 600,
+                      margin: 0,
+                    }}>
+                      {result.mqsc_scripts.join("\n")}
+                    </pre>
+                  </Card>
+                </>
+              ) : (
+                <EmptyState icon="▸" message={
+                  result.awaiting_human_review
+                    ? "Approve the design in the Review tab first. MQSC scripts are generated after approval."
+                    : "No MQSC scripts were returned. Check the Trace tab for pipeline details."
+                } />
+              )}
+            </div>
+          )}
+
+          {/* ━━━ CSVS TAB ━━━ */}
+          {tab === "csvs" && result && !loading && (
+            <div style={{ animation: "fadeUp 0.4s ease-out" }}>
+              <div style={{ marginBottom: 20 }}>
+                <h2 style={{ fontSize: 16, fontWeight: 600, fontFamily: T.fontDisplay, color: T.t1, marginBottom: 4 }}>
+                  Target State CSVs
+                </h2>
+                <p style={{ fontSize: 12, color: T.t3 }}>Same format as input — ready to feed into any provisioning tool or re-analyse.</p>
+              </div>
+              {result.target_csvs && Object.keys(result.target_csvs).length > 0
+                ? Object.entries(result.target_csvs).map(([name, content], idx) => {
+                    const rows = content.trim().split("\n").length - 1;
+                    return (
+                      <Card key={name} delay={0.1 * idx} style={{ marginBottom: 12 }}>
+                        <CardHeader right={
+                          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                            <Badge color={T.t3}>{rows} rows</Badge>
+                            <DownloadButton label="Download" onClick={() => downloadFile(content, name + ".csv", "text/csv")} />
+                          </div>
+                        }>
+                          <span style={{ fontFamily: T.fontMono }}>{name}.csv</span>
+                        </CardHeader>
+                        <pre style={{
+                          padding: "12px 16px", margin: 0,
+                          fontSize: 10, fontFamily: T.fontMono,
+                          color: T.t3, lineHeight: 1.6,
+                          overflowX: "auto", maxHeight: 140,
+                        }}>
+{content.trim().split("\n").slice(0, 6).join("\n")}
+{content.trim().split("\n").length > 6 ? `\n... (${content.trim().split("\n").length - 6} more rows)` : ""}
+                        </pre>
+                      </Card>
+                    );
+                  })
+                : <EmptyState icon="⊞" message={
+                    result.awaiting_human_review
+                      ? "Approve the design in the Review tab first. Target CSVs are generated after approval."
+                      : "No CSV output was returned. Check the Trace tab for pipeline details."
+                  } />}
+            </div>
+          )}
+
+          {/* ━━━ REPORT TAB ━━━ */}
+          {tab === "report" && result && !loading && (
+            <div style={{ animation: "fadeUp 0.4s ease-out" }}>
+              {result.final_report ? (
+                <>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+                    <h2 style={{ fontSize: 16, fontWeight: 600, fontFamily: T.fontDisplay, color: T.t1 }}>
+                      Final Analysis Report
+                    </h2>
+                    <DownloadButton label="Download Report" onClick={() => {
+                      downloadFile(result.final_report, "mq_titan_report.md");
+                    }} />
+                  </div>
+                  <Card>
+                    <pre style={{
+                      padding: 20, fontSize: 12, lineHeight: 1.7,
+                      fontFamily: T.fontSans, color: T.t2,
+                      overflowX: "auto", maxHeight: 700,
+                      whiteSpace: "pre-wrap", wordBreak: "break-word",
+                      margin: 0,
+                    }}>
+                      {result.final_report}
+                    </pre>
+                  </Card>
+                </>
+              ) : (
+                <EmptyState icon="◫" message={
+                  result.awaiting_human_review
+                    ? "Approve the design in the Review tab first. The report is generated after approval."
+                    : "No report was returned. Check the Trace tab for pipeline details."
+                } />
+              )}
+            </div>
+          )}
+
+          {/* ━━━ TRACE TAB ━━━ */}
+          {tab === "trace" && result && !loading && (
+            <div style={{ animation: "fadeUp 0.4s ease-out" }}>
+              <div style={{ marginBottom: 20 }}>
+                <h2 style={{ fontSize: 16, fontWeight: 600, fontFamily: T.fontDisplay, color: T.t1, marginBottom: 4 }}>
+                  Agent Execution Trace
+                </h2>
+                <p style={{ fontSize: 12, color: T.t3 }}>Ordered log from every agent in the pipeline.</p>
+              </div>
+              {result.agent_trace?.length > 0 ? (
+                <div style={{ position: "relative" }}>
+                  {/* Timeline line */}
+                  <div style={{
+                    position: "absolute", left: 71, top: 0, bottom: 0,
+                    width: 1, background: T.border0,
+                  }} />
+                  {result.agent_trace.map((m, i) => {
+                    // Handle both {agent, msg} objects and plain strings
+                    const agent = typeof m === "string" ? "Pipeline" : (m.agent || "Pipeline");
+                    const msg = typeof m === "string" ? m : (m.msg || m.message || JSON.stringify(m));
+                    return (
+                      <div key={i} style={{
+                        display: "flex", gap: 14, alignItems: "flex-start",
+                        padding: "10px 0",
+                        animation: `slideIn 0.3s ease-out ${0.04 * i}s both`,
+                        position: "relative",
+                      }}>
+                        <span style={{
+                          fontSize: 10, fontWeight: 600, fontFamily: T.fontMono,
+                          color: T.cyan, minWidth: 64, textAlign: "right",
+                          paddingTop: 2, flexShrink: 0,
+                        }}>{agent}</span>
+                        {/* Dot */}
+                        <div style={{
+                          width: 9, height: 9, borderRadius: "50%",
+                          background: T.cyan, border: `2px solid ${T.bg0}`,
+                          marginTop: 4, flexShrink: 0, zIndex: 1,
+                        }} />
+                        <div style={{
+                          fontSize: 12, color: T.t2, lineHeight: 1.6,
+                          padding: "6px 12px", background: T.bg2,
+                          borderRadius: T.r1, border: `1px solid ${T.border0}`,
+                          flex: 1,
+                        }}>{msg}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <EmptyState icon="⋯" message="No trace data available." />
+              )}
+            </div>
+          )}
+
+          {/* ── No result placeholder ── */}
+          {!result && tab !== "upload" && !loading && (
+            <EmptyState icon="◇" message="No analysis run yet. Go to the Upload tab and run the demo or upload your CSV files." />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   PIPELINE DIAGRAM — Animated 10-agent flow
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+const PIPELINE_AGENTS = [
+  { id: 1,  name: "Supervisor",      icon: "⊡", desc: "Validate session & paths",       color: T.t3 },
+  { id: 2,  name: "Sanitiser",       icon: "⊟", desc: "Clean & deduplicate data",       color: T.t3 },
+  { id: 3,  name: "Researcher",      icon: "◇", desc: "Build graph, detect violations",  color: T.cyan },
+  { id: 4,  name: "Analyst",         icon: "▤", desc: "5-factor complexity score",       color: T.cyan },
+  { id: 5,  name: "Architect",       icon: "◆", desc: "LLM designs target state",       color: T.green },
+  { id: 6,  name: "Optimizer",       icon: "⊘", desc: "Prune channels via reachability", color: T.green },
+  { id: 7,  name: "Tester",          icon: "◎", desc: "8 constraint validation checks",  color: T.amber },
+  { id: 8,  name: "Human Review",    icon: "⏸", desc: "Approve / reject / abort",       color: T.amber },
+  { id: 9,  name: "Provisioner",     icon: "▸", desc: "Per-QM MQSC + target CSVs",      color: T.purple },
+  { id: 10, name: "Migration",       icon: "⇄", desc: "4-phase rollback-safe plan",     color: T.purple },
+];
+
+function PipelineDiagram() {
+  const [activeIdx, setActiveIdx] = useState(-1);
+
+  useEffect(() => {
+    // Sequentially light up each agent
+    let i = 0;
+    const timer = setInterval(() => {
+      setActiveIdx(i);
+      i++;
+      if (i >= PIPELINE_AGENTS.length) {
+        // Reset after a pause and loop
+        setTimeout(() => {
+          setActiveIdx(-1);
+          i = 0;
+        }, 1200);
+      }
+    }, 350);
+    return () => clearInterval(timer);
+  }, []);
+
+  return (
+    <div style={{
+      marginTop: 28, padding: "20px 0",
+      animation: "fadeUp 0.5s ease-out 0.4s both",
+    }}>
+      {/* Title */}
+      <div style={{
+        textAlign: "center", marginBottom: 16,
+        fontSize: 10, fontWeight: 600, color: T.t4,
+        fontFamily: T.fontMono, textTransform: "uppercase", letterSpacing: "0.1em",
+      }}>
+        10-Agent Pipeline
+      </div>
+
+      {/* Pipeline flow */}
+      <div style={{
+        display: "flex", alignItems: "center", justifyContent: "center",
+        gap: 0, overflowX: "auto", padding: "4px 8px",
+      }}>
+        {PIPELINE_AGENTS.map((agent, i) => {
+          const isActive = i <= activeIdx;
+          const isCurrent = i === activeIdx;
+          return (
+            <div key={agent.id} style={{ display: "flex", alignItems: "center", flexShrink: 0 }}>
+              {/* Agent node */}
+              <div style={{ position: "relative", textAlign: "center" }}>
+                {/* Glow ring for current */}
+                {isCurrent && (
+                  <div style={{
+                    position: "absolute", top: -4, left: "50%", transform: "translateX(-50%)",
+                    width: 38, height: 38, borderRadius: "50%",
+                    border: `2px solid ${agent.color}`,
+                    opacity: 0.4,
+                    animation: "pulse 1s infinite",
+                  }} />
+                )}
+                {/* Circle */}
+                <div style={{
+                  width: 30, height: 30, borderRadius: "50%",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  fontSize: 12,
+                  background: isActive ? `${agent.color}20` : T.bg2,
+                  border: `1.5px solid ${isActive ? agent.color : T.border0}`,
+                  color: isActive ? agent.color : T.t4,
+                  transition: "all 0.3s cubic-bezier(0.16, 1, 0.3, 1)",
+                  boxShadow: isCurrent ? `0 0 12px ${agent.color}30` : "none",
+                }}>
+                  {agent.icon}
+                </div>
+                {/* Label */}
+                <div style={{
+                  fontSize: 8, fontFamily: T.fontMono, fontWeight: 600,
+                  color: isActive ? agent.color : T.t4,
+                  marginTop: 5, whiteSpace: "nowrap",
+                  transition: "color 0.3s",
+                  letterSpacing: "0.02em",
+                  maxWidth: 56, overflow: "hidden", textOverflow: "ellipsis",
+                }}>
+                  {agent.name}
+                </div>
+                {/* Description tooltip on current */}
+                {isCurrent && (
+                  <div style={{
+                    position: "absolute", top: -32, left: "50%", transform: "translateX(-50%)",
+                    padding: "3px 8px", borderRadius: 4,
+                    background: agent.color, color: T.bg0,
+                    fontSize: 8, fontFamily: T.fontMono, fontWeight: 600,
+                    whiteSpace: "nowrap",
+                    animation: "fadeIn 0.2s ease-out",
+                    boxShadow: `0 2px 8px ${agent.color}40`,
+                  }}>
+                    {agent.desc}
+                    {/* Arrow */}
+                    <div style={{
+                      position: "absolute", bottom: -4, left: "50%", transform: "translateX(-50%)",
+                      width: 0, height: 0,
+                      borderLeft: "4px solid transparent", borderRight: "4px solid transparent",
+                      borderTop: `4px solid ${agent.color}`,
+                    }} />
+                  </div>
+                )}
+              </div>
+
+              {/* Connector line */}
+              {i < PIPELINE_AGENTS.length - 1 && (
+                <div style={{
+                  width: 20, height: 1.5,
+                  background: i < activeIdx
+                    ? `linear-gradient(90deg, ${PIPELINE_AGENTS[i].color}80, ${PIPELINE_AGENTS[i + 1].color}80)`
+                    : T.border0,
+                  transition: "background 0.3s",
+                  margin: "0 1px",
+                  marginBottom: 18, /* align with circles, not labels */
+                }} />
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   UPLOAD TAB — Hero demo launcher + collapsible custom upload
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function UploadTab({ runDemo, handleUpload }) {
+  const [showUpload, setShowUpload] = useState(false);
+
+  return (
+    <div style={{ animation: "fadeUp 0.4s ease-out", maxWidth: 640, margin: "0 auto" }}>
+      {/* Hero section */}
+      <div style={{ textAlign: "center", marginBottom: 48, marginTop: 24 }}>
+        <div style={{
+          width: 64, height: 64, borderRadius: 16, margin: "0 auto 20px",
+          background: `linear-gradient(135deg, ${T.cyan}18, ${T.cyan}05)`,
+          border: `1px solid ${T.cyan}25`,
+          display: "flex", alignItems: "center", justifyContent: "center",
+          fontSize: 28, color: T.cyan,
+          boxShadow: `0 0 40px ${T.cyan}15, 0 0 80px ${T.cyan}08`,
+          animation: "scaleIn 0.5s ease-out",
+        }}>◆</div>
+        <h2 style={{
+          fontSize: 28, fontWeight: 700, fontFamily: T.fontDisplay, color: T.t1,
+          marginBottom: 10, letterSpacing: "-0.01em",
+          animation: "fadeUp 0.5s ease-out 0.1s both",
+        }}>
+          MQ Topology Intelligence
+        </h2>
+        <p style={{
+          fontSize: 14, color: T.t3, lineHeight: 1.7, maxWidth: 460, margin: "0 auto",
+          animation: "fadeUp 0.5s ease-out 0.2s both",
+        }}>
+          10 AI agents analyse, redesign, and provision your IBM MQ infrastructure.
+          Complexity scoring, architecture decisions, MQSC generation, and migration planning — all in one run.
+        </p>
+      </div>
+
+      {/* Giant demo button */}
+      <div style={{ animation: "fadeUp 0.5s ease-out 0.3s both" }}>
+        <button onClick={runDemo} style={{
+          width: "100%", padding: "22px 28px",
+          borderRadius: T.r2,
+          background: `linear-gradient(135deg, ${T.cyan}12, ${T.cyan}06)`,
+          border: `1px solid ${T.cyan}30`,
+          cursor: "pointer",
+          display: "flex", alignItems: "center", gap: 20,
+          transition: "all 0.2s",
+          boxShadow: `0 0 30px ${T.cyan}08`,
+          position: "relative",
+          overflow: "hidden",
+        }}
+          onMouseEnter={e => {
+            e.currentTarget.style.borderColor = `${T.cyan}60`;
+            e.currentTarget.style.boxShadow = `0 0 40px ${T.cyan}15, 0 4px 20px rgba(0,0,0,0.3)`;
+            e.currentTarget.style.transform = "translateY(-1px)";
+          }}
+          onMouseLeave={e => {
+            e.currentTarget.style.borderColor = `${T.cyan}30`;
+            e.currentTarget.style.boxShadow = `0 0 30px ${T.cyan}08`;
+            e.currentTarget.style.transform = "translateY(0)";
+          }}
+        >
+          {/* Play icon */}
+          <div style={{
+            width: 56, height: 56, borderRadius: 14,
+            background: `linear-gradient(135deg, ${T.cyan}, ${T.cyanDim})`,
+            display: "flex", alignItems: "center", justifyContent: "center",
+            fontSize: 22, color: T.bg0, flexShrink: 0,
+            boxShadow: `0 4px 16px ${T.cyan}40`,
+          }}>▶</div>
+          <div style={{ textAlign: "left", flex: 1 }}>
+            <div style={{ fontSize: 18, fontWeight: 700, color: T.t1, fontFamily: T.fontDisplay }}>
+              Launch Demo Analysis
+            </div>
+            <div style={{ fontSize: 12, color: T.t3, marginTop: 4, lineHeight: 1.5 }}>
+              Runs the full 10-agent pipeline on a synthetic MQ environment
+              with 8 queue managers, 60+ channels, and 20 applications
+            </div>
+          </div>
+          <div style={{ color: T.cyan, fontSize: 22, flexShrink: 0, opacity: 0.6 }}>→</div>
+        </button>
+      </div>
+
+      {/* Animated pipeline diagram */}
+      <PipelineDiagram />
+
+      {/* Collapsible custom upload */}
+      <div style={{ marginTop: 36, animation: "fadeUp 0.5s ease-out 0.5s both" }}>
+        <button onClick={() => setShowUpload(!showUpload)} style={{
+          width: "100%", padding: "12px 16px",
+          borderRadius: T.r1,
+          background: "transparent",
+          border: `1px solid ${T.border0}`,
+          cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+          color: T.t4, fontSize: 11, fontFamily: T.fontMono,
+          transition: "all 0.15s",
+        }}
+          onMouseEnter={e => { e.currentTarget.style.borderColor = T.border1; e.currentTarget.style.color = T.t3; }}
+          onMouseLeave={e => { e.currentTarget.style.borderColor = T.border0; e.currentTarget.style.color = T.t4; }}
+        >
+          <span style={{
+            transform: showUpload ? "rotate(180deg)" : "rotate(0deg)",
+            transition: "transform 0.2s", fontSize: 10,
+          }}>▼</span>
+          {showUpload ? "Hide custom upload" : "Or upload your own MQ environment CSVs"}
+        </button>
+
+        {showUpload && (
+          <Card delay={0} style={{ marginTop: 12, animation: "fadeUp 0.3s ease-out" }}>
+            <CardHeader>Upload Custom CSVs</CardHeader>
+            <form onSubmit={handleUpload} style={{ padding: 20 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 16 }}>
+                {["queue_managers", "queues", "applications", "channels"].map(name => (
+                  <div key={name}>
+                    <label style={{
+                      display: "block", fontSize: 10, fontWeight: 600, marginBottom: 6,
+                      color: T.t3, textTransform: "uppercase", letterSpacing: "0.06em", fontFamily: T.fontMono,
+                    }}>
+                      {name.replace("_", " ")}
+                    </label>
+                    <div style={{
+                      position: "relative", padding: "10px 12px",
+                      borderRadius: T.r1, border: `1px dashed ${T.border1}`,
+                      background: T.bg3,
+                    }}>
+                      <input type="file" name={name} accept=".csv" required style={{
+                        fontSize: 11, color: T.t2, width: "100%",
+                        fontFamily: T.fontMono,
+                      }} />
+                    </div>
+                  </div>
+                ))}
+              </div>
               <button type="submit" style={{
-                marginTop: 8, width: "100%", padding: "10px", borderRadius: 8,
-                background: "var(--color-background-success)", color: "var(--color-text-success)",
-                border: "1px solid var(--color-border-success)", fontSize: 14, fontWeight: 500, cursor: "pointer",
+                width: "100%", padding: "12px",
+                borderRadius: T.r1, border: `1px solid ${T.green}40`,
+                background: `linear-gradient(180deg, ${T.green}15, ${T.green}08)`,
+                color: T.green, fontSize: 13, fontWeight: 600,
+                cursor: "pointer", fontFamily: T.fontSans,
+                transition: "all 0.15s",
               }}>
                 Analyse My Environment
               </button>
             </form>
-          </div>
-        </div>
-      )}
+          </Card>
+        )}
+      </div>
+    </div>
+  );
+}
 
 
-      {/* ── REVIEW TAB ── */}
-      {tab === "review" && result && !loading && (
-        <div>
-          {result.awaiting_human_review ? (
-            <div>
-              {/* Header banner */}
-              <div style={{ padding: "14px 16px", background: "var(--color-background-warning)", borderRadius: 8, marginBottom: 20, display: "flex", alignItems: "center", gap: 10 }}>
-                <span style={{ fontSize: 18 }}>⏳</span>
-                <div>
-                  <p style={{ margin: 0, fontWeight: 600, fontSize: 14, color: "var(--color-text-warning)" }}>Pipeline paused — awaiting your review</p>
-                  <p style={{ margin: 0, fontSize: 12, color: "var(--color-text-secondary)", marginTop: 2 }}>Review the proposed target state below. Approve to generate outputs or reject with a reason.</p>
-                </div>
-              </div>
+/* ═══════════════════════════════════════════════════════════════════════════
+   MIGRATION STEP — Expandable
+   ═══════════════════════════════════════════════════════════════════════════ */
 
-              {/* Complexity summary */}
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 20 }}>
-                <div style={{ padding: "14px", background: "var(--color-background-secondary)", borderRadius: 8, textAlign: "center" }}>
-                  <div style={{ fontSize: 26, fontWeight: 700, color: "#E24B4A" }}>{result.as_is_metrics?.total_score}</div>
-                  <div style={{ fontSize: 11, color: "var(--color-text-tertiary)", marginTop: 4 }}>As-Is Score</div>
-                </div>
-                <div style={{ padding: "14px", background: "var(--color-background-secondary)", borderRadius: 8, textAlign: "center" }}>
-                  <div style={{ fontSize: 26, fontWeight: 700, color: "#1D9E75" }}>{result.target_metrics?.total_score}</div>
-                  <div style={{ fontSize: 11, color: "var(--color-text-tertiary)", marginTop: 4 }}>Target Score</div>
-                </div>
-                <div style={{ padding: "14px", background: "var(--color-background-secondary)", borderRadius: 8, textAlign: "center" }}>
-                  <div style={{ fontSize: 26, fontWeight: 700, color: "#1D9E75" }}>{result.complexity_reduction?.reduction_pct}%</div>
-                  <div style={{ fontSize: 11, color: "var(--color-text-tertiary)", marginTop: 4 }}>Complexity Reduction</div>
-                </div>
-              </div>
-
-              {/* ADRs summary */}
-              {result.adrs?.length > 0 && (
-                <div style={{ marginBottom: 20 }}>
-                  <p style={{ fontSize: 13, fontWeight: 500, marginBottom: 8 }}>Architecture Decisions ({result.adrs.length})</p>
-                  {result.adrs.map((adr, i) => (
-                    <div key={i} style={{ padding: "8px 12px", background: "var(--color-background-secondary)", borderRadius: 6, marginBottom: 6, fontSize: 12 }}>
-                      <span style={{ fontWeight: 500, color: "var(--color-text-info)" }}>{adr.id}</span>
-                      <span style={{ color: "var(--color-text-secondary)", marginLeft: 8 }}>{adr.decision}</span>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {/* Topology preview */}
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 20 }}>
-                <TopologyGraph graphData={result.as_is_graph} title="As-Is Topology" height={240} />
-                <TopologyGraph graphData={result.target_graph} title="Proposed Target State" height={240} />
-              </div>
-
-              {/* Approve / Reject */}
-              <div style={{ border: "1px solid var(--color-border-tertiary)", borderRadius: 8, padding: 16 }}>
-                <p style={{ fontSize: 13, fontWeight: 500, marginBottom: 12 }}>Your Decision</p>
-
-                <textarea
-                  value={reviewFeedback}
-                  onChange={e => setReviewFeedback(e.target.value)}
-                  placeholder="If rejecting, describe what needs to change (required for rejection)..."
-                  rows={3}
-                  style={{ width: "100%", padding: "8px 10px", borderRadius: 6, border: "1px solid var(--color-border-secondary)", fontSize: 12, marginBottom: 12, background: "var(--color-background-primary)", color: "var(--color-text-primary)", resize: "vertical", boxSizing: "border-box" }}
-                />
-
-                <div style={{ display: "flex", gap: 10 }}>
-                  <button
-                    onClick={() => submitReview(true)}
-                    disabled={reviewLoading}
-                    style={{ flex: 1, padding: "10px", borderRadius: 8, border: "none", background: "#1D9E75", color: "#fff", fontSize: 14, fontWeight: 600, cursor: reviewLoading ? "not-allowed" : "pointer", opacity: reviewLoading ? 0.6 : 1 }}>
-                    {reviewLoading ? "Processing..." : "✓ Approve — Generate Outputs"}
-                  </button>
-                  <button
-                    onClick={() => submitReview(false)}
-                    disabled={reviewLoading}
-                    style={{ flex: 1, padding: "10px", borderRadius: 8, border: "1px solid #E24B4A", background: "transparent", color: "#E24B4A", fontSize: 14, fontWeight: 600, cursor: reviewLoading ? "not-allowed" : "pointer", opacity: reviewLoading ? 0.6 : 1 }}>
-                    {reviewLoading ? "Processing..." : "✗ Reject — Redesign with Feedback"}
-                  </button>
-                </div>
-              </div>
-            </div>
-          ) : (
-            <div style={{ padding: "20px", textAlign: "center", color: "var(--color-text-secondary)", fontSize: 13 }}>
-              {result.human_approved === true
-                ? "✓ You approved this design. Outputs are available in the other tabs."
-                : result.human_approved === false
-                ? "✗ You rejected this design. The Architect is redesigning — check the Trace tab."
-                : "No review pending."}
+function MigrationStep({ step, delay = 0 }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div style={{
+      borderBottom: `1px solid ${T.border0}`,
+      animation: `slideIn 0.3s ease-out ${delay}s both`,
+    }}>
+      <div onClick={() => setOpen(!open)} style={{
+        padding: "12px 16px", cursor: "pointer",
+        display: "flex", alignItems: "center", gap: 12,
+        transition: "background 0.15s",
+        background: open ? `${T.bg3}60` : "transparent",
+      }}
+        onMouseEnter={e => { if (!open) e.currentTarget.style.background = `${T.bg3}30`; }}
+        onMouseLeave={e => { if (!open) e.currentTarget.style.background = "transparent"; }}
+      >
+        <span style={{
+          fontSize: 11, fontWeight: 700, fontFamily: T.fontMono,
+          color: T.t3, minWidth: 24,
+        }}>{step.step_number}</span>
+        <PhaseBadge phase={step.phase} />
+        <span style={{ fontSize: 12, color: T.t2, flex: 1 }}>{step.description}</span>
+        {step.target_qm && <Badge color={T.t3} style={{ fontSize: 9 }}>{step.target_qm}</Badge>}
+        <span style={{
+          fontSize: 10, color: T.t4,
+          transform: open ? "rotate(180deg)" : "rotate(0deg)",
+          transition: "transform 0.2s",
+        }}>▼</span>
+      </div>
+      {open && (
+        <div style={{ padding: "0 16px 16px 52px", animation: "fadeIn 0.2s" }}>
+          {step.depends_on?.length > 0 && (
+            <div style={{ fontSize: 11, color: T.t3, marginBottom: 10, fontFamily: T.fontMono }}>
+              Depends on: {step.depends_on.map(d => `Step ${d}`).join(", ")}
             </div>
           )}
-        </div>
-      )}
-
-      {/* ── TOPOLOGY TAB ── */}
-      {tab === "topology" && result && !loading && (
-        <div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
-            <TopologyGraph graphData={result.as_is_graph} title="As-Is Topology (current state)" />
-            <TopologyGraph graphData={result.target_graph} title="Target State (after transformation)" />
-          </div>
-          <div style={{ marginTop: 12, padding: "10px 14px", background: "var(--color-background-success)", borderRadius: 8, fontSize: 13 }}>
-            <strong style={{ color: "var(--color-text-success)" }}>
-              Complexity reduction: {result.complexity_reduction?.reduction_pct}% 
-            </strong>
-            <span style={{ color: "var(--color-text-secondary)", marginLeft: 8 }}>
-              Score: {result.complexity_reduction?.before} → {result.complexity_reduction?.after}
-            </span>
-            <span style={{ marginLeft: 12, color: result.validation_passed ? "var(--color-text-success)" : "var(--color-text-danger)" }}>
-              {result.validation_passed ? "✓ All constraints satisfied" : "✗ Constraint violations found"}
-            </span>
-          </div>
-        </div>
-      )}
-
-      {/* ── METRICS TAB ── */}
-      {tab === "metrics" && result && !loading && (
-        <div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20, marginBottom: 24 }}>
-            <ScoreGauge label="As-Is Complexity Score" score={result.as_is_metrics?.total_score} />
-            <ScoreGauge label="Target Complexity Score" score={result.target_metrics?.total_score} />
-          </div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 80px 80px 80px", gap: 8, padding: "6px 0", fontSize: 11, color: "var(--color-text-tertiary)", fontWeight: 500 }}>
-            <span>Metric</span><span style={{ textAlign: "right" }}>Before</span><span style={{ textAlign: "right" }}>After</span><span style={{ textAlign: "right" }}>Delta</span>
-          </div>
           {[
-            ["Channel Count (30%)", "channel_count"],
-            ["Coupling Index (25%)", "coupling_index"],
-            ["Routing Depth (20%)", "routing_depth"],
-            ["Fan-Out Score (15%)", "fan_out_score"],
-            ["Orphan Objects (10%)", "orphan_objects"],
-          ].map(([label, key]) => (
-            <MetricRow key={key} label={label}
-              before={result.as_is_metrics?.[key] ?? "—"}
-              after={result.target_metrics?.[key] ?? "—"} />
-          ))}
-
-          {result.constraint_violations?.length > 0 && (
-            <div style={{ marginTop: 20 }}>
-              <p style={{ fontWeight: 500, fontSize: 13, marginBottom: 8 }}>Constraint Violations</p>
-              {result.constraint_violations.map((v, i) => <ViolationBadge key={i} v={v} />)}
+            ["Forward MQSC", step.mqsc_forward, T.green],
+            ["Rollback MQSC", step.mqsc_rollback, T.red],
+            ["Verification", step.verification, T.cyan],
+          ].map(([label, content, color]) => content && (
+            <div key={label} style={{ marginBottom: 10 }}>
+              <div style={{
+                fontSize: 10, fontWeight: 600, color, fontFamily: T.fontMono,
+                textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 4,
+              }}>{label}</div>
+              <pre style={{
+                padding: "10px 12px", borderRadius: T.r1,
+                background: T.bg1, border: `1px solid ${T.border0}`,
+                fontSize: 10, fontFamily: T.fontMono, color: T.t2,
+                lineHeight: 1.6, overflowX: "auto", margin: 0,
+                whiteSpace: "pre-wrap",
+              }}>{content}</pre>
             </div>
-          )}
+          ))}
         </div>
-      )}
-
-      {/* ── ADRs TAB ── */}
-      {tab === "adrs" && result && !loading && (
-        <div>
-          <p style={{ fontSize: 13, color: "var(--color-text-secondary)", marginBottom: 16 }}>
-            Architecture Decision Records — every design decision the Architect agent made, with full rationale.
-          </p>
-          {result.adrs?.length
-            ? result.adrs.map((adr, i) => <ADRCard key={i} adr={adr} />)
-            : <p style={{ color: "var(--color-text-tertiary)", fontSize: 13 }}>No ADRs recorded.</p>
-          }
-        </div>
-      )}
-
-      {/* ── MQSC TAB ── */}
-      {tab === "mqsc" && result && !loading && (
-        <div>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-            <p style={{ fontSize: 13, color: "var(--color-text-secondary)", margin: 0 }}>
-              Ready-to-run MQSC provisioning commands for the target state.
-            </p>
-            <button onClick={() => {
-              const blob = new Blob([result.mqsc_scripts?.join("\n")], { type: "text/plain" });
-              const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
-              a.download = "mq_titan_target.mqsc"; a.click();
-            }} style={{ fontSize: 12, padding: "6px 12px", borderRadius: 6, border: "1px solid var(--color-border-secondary)", background: "transparent", cursor: "pointer", color: "var(--color-text-primary)" }}>
-              Download .mqsc
-            </button>
-          </div>
-          <pre style={{ background: "var(--color-background-secondary)", borderRadius: 8, padding: 16, fontSize: 11, overflowX: "auto", lineHeight: 1.8, color: "var(--color-text-primary)" }}>
-            {result.mqsc_scripts?.join("\n") || "No scripts generated."}
-          </pre>
-        </div>
-      )}
-
-
-      {/* ── CSVS TAB ── */}
-      {tab === "csvs" && result && !loading && (
-        <div>
-          <p style={{ fontSize: 13, color: "var(--color-text-secondary)", marginBottom: 16 }}>
-            Target state CSV files — same format as input. Ready to feed into any provisioning tool.
-          </p>
-          {result.target_csvs && Object.keys(result.target_csvs).length > 0
-            ? Object.entries(result.target_csvs).map(([name, content]) => {
-              const rows = content.trim().split("\n").length - 1;
-
-                return (
-                  <div key={name} style={{ marginBottom: 16, border: "1px solid var(--color-border-tertiary)", borderRadius: 8, overflow: "hidden" }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 14px", background: "var(--color-background-secondary)" }}>
-                      <div>
-                        <span style={{ fontSize: 13, fontWeight: 500 }}>{name}.csv</span>
-                        <span style={{ fontSize: 11, color: "var(--color-text-tertiary)", marginLeft: 10 }}>{rows} rows</span>
-                      </div>
-                      <button onClick={() => {
-                        const blob = new Blob([content], { type: "text/csv" });
-                        const a = document.createElement("a");
-                        a.href = URL.createObjectURL(blob);
-                        a.download = name + ".csv";
-                        a.click();
-                      }} style={{ fontSize: 12, padding: "5px 12px", borderRadius: 6, border: "1px solid var(--color-border-secondary)", background: "transparent", cursor: "pointer", color: "var(--color-text-primary)" }}>
-                        Download
-                      </button>
-                    </div>
-                    <pre style={{ margin: 0, padding: "10px 14px", fontSize: 10, overflowX: "auto", background: "var(--color-background-primary)", maxHeight: 160, color: "var(--color-text-secondary)", lineHeight: 1.6 }}>
-  {content.trim().split("\n").slice(0, 6).join("\n")}
-  {content.trim().split("\n").length > 6 ? "\n... (" + (content.trim().split("\n").length - 6) + " more rows)" : ""}
-</pre>
-                  </div>
-                );
-              })
-            : <p style={{ color: "var(--color-text-tertiary)", fontSize: 13 }}>No CSV output generated yet.</p>
-          }
-        </div>
-      )}
-
-      {/* ── TRACE TAB ── */}
-      {tab === "trace" && result && !loading && (
-        <div>
-          <p style={{ fontSize: 13, color: "var(--color-text-secondary)", marginBottom: 16 }}>
-            Agent execution trace — every agent's findings in order.
-          </p>
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {result.agent_trace?.map((m, i) => (
-              <div key={i} style={{ display: "flex", gap: 12, alignItems: "flex-start", padding: "8px 12px", background: "var(--color-background-secondary)", borderRadius: 6 }}>
-                <span style={{ fontSize: 11, fontWeight: 600, minWidth: 100, color: "var(--color-text-info)", paddingTop: 1 }}>{m.agent}</span>
-                <span style={{ fontSize: 12, color: "var(--color-text-secondary)", lineHeight: 1.5 }}>{m.msg}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* No result yet on non-upload tabs */}
-      {!result && tab !== "upload" && !loading && (
-        <p style={{ color: "var(--color-text-tertiary)", fontSize: 13 }}>
-          No analysis run yet. Go to the Upload tab and run the demo or upload your CSV files.
-        </p>
       )}
     </div>
   );

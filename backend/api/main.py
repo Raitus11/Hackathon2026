@@ -29,6 +29,7 @@ from pydantic import BaseModel
 from typing import Optional
 
 from backend.orchestration.workflow import mq_titan_workflow
+from backend.agents.agents import provisioner_agent, migration_planner_agent, doc_expert_agent
 from backend.graph.mq_graph import graph_to_dict, sanitise
 
 logging.basicConfig(level=logging.INFO)
@@ -84,7 +85,11 @@ def _build_response(session_id: str, result: dict) -> dict:
         "agent_trace":           result.get("messages", []),
         "target_csvs":           result.get("target_csvs", {}),
         "data_quality":          result.get("data_quality_report", {}),
-        "awaiting_human_review": result.get("awaiting_human_review", False),
+        "awaiting_human_review": (
+            result.get("awaiting_human_review", False)
+            and not result.get("human_approved")
+            and not result.get("human_aborted")
+        ),
         "human_approved":        result.get("human_approved"),
         "human_aborted":         result.get("human_aborted", False),
         "architect_method":      result.get("architect_method"),
@@ -258,18 +263,37 @@ def submit_review(session_id: str, decision: ReviewDecision):
     result["human_aborted"]         = decision.abort
     result["awaiting_human_review"] = False
 
-    # Resume pipeline from human_review node
-    # LangGraph invoke with the updated state picks up from human_review
-    # conditional edge and routes accordingly
     try:
-        final_result = mq_titan_workflow.invoke(result)
+        if decision.abort:
+            # Abort: just run doc_expert for cancellation report
+            updates = doc_expert_agent(result)
+            result.update(updates)
+        elif decision.approved:
+            # Approve: run the 3 remaining agents directly
+            # (Avoids re-running the full pipeline from supervisor)
+            updates = provisioner_agent(result)
+            result.update(updates)
+            updates = migration_planner_agent(result)
+            result.update(updates)
+            updates = doc_expert_agent(result)
+            result.update(updates)
+        else:
+            # Reject: re-run full pipeline with feedback injected
+            # (Architect needs to redesign based on feedback)
+            final_result = mq_titan_workflow.invoke(result)
+            # Force flags after re-run (pipeline may overwrite them)
+            final_result["human_approved"]        = None  # reset for next review
+            final_result["human_feedback"]        = ""
+            final_result["human_aborted"]         = False
+            final_result["awaiting_human_review"] = True  # will pause at gate again
+            result = final_result
     except Exception as e:
         logger.exception("Pipeline resume error")
         raise HTTPException(status_code=500, detail=str(e))
 
     # Store updated state
-    sessions[session_id] = final_result
-    response = _build_response(session_id, final_result)
+    sessions[session_id] = result
+    response = _build_response(session_id, result)
     responses[session_id] = response
 
     return JSONResponse(content=response)
