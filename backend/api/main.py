@@ -26,11 +26,12 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 
 from backend.orchestration.workflow import mq_titan_workflow
 from backend.agents.agents import provisioner_agent, migration_planner_agent, doc_expert_agent
 from backend.graph.mq_graph import graph_to_dict, sanitise
+from backend.llm.llm_client import call_llm_chat
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -62,6 +63,15 @@ class ReviewDecision(BaseModel):
     approved: bool
     abort: bool = False            # True = stop pipeline entirely, generate failure report
     feedback: Optional[str] = ""   # required if approved=False and abort=False
+
+
+class ChatMessage(BaseModel):
+    role: str       # "user" or "assistant"
+    content: str
+
+class ChatRequest(BaseModel):
+    message: str
+    history: List[ChatMessage] = []
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -323,3 +333,104 @@ def download_target_csv(session_id: str, csv_name: str):
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename={csv_name}.csv"}
     )
+
+# ── Chat with Architect AI ───────────────────────────────────────────────────
+
+CHAT_SYSTEM_PROMPT = """You are the MQ-TITAN Architect AI. You designed the proposed target state for an IBM MQ topology.
+The human reviewer is asking you questions about your design decisions before approving or requesting changes.
+
+Answer concisely and specifically. Reference actual QM names, app IDs, and channel names from the topology.
+If the reviewer suggests changes, acknowledge them and explain what the impact would be.
+Keep responses under 150 words. Be direct and technical."""
+
+
+@app.post("/api/chat/{session_id}")
+def chat_with_architect(session_id: str, req: ChatRequest):
+    """Chat with the Architect AI about the current design."""
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    result = sessions[session_id]
+
+    # Build context about the current design
+    adrs = result.get("adrs", [])
+    as_is = result.get("as_is_metrics", {}) or {}
+    target = result.get("target_metrics", {}) or {}
+    method = result.get("architect_method", "rules_fallback")
+    violations = result.get("constraint_violations", [])
+
+    adr_summary = "\n".join(
+        f"- {a.get('id','')}: {a.get('decision','')}" for a in adrs
+    ) if adrs else "No ADRs."
+
+    violation_summary = "\n".join(
+        f"- [{v.get('severity','')}] {v.get('rule','')}: {v.get('detail','')}"
+        for v in violations[:5]
+    ) if violations else "All constraints passed."
+
+    context = (
+        f"Design method: {method}\n"
+        f"As-is score: {as_is.get('total_score', 'N/A')}/100\n"
+        f"Target score: {target.get('total_score', 'N/A')}/100\n"
+        f"ADRs:\n{adr_summary}\n"
+        f"Constraint status:\n{violation_summary}"
+    )
+
+    system = f"{CHAT_SYSTEM_PROMPT}\n\n## CURRENT DESIGN CONTEXT:\n{context}"
+
+    # Build message history for LLM
+    llm_messages = []
+    for msg in req.history:
+        llm_messages.append({"role": msg.role, "content": msg.content})
+    llm_messages.append({"role": "user", "content": req.message})
+
+    # Try LLM call
+    reply = call_llm_chat(
+        system_prompt=system,
+        messages=llm_messages,
+        max_tokens=512,
+        temperature=0.3,
+    )
+
+    if not reply:
+        # Fallback — generate a contextual response based on user's question
+        q = req.message.lower()
+        adr_text = "; ".join(f"{a.get('id','')}: {a.get('decision','')}" for a in adrs[:3])
+
+        if any(w in q for w in ["why", "reason", "explain", "rationale"]):
+            reply = (
+                f"My decisions were based on the {method} method. "
+                f"Key rationale: {adrs[0].get('rationale', 'optimise topology') if adrs else 'reduce complexity'}. "
+                f"The target achieves {target.get('total_score', '?')}/100 vs {as_is.get('total_score', '?')}/100 as-is."
+            )
+        elif any(w in q for w in ["change", "keep", "remove", "move", "don't", "dont", "stop"]):
+            reply = (
+                f"I hear your concern. If we adjust the design, it could affect the complexity score "
+                f"(currently {target.get('total_score', '?')}/100). "
+                f"Type your specific changes and click Revise — I'll redesign with your constraints in mind."
+            )
+        elif any(w in q for w in ["qm", "queue manager", "channel", "app"]):
+            reply = (
+                f"Current design decisions: {adr_text or 'none recorded'}. "
+                f"The target has {target.get('channel_count', '?')} channels "
+                f"(down from {as_is.get('channel_count', '?')}). "
+                f"Ask about a specific QM or app for details."
+            )
+        elif any(w in q for w in ["score", "metric", "complexity", "reduction"]):
+            reply = (
+                f"Complexity breakdown — As-is: {as_is.get('total_score', '?')}/100, "
+                f"Target: {target.get('total_score', '?')}/100. "
+                f"Channels: {as_is.get('channel_count', '?')} → {target.get('channel_count', '?')}. "
+                f"Coupling: {as_is.get('coupling_index', '?')} → {target.get('coupling_index', '?')}. "
+                f"{'All constraints pass.' if not violations else f'{len(violations)} constraint violations remain.'}"
+            )
+        else:
+            reply = (
+                f"I designed this topology using {method}. "
+                f"Score: {as_is.get('total_score', '?')} → {target.get('total_score', '?')} "
+                f"({result.get('complexity_reduction', {}).get('reduction_pct', '?')}% reduction). "
+                f"Decisions: {adr_text or 'none'}. "
+                f"You can ask about specific QMs, channels, scores, or tell me what to change."
+            )
+
+    return JSONResponse(content={"reply": reply})

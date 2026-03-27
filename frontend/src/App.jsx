@@ -3,7 +3,12 @@ import * as d3 from "d3";
 
 const API = "http://localhost:8000";
 
-
+/* ═══════════════════════════════════════════════════════════════════════════
+   DESIGN SYSTEM — Industrial Command Centre
+   Dark theme with electric cyan accents, monospace data density,
+   and warm amber warnings. Built for judges who've seen too many
+   purple-gradient dashboards.
+   ═══════════════════════════════════════════════════════════════════════════ */
 
 const T = {
   // Core palette
@@ -641,9 +646,10 @@ export default function App() {
     result?.final_report
   );
 
-  async function submitReview(approved, abort = false) {
-    if (!approved && !abort && !reviewFeedback.trim()) {
-      setError("Please provide a reason when rejecting — the Architect needs your feedback to redesign.");
+  async function submitReview(approved, abort = false, feedbackOverride = null) {
+    const feedback = feedbackOverride !== null ? feedbackOverride : reviewFeedback;
+    if (!approved && !abort && !feedback.trim()) {
+      setError("Please provide a reason when revising — the Architect needs your feedback to redesign.");
       return;
     }
     // Track the decision locally BEFORE the API call
@@ -659,7 +665,7 @@ export default function App() {
       const res = await fetch(`${API}/api/review/${result?.session_id}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ approved, feedback: reviewFeedback, abort }),
+        body: JSON.stringify({ approved, feedback, abort }),
       });
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
@@ -679,7 +685,10 @@ export default function App() {
 
       if (approved) setTab("topology");
       else if (abort) setTab("trace");
-      // rejected: stay on review — pipeline will come back with new design
+      else {
+        // Revision complete — reset decision so review panel shows the new design
+        setUserDecision(null);
+      }
     } catch (e) {
       // Roll back the local decision on error
       setUserDecision(null);
@@ -822,7 +831,7 @@ export default function App() {
         )}
 
         {/* ── LOADING ── */}
-        {loading && <LoadingOverlay />}
+        {loading && tab !== "review" && <LoadingOverlay />}
 
         {/* ── CONTENT ── */}
         <div style={{ padding: "24px 0 60px" }}>
@@ -833,132 +842,27 @@ export default function App() {
           )}
 
           {/* ━━━ REVIEW TAB ━━━ */}
-          {tab === "review" && result && !loading && (
+          {tab === "review" && result && (
             <div style={{ animation: "fadeUp 0.4s ease-out" }}>
-              {result.awaiting_human_review ? (
-                <>
-                  {/* Status banner */}
-                  <div style={{
-                    padding: "16px 20px", borderRadius: T.r2, marginBottom: 24,
-                    background: T.amberBg, border: `1px solid ${T.amberBorder}`,
-                    display: "flex", alignItems: "center", gap: 14,
-                    animation: "borderGlow 3s infinite",
-                    borderColor: T.amberBorder,
-                  }}>
-                    <div style={{
-                      width: 10, height: 10, borderRadius: "50%",
-                      background: T.amber, animation: "pulse 2s infinite", flexShrink: 0,
-                    }} />
-                    <div>
-                      <div style={{ fontSize: 13, fontWeight: 600, color: T.amber }}>Pipeline Paused — Awaiting Human Review</div>
-                      <div style={{ fontSize: 11, color: T.t3, marginTop: 2 }}>Review the proposed redesign. Approve to generate outputs, reject to iterate, or abort to cancel.</div>
-                    </div>
-                    {architectMethod && (
-                      <Badge color={architectMethod === "llm" ? T.cyan : T.amber} style={{ marginLeft: "auto", fontSize: 9, flexShrink: 0 }}>
-                        {architectMethod === "llm" ? "◆ AI" : "◇ RULES"}
-                      </Badge>
-                    )}
-                  </div>
-
-                  {/* Score cards */}
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 24 }}>
-                    {[
-                      { label: "As-Is Score", value: result.as_is_metrics?.total_score, color: T.red },
-                      { label: "Target Score", value: result.target_metrics?.total_score, color: T.green },
-                      { label: "Reduction", value: `${result.complexity_reduction?.reduction_pct}%`, color: T.cyan },
-                    ].map((s, i) => (
-                      <Card key={i} delay={0.1 * i}>
-                        <Stat label={s.label} value={s.value} color={s.color} delay={0.1 * i} />
-                      </Card>
-                    ))}
-                  </div>
-
-                  {/* ADR summary */}
-                  {result.adrs?.length > 0 && (
-                    <div style={{ marginBottom: 24 }}>
-                      <SectionTitle count={result.adrs.length}>Architecture Decisions</SectionTitle>
-                      {result.adrs.map((adr, i) => (
-                        <div key={i} style={{
-                          padding: "10px 14px", borderRadius: T.r1,
-                          background: T.bg2, border: `1px solid ${T.border0}`,
-                          marginBottom: 6, display: "flex", alignItems: "center", gap: 10,
-                          animation: `slideIn 0.3s ease-out ${0.05 * i}s both`,
-                        }}>
-                          <Badge color={T.cyan} style={{ fontSize: 9 }}>{adr.id}</Badge>
-                          <span style={{ fontSize: 12, color: T.t2 }}>{adr.decision || adr.title}</span>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-
-                  {/* Topology preview */}
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 24 }}>
-                    <TopologyGraph graphData={result.as_is_graph} title="As-Is Topology" height={260} />
-                    <TopologyGraph graphData={result.target_graph} title="Proposed Target" height={260}
-                      badge={<Badge color={T.green} style={{ fontSize: 9 }}>PROPOSED</Badge>} />
-                  </div>
-
-                  {/* Decision panel */}
-                  <Card glow={T.cyan}>
-                    <CardHeader>Your Decision</CardHeader>
-                    <div style={{ padding: 20 }}>
-                      <textarea
-                        value={reviewFeedback}
-                        onChange={e => setReviewFeedback(e.target.value)}
-                        placeholder="Feedback for the Architect (required for rejection)..."
-                        rows={3}
-                        style={{
-                          width: "100%", padding: "10px 12px", borderRadius: T.r1,
-                          border: `1px solid ${T.border1}`, fontSize: 12,
-                          background: T.bg1, color: T.t1, resize: "vertical",
-                          fontFamily: T.fontSans, lineHeight: 1.6,
-                          outline: "none",
-                        }}
-                        onFocus={e => e.target.style.borderColor = T.cyan}
-                        onBlur={e => e.target.style.borderColor = T.border1}
-                      />
-                      <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
-                        <button onClick={() => submitReview(true)} disabled={reviewLoading} style={{
-                          flex: 2, padding: "12px 16px", borderRadius: T.r1, border: "none",
-                          background: `linear-gradient(180deg, ${T.green}, ${T.greenDim})`,
-                          color: "#fff", fontSize: 13, fontWeight: 600, cursor: reviewLoading ? "not-allowed" : "pointer",
-                          opacity: reviewLoading ? 0.6 : 1, fontFamily: T.fontSans,
-                          boxShadow: `0 2px 12px ${T.green}40`,
-                          transition: "all 0.15s",
-                        }}>
-                          {reviewLoading ? "Processing..." : "✓ Approve — Generate Outputs"}
-                        </button>
-                        <button onClick={() => submitReview(false)} disabled={reviewLoading} style={{
-                          flex: 1, padding: "12px 16px", borderRadius: T.r1,
-                          border: `1px solid ${T.amber}50`, background: T.amberBg,
-                          color: T.amber, fontSize: 13, fontWeight: 600,
-                          cursor: reviewLoading ? "not-allowed" : "pointer",
-                          opacity: reviewLoading ? 0.6 : 1, fontFamily: T.fontSans,
-                          transition: "all 0.15s",
-                        }}>
-                          {reviewLoading ? "..." : "↻ Reject"}
-                        </button>
-                        <button onClick={() => submitReview(false, true)} disabled={reviewLoading} style={{
-                          padding: "12px 16px", borderRadius: T.r1,
-                          border: `1px solid ${T.red}40`, background: T.redBg,
-                          color: T.red, fontSize: 13, fontWeight: 600,
-                          cursor: reviewLoading ? "not-allowed" : "pointer",
-                          opacity: reviewLoading ? 0.6 : 1, fontFamily: T.fontSans,
-                          transition: "all 0.15s",
-                        }}>
-                          ✗ Abort
-                        </button>
-                      </div>
-                    </div>
-                  </Card>
-                </>
+              {loading ? (
+                <LoadingOverlay />
+              ) : isAwaitingReview ? (
+                <ReviewChatPanel
+                  result={result}
+                  architectMethod={architectMethod}
+                  reviewLoading={reviewLoading}
+                  onApprove={() => submitReview(true)}
+                  onRevise={(feedback) => submitReview(false, false, feedback)}
+                  onAbort={() => submitReview(false, true)}
+                  sessionId={result?.session_id}
+                />
               ) : (
                 <EmptyState
-                  icon={result.human_approved ? "✓" : result.human_aborted ? "⊘" : "◇"}
+                  icon={isApproved ? "✓" : isAborted ? "⊘" : "◇"}
                   message={
-                    result.human_approved ? "Design approved. Outputs are available in the other tabs."
-                      : result.human_aborted ? "Pipeline aborted. Check the Trace tab for details."
-                      : result.human_approved === false ? "Design rejected. The Architect is redesigning with your feedback."
+                    isApproved ? "Design approved. Outputs are available in the other tabs."
+                      : isAborted ? "Pipeline aborted. Check the Trace tab for details."
+                      : isRejected ? "Revision in progress — the Architect is redesigning based on your feedback."
                       : "No review pending. Run an analysis first."
                   }
                 />
@@ -1357,6 +1261,266 @@ export default function App() {
             <EmptyState icon="◇" message="No analysis run yet. Go to the Upload tab and run the demo or upload your CSV files." />
           )}
         </div>
+      </div>
+    </div>
+  );
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   REVIEW CHAT PANEL — Chat with the Architect AI before deciding
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function ReviewChatPanel({ result, architectMethod, reviewLoading, onApprove, onRevise, onAbort, sessionId }) {
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState("");
+  const [chatLoading, setChatLoading] = useState(false);
+  const chatEndRef = useRef(null);
+  const inputRef = useRef(null);
+
+  // Auto-scroll chat to bottom
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  // Add initial architect greeting
+  useEffect(() => {
+    const method = architectMethod === "llm" ? "AI reasoning" : "rule-based analysis";
+    const score = result?.target_metrics?.total_score || "?";
+    const reduction = result?.complexity_reduction?.reduction_pct || "?";
+    const adrCount = result?.adrs?.length || 0;
+    setMessages([{
+      role: "assistant",
+      content: `I've completed the topology redesign using ${method}. `
+        + `Target complexity score: ${score}/100 (${reduction}% reduction). `
+        + `I made ${adrCount} architecture decisions. `
+        + `Ask me anything about the design before you approve or request changes.`,
+    }]);
+  }, [result, architectMethod]);
+
+  async function sendMessage() {
+    const text = input.trim();
+    if (!text || chatLoading) return;
+
+    const userMsg = { role: "user", content: text };
+    setMessages(prev => [...prev, userMsg]);
+    setInput("");
+    setChatLoading(true);
+
+    try {
+      const res = await fetch(`${API}/api/chat/${sessionId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: text,
+          history: messages.filter(m => m.role === "user" || m.role === "assistant"),
+        }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      setMessages(prev => [...prev, { role: "assistant", content: data.reply }]);
+    } catch (e) {
+      setMessages(prev => [...prev, {
+        role: "assistant",
+        content: "I couldn't process that request. You can still approve, revise, or abort using the buttons below.",
+      }]);
+    } finally {
+      setChatLoading(false);
+      inputRef.current?.focus();
+    }
+  }
+
+  function handleRevise() {
+    // Collect all user messages as the revision feedback
+    const userMessages = messages
+      .filter(m => m.role === "user")
+      .map(m => m.content);
+    const feedback = userMessages.length > 0
+      ? userMessages.join("\n")
+      : "Please revise the design.";
+    onRevise(feedback);
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      {/* TOP ROW — Scores + Badges */}
+      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, flex: 1 }}>
+          {[
+            { label: "As-Is", value: result.as_is_metrics?.total_score, color: T.red },
+            { label: "Target", value: result.target_metrics?.total_score, color: T.green },
+            { label: "Reduction", value: `${result.complexity_reduction?.reduction_pct}%`, color: T.cyan },
+          ].map((s, i) => (
+            <Card key={i} delay={0.05 * i}>
+              <div style={{ padding: "10px 8px", textAlign: "center" }}>
+                <div style={{ fontSize: 22, fontWeight: 700, fontFamily: T.fontDisplay, color: s.color }}>{s.value}</div>
+                <div style={{ fontSize: 9, color: T.t3, marginTop: 2, fontFamily: T.fontMono, textTransform: "uppercase", letterSpacing: "0.06em" }}>{s.label}</div>
+              </div>
+            </Card>
+          ))}
+        </div>
+        <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+          {result.redesign_count > 1 && <Badge color={T.amber} style={{ fontSize: 9 }}>Iteration {result.redesign_count}</Badge>}
+          {architectMethod && (
+            <Badge color={architectMethod === "llm" ? T.cyan : T.amber} style={{ fontSize: 9 }}>
+              {architectMethod === "llm" ? "◆ AI" : "◇ RULES"}
+            </Badge>
+          )}
+        </div>
+      </div>
+
+      {/* TOPOLOGY — Always visible */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+        <TopologyGraph graphData={result.as_is_graph} title="As-Is Topology" height={220} />
+        <TopologyGraph graphData={result.target_graph} title="Proposed Target" height={220}
+          badge={<Badge color={T.green} style={{ fontSize: 8 }}>NEW</Badge>} />
+      </div>
+
+      {/* MAIN ROW — ADRs + Actions (left 60%) | Chat (right 40%) */}
+      <div style={{ display: "grid", gridTemplateColumns: "3fr 2fr", gap: 14 }}>
+
+        {/* LEFT — ADRs + Action buttons */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          {/* ADR summary */}
+          {result.adrs?.length > 0 && (
+            <Card delay={0.1}>
+              <CardHeader right={<Badge color={T.cyan}>{result.adrs.length}</Badge>}>Architecture Decisions</CardHeader>
+              <div style={{ padding: "8px 12px", maxHeight: 180, overflowY: "auto" }}>
+                {result.adrs.map((adr, i) => (
+                  <div key={i} style={{
+                    padding: "6px 0", borderBottom: i < result.adrs.length - 1 ? `1px solid ${T.border0}` : "none",
+                    display: "flex", alignItems: "flex-start", gap: 8,
+                  }}>
+                    <Badge color={T.cyan} style={{ fontSize: 8, flexShrink: 0, marginTop: 2 }}>{adr.id}</Badge>
+                    <span style={{ fontSize: 11, color: T.t2, lineHeight: 1.4 }}>{adr.decision || adr.title}</span>
+                  </div>
+                ))}
+              </div>
+            </Card>
+          )}
+
+          {/* Violations if any */}
+          {result.constraint_violations?.length > 0 && (
+            <div>
+              {result.constraint_violations.slice(0, 3).map((v, i) => (
+                <ViolationBadge key={i} v={v} delay={0.05 * i} />
+              ))}
+            </div>
+          )}
+
+          {/* Action buttons */}
+          <div style={{ marginTop: "auto" }}>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={onApprove} disabled={reviewLoading} style={{
+                flex: 2, padding: "12px 16px", borderRadius: T.r1, border: "none",
+                background: `linear-gradient(180deg, ${T.green}, ${T.greenDim})`,
+                color: "#fff", fontSize: 13, fontWeight: 600, cursor: reviewLoading ? "not-allowed" : "pointer",
+                opacity: reviewLoading ? 0.6 : 1, fontFamily: T.fontSans,
+                boxShadow: `0 2px 12px ${T.green}40`, transition: "all 0.15s",
+              }}>
+                {reviewLoading ? "Processing..." : "✓ Approve — Generate Outputs"}
+              </button>
+              <button onClick={handleRevise} disabled={reviewLoading || messages.filter(m => m.role === "user").length === 0} style={{
+                flex: 1, padding: "12px 16px", borderRadius: T.r1,
+                border: `1px solid ${T.cyan}50`, background: T.cyanBg,
+                color: T.cyan, fontSize: 13, fontWeight: 600,
+                cursor: (reviewLoading || messages.filter(m => m.role === "user").length === 0) ? "not-allowed" : "pointer",
+                opacity: (reviewLoading || messages.filter(m => m.role === "user").length === 0) ? 0.4 : 1,
+                fontFamily: T.fontSans, transition: "all 0.15s",
+              }}>
+                {reviewLoading ? "..." : "↻ Revise with Feedback"}
+              </button>
+              <button onClick={onAbort} disabled={reviewLoading} style={{
+                padding: "12px 14px", borderRadius: T.r1,
+                border: `1px solid ${T.red}30`, background: "transparent",
+                color: T.red, fontSize: 11, fontWeight: 600,
+                cursor: reviewLoading ? "not-allowed" : "pointer",
+                opacity: reviewLoading ? 0.6 : 0.6, fontFamily: T.fontSans,
+                transition: "all 0.15s",
+              }}>
+                ✗
+              </button>
+            </div>
+            <div style={{ fontSize: 9, color: T.t4, marginTop: 6, lineHeight: 1.5 }}>
+              Chat with the Architect first, then <strong style={{ color: T.green }}>Approve</strong> or <strong style={{ color: T.cyan }}>Revise</strong> (sends your chat as feedback).
+            </div>
+          </div>
+        </div>
+
+        {/* RIGHT — Compact Chat */}
+        <Card glow={T.cyan} style={{ display: "flex", flexDirection: "column" }}>
+          <CardHeader right={
+            <span style={{ fontSize: 9, color: T.t4, fontFamily: T.fontMono }}>AI Chat</span>
+          }>Ask the Architect</CardHeader>
+
+          {/* Messages */}
+          <div style={{
+            flex: 1, overflowY: "auto", padding: "10px 12px",
+            display: "flex", flexDirection: "column", gap: 8,
+            minHeight: 200, maxHeight: 300,
+          }}>
+            {messages.map((msg, i) => (
+              <div key={i} style={{
+                display: "flex", flexDirection: "column",
+                alignItems: msg.role === "user" ? "flex-end" : "flex-start",
+                animation: "fadeUp 0.2s ease-out",
+              }}>
+                <div style={{
+                  padding: "6px 10px", borderRadius: T.r1,
+                  background: msg.role === "user" ? T.cyanBg : T.bg3,
+                  border: `1px solid ${msg.role === "user" ? T.cyanBorder : T.border0}`,
+                  fontSize: 11, color: T.t1, lineHeight: 1.5,
+                  maxWidth: "92%",
+                }}>
+                  {msg.content}
+                </div>
+              </div>
+            ))}
+            {chatLoading && (
+              <div style={{
+                padding: "6px 10px", borderRadius: T.r1,
+                background: T.bg3, border: `1px solid ${T.border0}`,
+                fontSize: 11, color: T.t3, alignSelf: "flex-start",
+              }}>
+                <span style={{ animation: "pulse 1s infinite" }}>Thinking...</span>
+              </div>
+            )}
+            <div ref={chatEndRef} />
+          </div>
+
+          {/* Input */}
+          <div style={{
+            padding: "8px 10px", borderTop: `1px solid ${T.border0}`,
+            display: "flex", gap: 6,
+          }}>
+            <input
+              ref={inputRef}
+              type="text"
+              value={input}
+              onChange={e => setInput(e.target.value)}
+              onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}
+              placeholder="Ask about the design..."
+              disabled={chatLoading || reviewLoading}
+              style={{
+                flex: 1, padding: "7px 10px", borderRadius: T.r1,
+                border: `1px solid ${T.border1}`, fontSize: 11,
+                background: T.bg1, color: T.t1, fontFamily: T.fontSans,
+                outline: "none",
+              }}
+              onFocus={e => e.target.style.borderColor = T.cyan}
+              onBlur={e => e.target.style.borderColor = T.border1}
+            />
+            <button onClick={sendMessage} disabled={chatLoading || !input.trim() || reviewLoading} style={{
+              padding: "7px 12px", borderRadius: T.r1, border: "none",
+              background: (chatLoading || !input.trim()) ? T.bg3 : T.cyan,
+              color: (chatLoading || !input.trim()) ? T.t4 : T.bg0,
+              fontSize: 11, fontWeight: 600, cursor: (chatLoading || !input.trim()) ? "not-allowed" : "pointer",
+              transition: "all 0.15s",
+            }}>
+              →
+            </button>
+          </div>
+        </Card>
       </div>
     </div>
   );

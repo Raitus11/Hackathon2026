@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 # Lazy import — only fail when actually called, not at module load
 _groq_client = None
+_rate_limited_until = 0  # timestamp — skip LLM calls until this time
 
 
 def _get_client():
@@ -60,6 +61,13 @@ def call_llm(
     Returns parsed dict on success, None on failure (triggers fallback).
     Never raises — all errors are caught and logged.
     """
+    # Circuit breaker: if we were recently rate-limited, skip immediately
+    global _rate_limited_until
+    if time.time() < _rate_limited_until:
+        remaining = int(_rate_limited_until - time.time())
+        logger.info(f"LLM circuit breaker active — rate limited for {remaining}s more. Using rules fallback.")
+        return None
+
     client = _get_client()
     if client is None:
         logger.info("No Groq client available — returning None for fallback")
@@ -107,13 +115,12 @@ def call_llm(
         except Exception as e:
             error_str = str(e).lower()
 
-            # Rate limit — back off and retry
+            # Rate limit — set circuit breaker and fail fast
             if "rate_limit" in error_str or "429" in error_str:
-                wait = min(5 * (attempt + 1), 30)
-                logger.warning(f"Rate limited — waiting {wait}s before retry")
-                time.sleep(wait)
-                if attempt < max_retries:
-                    continue
+                # Extract wait time from error if possible, default to 60s
+                _rate_limited_until = time.time() + 60
+                logger.warning(f"Rate limited — circuit breaker set for 60s. Falling back to rules immediately.")
+                return None
 
             # Timeout — retry with shorter prompt or give up
             if "timeout" in error_str or "timed out" in error_str:
@@ -144,3 +151,44 @@ def validate_architect_response(result: dict) -> list:
         "required_connections",
     ]
     return [k for k in required if k not in result]
+
+
+def call_llm_chat(
+    system_prompt: str,
+    messages: list,
+    max_tokens: int = 512,
+    temperature: float = 0.3,
+    model: str = "llama-3.3-70b-versatile",
+) -> str | None:
+    """
+    Call Groq LLM for free-form chat (no JSON mode).
+    Returns plain text response or None on failure.
+    """
+    global _rate_limited_until
+    if time.time() < _rate_limited_until:
+        return None
+
+    client = _get_client()
+    if client is None:
+        return None
+
+    try:
+        completion = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                *messages,
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=30,
+        )
+        return completion.choices[0].message.content
+    except Exception as e:
+        error_str = str(e).lower()
+        if "rate_limit" in error_str or "429" in error_str:
+            _rate_limited_until = time.time() + 60
+            logger.warning("Chat rate limited — circuit breaker set for 60s")
+        else:
+            logger.error(f"Chat LLM failed: {e}")
+        return None
