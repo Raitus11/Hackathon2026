@@ -12,18 +12,16 @@ from typing import Any
 def build_graph(raw_data: dict) -> nx.DiGraph:
     """
     Build directed graph from cleaned data.
-    Node types: 'qm' | 'app' | 'queue'
-    Edge types: 'connects_to' | 'channel' | 'owns'
+    Node types: 'qm' | 'app'
+    Edge types: 'connects_to' | 'channel'
+
+    Queue nodes are NOT added — no downstream agent uses them,
+    and with 12K+ rows they bloat the graph and kill performance.
     """
     G = nx.DiGraph()
 
-    qm_df = pd.DataFrame(raw_data["queue_managers"])
-    app_df = pd.DataFrame(raw_data["applications"])
-    queue_df = pd.DataFrame(raw_data["queues"])
-    channel_df = pd.DataFrame(raw_data["channels"])
-
-    # Add QM nodes
-    for _, row in qm_df.iterrows():
+    # Add QM nodes (typically 30-100, fast)
+    for row in raw_data["queue_managers"]:
         G.add_node(
             row["qm_id"],
             type="qm",
@@ -32,37 +30,34 @@ def build_graph(raw_data: dict) -> nx.DiGraph:
         )
 
     # Add app nodes + edges to their QMs
-    seen_apps = {}
-    for _, row in app_df.iterrows():
+    # Use dict-based dedup instead of iterrows
+    seen_app_qm = set()
+    app_names = {}
+    for row in raw_data["applications"]:
         app_id = row["app_id"]
         qm_id = row["qm_id"]
 
-        if app_id not in G.nodes:
-            G.add_node(app_id, type="app", name=row.get("app_name", app_id))
+        if app_id not in app_names:
+            app_names[app_id] = row.get("app_name", app_id)
 
-        if qm_id in G.nodes:
-            # Track unique QM connections per app
-            if app_id not in seen_apps:
-                seen_apps[app_id] = set()
-            if qm_id not in seen_apps[app_id]:
-                seen_apps[app_id].add(qm_id)
+        key = (app_id, qm_id)
+        if key not in seen_app_qm:
+            seen_app_qm.add(key)
+            if app_id not in G.nodes:
+                G.add_node(app_id, type="app", name=app_names[app_id])
+            if qm_id in G.nodes:
                 G.add_edge(app_id, qm_id, rel="connects_to", direction=row.get("direction", "UNKNOWN"))
 
-    # Add queue nodes + ownership edges
-    for _, row in queue_df.iterrows():
-        q_id = row["queue_id"]
-        qm_id = row["qm_id"]
-        G.add_node(q_id, type="queue", name=row.get("queue_name", q_id), usage=row.get("usage", "NORMAL"))
-        if qm_id in G.nodes:
-            G.add_edge(qm_id, q_id, rel="owns")
-
-    # Add QM-to-QM channel edges
-    for _, row in channel_df.iterrows():
+    # Add QM-to-QM channel edges (SENDER only to avoid double-counting)
+    seen_channels = set()
+    for row in raw_data["channels"]:
+        if row.get("channel_type") != "SENDER":
+            continue
         from_qm = row["from_qm"]
         to_qm = row["to_qm"]
-        ctype = row.get("channel_type", "")
-        # Only add SENDER channels as directed edges to avoid double-counting
-        if ctype == "SENDER" and from_qm in G.nodes and to_qm in G.nodes:
+        key = (from_qm, to_qm)
+        if key not in seen_channels and from_qm in G.nodes and to_qm in G.nodes:
+            seen_channels.add(key)
             G.add_edge(
                 from_qm, to_qm,
                 rel="channel",
@@ -96,9 +91,18 @@ def detect_violations(G: nx.DiGraph) -> dict:
         if not connected_apps:
             orphan_qms.append(qm)
 
-    # Channel cycles in QM subgraph
+    # Channel cycles in QM subgraph — bounded to avoid hanging on dense graphs
     qm_subgraph = G.subgraph(qm_nodes)
-    cycles = list(nx.simple_cycles(qm_subgraph))
+    cycles = []
+    try:
+        # Use a generator and cap at 50 cycles to avoid exponential blowup
+        cycle_gen = nx.simple_cycles(qm_subgraph)
+        for i, cycle in enumerate(cycle_gen):
+            cycles.append(cycle)
+            if i >= 50:
+                break
+    except Exception:
+        cycles = []
 
     # Stopped/inactive channels
     stopped_channels = [

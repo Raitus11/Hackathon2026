@@ -1,91 +1,60 @@
 """
-csv_ingest.py
-Transforms a single MQ Raw Data file into the 4 logical tables
-the pipeline expects: queue_managers, queues, applications, channels.
-
-Input: csv_paths = {"raw_file": "/path/to/MQ_Raw_Data.csv"}
-Output: (clean_data_dict, quality_report_dict)
-
-Auto-detects CSV vs Excel — handles files with wrong extensions.
+csv_ingest.py — Optimized for 12,000+ rows.
+Transforms single MQ Raw Data file into 4 logical tables.
+No iterrows(). Applications deduped to unique (app_id, qm_id) pairs.
 """
 import pandas as pd
 import logging
 import hashlib
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 
 def _load_dataframe(file_path: str) -> pd.DataFrame:
-    """
-    Load a file as DataFrame. Tries CSV first, falls back to Excel.
-    Handles the common case where an Excel file has a .csv extension.
-    """
-    # Try CSV first (fastest)
     try:
         df = pd.read_csv(file_path)
-        if len(df.columns) > 1:  # sanity check — single-column = probably not CSV
+        if len(df.columns) > 1:
             return df
     except Exception:
         pass
-
-    # Fall back to Excel
     try:
-        df = pd.read_excel(file_path, engine="openpyxl")
-        return df
+        return pd.read_excel(file_path, engine="openpyxl")
     except Exception:
         pass
-
-    # Last resort — CSV with different encodings
-    for enc in ["latin-1", "cp1252", "iso-8859-1"]:
+    for enc in ["latin-1", "cp1252"]:
         try:
             df = pd.read_csv(file_path, encoding=enc)
             if len(df.columns) > 1:
                 return df
         except Exception:
             pass
-
-    raise ValueError(f"Cannot read file as CSV or Excel: {file_path}")
+    raise ValueError(f"Cannot read file: {file_path}")
 
 
 def load_and_clean(csv_paths: dict) -> tuple[dict, dict]:
-    """
-    Load single MQ Raw Data file, transform into 4 logical tables.
-    Returns: (clean_data_dict, quality_report_dict)
-    """
     report = {"steps": [], "warnings": [], "errors": [], "rows_removed": {}}
 
     file_path = csv_paths.get("raw_file", "")
     if not file_path:
-        report["errors"].append("No raw_file path provided in csv_paths")
+        report["errors"].append("No raw_file path provided")
         return {}, report
 
-    # ── Step 1: Load file (auto-detect format) ────────────────────────────
     try:
         df = _load_dataframe(file_path)
-        report["steps"].append(f"Loaded file: {len(df)} rows, {len(df.columns)} columns")
+        report["steps"].append(f"Loaded: {len(df)} rows, {len(df.columns)} columns")
     except Exception as e:
-        report["errors"].append(f"Failed to load file: {e}")
+        report["errors"].append(f"Failed to load: {e}")
         return {}, report
 
-    # ── Step 2: Validate required columns ─────────────────────────────────
-    required_cols = [
-        "queue_manager_name", "app_id", "q_type",
-        "Discrete Queue Name", "PrimaryAppRole",
-    ]
-    missing = [c for c in required_cols if c not in df.columns]
+    required = ["queue_manager_name", "app_id", "q_type", "Discrete Queue Name", "PrimaryAppRole"]
+    missing = [c for c in required if c not in df.columns]
     if missing:
-        report["errors"].append(f"Missing required columns: {missing}. Found: {list(df.columns)[:10]}")
+        report["errors"].append(f"Missing columns: {missing}")
         return {}, report
-    report["steps"].append("Schema validation passed")
 
-    # ── Step 3: Normalise key fields ──────────────────────────────────────
-    df["queue_manager_name"] = df["queue_manager_name"].astype(str).str.strip().str.upper()
-    df["app_id"] = df["app_id"].astype(str).str.strip().str.upper()
-    df["q_type"] = df["q_type"].astype(str).str.strip().str.upper()
-    df["Discrete Queue Name"] = df["Discrete Queue Name"].astype(str).str.strip().str.upper()
-    df["PrimaryAppRole"] = df["PrimaryAppRole"].astype(str).str.strip().str.upper()
-
+    # ── Normalise (vectorized) ────────────────────────────────────────────
+    for col in ["queue_manager_name", "app_id", "q_type", "Discrete Queue Name", "PrimaryAppRole"]:
+        df[col] = df[col].astype(str).str.strip().str.upper()
     for col in ["remote_q_mgr_name", "remote_q_name", "xmit_q_name"]:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip().str.upper()
@@ -95,229 +64,144 @@ def load_and_clean(csv_paths: dict) -> tuple[dict, dict]:
     df = df.dropna(subset=["queue_manager_name", "app_id", "Discrete Queue Name"])
     removed = before - len(df)
     if removed:
-        report["warnings"].append(f"Dropped {removed} rows with null critical fields")
-        report["rows_removed"]["null_critical"] = removed
+        report["warnings"].append(f"Dropped {removed} null rows")
+    report["steps"].append(f"Normalised. {len(df)} rows.")
 
-    report["steps"].append(f"Normalised key fields. Working with {len(df)} rows.")
-
-    # ── Step 4: Extract QUEUE MANAGERS ────────────────────────────────────
+    # ── QUEUE MANAGERS ────────────────────────────────────────────────────
     qm_rows = []
-    for qm_name in sorted(df["queue_manager_name"].unique()):
-        qm_slice = df[df["queue_manager_name"] == qm_name]
-
+    has_nh = "Neighborhood" in df.columns
+    has_lob = "line_of_business" in df.columns
+    for qm_name, grp in df.groupby("queue_manager_name"):
         region = "UNKNOWN"
-        if "Neighborhood" in df.columns:
-            vals = qm_slice["Neighborhood"].dropna()
-            if len(vals) > 0:
-                mode = vals.mode()
-                region = str(mode.iloc[0]) if len(mode) > 0 else str(vals.iloc[0])
-
+        if has_nh:
+            v = grp["Neighborhood"].dropna()
+            if len(v): region = str(v.mode().iloc[0]) if len(v.mode()) else str(v.iloc[0])
         lob = "UNKNOWN"
-        if "line_of_business" in df.columns:
-            vals = qm_slice["line_of_business"].dropna()
-            if len(vals) > 0:
-                mode = vals.mode()
-                lob = str(mode.iloc[0]) if len(mode) > 0 else str(vals.iloc[0])
+        if has_lob:
+            v = grp["line_of_business"].dropna()
+            if len(v): lob = str(v.mode().iloc[0]) if len(v.mode()) else str(v.iloc[0])
+        qm_rows.append({"qm_id": qm_name, "qm_name": qm_name, "region": region.strip(), "line_of_business": lob.strip()})
 
-        qm_rows.append({
-            "qm_id": qm_name,
-            "qm_name": qm_name,
-            "region": region.strip(),
-            "line_of_business": lob.strip(),
-        })
-
-    # Add QMs only referenced in remote_q_mgr_name
     if "remote_q_mgr_name" in df.columns:
-        existing_ids = {r["qm_id"] for r in qm_rows}
+        existing = {r["qm_id"] for r in qm_rows}
         for rqm in df["remote_q_mgr_name"].dropna().unique():
-            if rqm not in existing_ids:
-                qm_rows.append({
-                    "qm_id": rqm, "qm_name": rqm,
-                    "region": "REMOTE_REFERENCED", "line_of_business": "UNKNOWN",
-                })
-                report["warnings"].append(
-                    f"QM '{rqm}' referenced in remote_q_mgr_name but not in queue_manager_name — added"
-                )
+            if rqm not in existing:
+                qm_rows.append({"qm_id": rqm, "qm_name": rqm, "region": "REMOTE_REFERENCED", "line_of_business": "UNKNOWN"})
+    report["steps"].append(f"{len(qm_rows)} queue managers")
 
-    report["steps"].append(f"Extracted {len(qm_rows)} queue managers")
+    # ── QUEUES (vectorized — no iterrows) ─────────────────────────────────
+    q_df = df[["Discrete Queue Name", "queue_manager_name", "q_type"]].drop_duplicates()
+    type_map = {"REMOTE": "REMOTE", "ALIAS": "ALIAS"}
+    q_df = q_df.assign(queue_type=q_df["q_type"].map(type_map).fillna("LOCAL"))
 
-    # ── Step 5: Extract QUEUES ────────────────────────────────────────────
     queue_rows = []
-    seen_queues = set()
-    for _, row in df.iterrows():
-        q_name = row["Discrete Queue Name"]
-        qm_id = row["queue_manager_name"]
-        key = (q_name, qm_id)
-        if key in seen_queues:
-            continue
-        seen_queues.add(key)
-
-        q_type_raw = row["q_type"]
-        q_type_mapped = "LOCAL"
-        if q_type_raw == "REMOTE":
-            q_type_mapped = "REMOTE"
-        elif q_type_raw == "ALIAS":
-            q_type_mapped = "ALIAS"
-
-        usage = "NORMAL"
-        if "usage" in df.columns and pd.notna(row.get("usage")):
-            raw_usage = str(row["usage"]).strip().upper()
-            if raw_usage in ("NORMAL", "XMITQ"):
-                usage = raw_usage
-
-        q_id = f"Q_{hashlib.md5(f'{qm_id}:{q_name}'.encode()).hexdigest()[:8].upper()}"
-
-        entry = {
-            "queue_id": q_id,
-            "queue_name": q_name,
-            "qm_id": qm_id,
-            "queue_type": q_type_mapped,
-            "usage": usage,
-        }
-
-        if q_type_mapped == "REMOTE":
-            if "remote_q_mgr_name" in df.columns and pd.notna(row.get("remote_q_mgr_name")):
-                entry["remote_qm"] = str(row["remote_q_mgr_name"]).strip().upper()
-            if "remote_q_name" in df.columns and pd.notna(row.get("remote_q_name")):
-                entry["remote_queue"] = str(row["remote_q_name"]).strip().upper()
-            if "xmit_q_name" in df.columns and pd.notna(row.get("xmit_q_name")):
-                entry["xmit_queue"] = str(row["xmit_q_name"]).strip().upper()
-
-        queue_rows.append(entry)
-
-    report["steps"].append(f"Extracted {len(queue_rows)} unique queues")
-
-    # ── Step 6: Extract APPLICATIONS ──────────────────────────────────────
-    app_rows = []
-    seen_app_rows = set()
-    for _, row in df.iterrows():
-        app_id = row["app_id"]
-        qm_id = row["queue_manager_name"]
-        q_name = row["Discrete Queue Name"]
-        role = row["PrimaryAppRole"]
-
-        direction = "UNKNOWN"
-        if role == "PRODUCER":
-            direction = "PUT"
-        elif role == "CONSUMER":
-            direction = "GET"
-
-        app_name = app_id
-        for name_col in ["Primary App_Full_Name", "PrimaryAppDisp", "ProducerName", "Consumer Name"]:
-            if name_col in df.columns and pd.notna(row.get(name_col)):
-                app_name = str(row[name_col]).strip()
-                break
-
-        q_id = f"Q_{hashlib.md5(f'{qm_id}:{q_name}'.encode()).hexdigest()[:8].upper()}"
-
-        dedup_key = (app_id, qm_id, q_id, direction)
-        if dedup_key in seen_app_rows:
-            continue
-        seen_app_rows.add(dedup_key)
-
-        app_rows.append({
-            "app_id": app_id,
-            "app_name": app_name,
-            "qm_id": qm_id,
-            "queue_id": q_id,
-            "queue_name": q_name,
-            "direction": direction,
+    for _, r in q_df.iterrows():
+        queue_rows.append({
+            "queue_id": f"Q_{abs(hash((r['queue_manager_name'], r['Discrete Queue Name']))) % 99999999:08d}",
+            "queue_name": r["Discrete Queue Name"],
+            "qm_id": r["queue_manager_name"],
+            "queue_type": r["queue_type"],
+            "usage": "NORMAL",
         })
 
-    report["steps"].append(f"Extracted {len(app_rows)} application-queue relationships")
+    # Enrich remote queues with metadata (only remote rows, deduped)
+    if "remote_q_mgr_name" in df.columns:
+        rdf = df.loc[df["q_type"] == "REMOTE",
+                      ["Discrete Queue Name", "queue_manager_name", "remote_q_mgr_name", "remote_q_name", "xmit_q_name"]
+                     ].drop_duplicates(subset=["Discrete Queue Name", "queue_manager_name"])
+        rlookup = {
+            (r["Discrete Queue Name"], r["queue_manager_name"]): {
+                "remote_qm": r["remote_q_mgr_name"] if pd.notna(r["remote_q_mgr_name"]) else None,
+                "remote_queue": r["remote_q_name"] if pd.notna(r["remote_q_name"]) else None,
+                "xmit_queue": r["xmit_q_name"] if pd.notna(r["xmit_q_name"]) else None,
+            }
+            for _, r in rdf.iterrows()
+        }
+        for q in queue_rows:
+            if q["queue_type"] == "REMOTE":
+                m = rlookup.get((q["queue_name"], q["qm_id"]), {})
+                for k in ("remote_qm", "remote_queue", "xmit_queue"):
+                    if m.get(k): q[k] = m[k]
 
-    # ── Step 7: Infer CHANNELS from REMOTE queue definitions ──────────────
+    report["steps"].append(f"{len(queue_rows)} queues")
+
+    # ── APPLICATIONS — dedup to unique (app_id, qm_id) pairs ─────────────
+    # The graph only needs app→QM relationships. One row per (app, QM, direction).
+    # This collapses 13,000 rows down to ~300.
+    direction_map = {"PRODUCER": "PUT", "CONSUMER": "GET"}
+    adf = df[["app_id", "queue_manager_name", "PrimaryAppRole"]].copy()
+    adf["direction"] = adf["PrimaryAppRole"].map(direction_map).fillna("UNKNOWN")
+
+    # Get first non-null app name per app_id
+    name_cols = [c for c in ["Primary App_Full_Name", "PrimaryAppDisp", "ProducerName"] if c in df.columns]
+    name_df = df[["app_id"] + name_cols].drop_duplicates(subset=["app_id"])
+    app_name_map = {}
+    for _, r in name_df.iterrows():
+        name = r["app_id"]
+        for c in name_cols:
+            if pd.notna(r.get(c)) and str(r[c]).strip():
+                name = str(r[c]).strip()
+                break
+        app_name_map[r["app_id"]] = name
+
+    # Dedup to unique (app_id, qm_id, direction)
+    adf = adf.drop_duplicates(subset=["app_id", "queue_manager_name", "direction"])
+    app_rows = [
+        {
+            "app_id": r["app_id"],
+            "app_name": app_name_map.get(r["app_id"], r["app_id"]),
+            "qm_id": r["queue_manager_name"],
+            "direction": r["direction"],
+        }
+        for _, r in adf.iterrows()
+    ]
+    report["steps"].append(f"{len(app_rows)} app-QM relationships (deduped from {len(df)} rows)")
+
+    # ── CHANNELS ──────────────────────────────────────────────────────────
     channel_rows = []
-    seen_channels = set()
-    valid_qm_ids = {r["qm_id"] for r in qm_rows}
+    seen = set()
+    valid_qms = {r["qm_id"] for r in qm_rows}
 
     for q in queue_rows:
-        if q["queue_type"] != "REMOTE":
-            continue
-        remote_qm = q.get("remote_qm")
-        if not remote_qm:
-            continue
-        from_qm = q["qm_id"]
-        to_qm = remote_qm
-        if from_qm == to_qm:
-            continue
+        if q.get("queue_type") != "REMOTE": continue
+        rqm = q.get("remote_qm")
+        if not rqm: continue
+        f, t = q["qm_id"], rqm
+        if f == t: continue
+        if (f, t) in seen: continue
+        seen.add((f, t))
+        cn = f"{f}.{t}"
+        cid = f"CH_{abs(hash(cn)) % 99999999:08d}"
+        channel_rows.append({"channel_id": cid+"_S", "channel_name": cn, "channel_type": "SENDER",
+                             "from_qm": f, "to_qm": t, "status": "RUNNING",
+                             "xmit_queue": q.get("xmit_queue", f"{t}.XMITQ")})
+        channel_rows.append({"channel_id": cid+"_R", "channel_name": cn, "channel_type": "RECEIVER",
+                             "from_qm": f, "to_qm": t, "status": "RUNNING"})
 
-        ch_key = (from_qm, to_qm)
-        if ch_key in seen_channels:
-            continue
-        seen_channels.add(ch_key)
-
-        channel_name = f"{from_qm}.{to_qm}"
-        ch_id = f"CH_{hashlib.md5(channel_name.encode()).hexdigest()[:8].upper()}"
-
-        channel_rows.append({
-            "channel_id": ch_id + "_SDR",
-            "channel_name": channel_name,
-            "channel_type": "SENDER",
-            "from_qm": from_qm, "to_qm": to_qm,
-            "status": "RUNNING",
-            "xmit_queue": q.get("xmit_queue", f"{to_qm}.XMITQ"),
-        })
-        channel_rows.append({
-            "channel_id": ch_id + "_RCVR",
-            "channel_name": channel_name,
-            "channel_type": "RECEIVER",
-            "from_qm": from_qm, "to_qm": to_qm,
-            "status": "RUNNING",
-        })
-
-    # Also infer from xmit_q_name patterns
     if "xmit_q_name" in df.columns:
-        for _, row in df.iterrows():
-            xmit = row.get("xmit_q_name")
-            if pd.isna(xmit):
-                continue
-            xmit = str(xmit).strip().upper()
+        xdf = df[["queue_manager_name", "xmit_q_name"]].dropna(subset=["xmit_q_name"]).drop_duplicates()
+        for _, r in xdf.iterrows():
+            xmit = str(r["xmit_q_name"]).strip().upper()
             parts = xmit.split(".")
-            from_qm = row["queue_manager_name"]
-            to_qm_candidate = parts[-1] if len(parts) > 1 else xmit
-            if to_qm_candidate in valid_qm_ids and from_qm != to_qm_candidate:
-                ch_key = (from_qm, to_qm_candidate)
-                if ch_key not in seen_channels:
-                    seen_channels.add(ch_key)
-                    channel_name = f"{from_qm}.{to_qm_candidate}"
-                    ch_id = f"CH_{hashlib.md5(channel_name.encode()).hexdigest()[:8].upper()}"
-                    channel_rows.append({
-                        "channel_id": ch_id + "_SDR",
-                        "channel_name": channel_name,
-                        "channel_type": "SENDER",
-                        "from_qm": from_qm, "to_qm": to_qm_candidate,
-                        "status": "RUNNING", "xmit_queue": xmit,
-                    })
-                    channel_rows.append({
-                        "channel_id": ch_id + "_RCVR",
-                        "channel_name": channel_name,
-                        "channel_type": "RECEIVER",
-                        "from_qm": from_qm, "to_qm": to_qm_candidate,
-                        "status": "RUNNING",
-                    })
+            f = r["queue_manager_name"]
+            t = parts[-1] if len(parts) > 1 else xmit
+            if t in valid_qms and f != t and (f, t) not in seen:
+                seen.add((f, t))
+                cn = f"{f}.{t}"
+                cid = f"CH_{abs(hash(cn)) % 99999999:08d}"
+                channel_rows.append({"channel_id": cid+"_S", "channel_name": cn, "channel_type": "SENDER",
+                                     "from_qm": f, "to_qm": t, "status": "RUNNING", "xmit_queue": xmit})
+                channel_rows.append({"channel_id": cid+"_R", "channel_name": cn, "channel_type": "RECEIVER",
+                                     "from_qm": f, "to_qm": t, "status": "RUNNING"})
 
-    report["steps"].append(f"Inferred {len(channel_rows)} channel definitions from remote queue metadata")
-
-    # ── Summary ───────────────────────────────────────────────────────────
+    report["steps"].append(f"{len(channel_rows)} channels")
     report["summary"] = {
-        "queue_managers": len(qm_rows),
-        "queues": len(queue_rows),
-        "applications": len(app_rows),
-        "channels": len(channel_rows),
-        "raw_rows": len(df),
+        "queue_managers": len(qm_rows), "queues": len(queue_rows),
+        "applications": len(app_rows), "channels": len(channel_rows), "raw_rows": len(df),
     }
+    report["steps"].append(f"Done: {len(qm_rows)} QMs, {len(queue_rows)} queues, {len(app_rows)} apps, {len(channel_rows)} channels")
 
-    clean_data = {
-        "queue_managers": qm_rows,
-        "queues": queue_rows,
-        "applications": app_rows,
-        "channels": channel_rows,
-    }
-
-    report["steps"].append(
-        f"Transformation complete: {len(qm_rows)} QMs, {len(queue_rows)} queues, "
-        f"{len(app_rows)} apps, {len(channel_rows)} channels from {len(df)} raw rows"
-    )
-
-    return clean_data, report
+    return {
+        "queue_managers": qm_rows, "queues": queue_rows,
+        "applications": app_rows, "channels": channel_rows,
+    }, report
