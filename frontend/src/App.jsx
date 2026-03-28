@@ -271,7 +271,9 @@ function TopologyGraph({ graphData, title, height = 360, badge }) {
     const edges = graphData.edges.map(d => ({ ...d }));
 
     const sim = d3.forceSimulation(nodes)
-      .force("link", d3.forceLink(edges).id(d => d.id).distance(100))
+      .force("link", d3.forceLink(edges).id(d => d.id)
+        .distance(d => d.rel === "connects_to" ? 35 : 100)
+        .strength(d => d.rel === "connects_to" ? 1.5 : 0.3))
       .force("charge", d3.forceManyBody().strength(-350))
       .force("center", d3.forceCenter(w / 2, h / 2))
       .force("collide", d3.forceCollide(35));
@@ -307,8 +309,8 @@ function TopologyGraph({ graphData, title, height = 360, badge }) {
     g.selectAll("line.edge")
       .data(edges.filter(e => e.rel === "channel" || e.rel === "connects_to"))
       .join("line").attr("class", "edge")
-      .attr("stroke", d => d.rel === "channel" ? `${T.cyan}50` : `${T.green}40`)
-      .attr("stroke-width", d => d.rel === "channel" ? 1.5 : 0.8)
+      .attr("stroke", d => d.rel === "channel" ? `${T.cyan}50` : `${T.green}60`)
+      .attr("stroke-width", d => d.rel === "channel" ? 1.5 : 0.9)
       .attr("stroke-dasharray", d => d.rel === "connects_to" ? "3 3" : null)
       .attr("marker-end", d => `url(#arrow-${d.rel}-${title})`);
 
