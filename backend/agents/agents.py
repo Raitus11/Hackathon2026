@@ -842,7 +842,14 @@ def optimizer_agent(state: dict) -> dict:
     # accidental from legacy config. Reported but not a constraint.
     # ══════════════════════════════════════════════════════════════════════
     qm_subgraph = G.subgraph(qm_nodes)
-    cycles = list(nx.simple_cycles(qm_subgraph))
+    cycles = []
+    try:
+        for i, c in enumerate(nx.simple_cycles(qm_subgraph)):
+            cycles.append(c)
+            if i >= 20:
+                break
+    except Exception:
+        pass
     cycle_info = ""
     if cycles:
         formatted = [" → ".join(c + [c[0]]) for c in cycles[:3]]
