@@ -56,7 +56,34 @@ def supervisor_agent(state: dict) -> dict:
         messages.append({"agent": "SUPERVISOR", "msg": f"ERROR — {msg}"})
         return {"error": msg, "messages": messages}
 
-    # ── Validate all 4 required keys are present ──────────────────────────
+    # ── Validate all 4 required keys are present (or single raw_file) ────
+    if "raw_file" in csv_paths:
+        # Single-file mode — validate the file exists and is readable
+        raw_path = Path(csv_paths["raw_file"])
+        if not raw_path.exists():
+            msg = f"Raw data file not found: {csv_paths['raw_file']}"
+            logger.error(f"SUPERVISOR: {msg}")
+            messages.append({"agent": "SUPERVISOR", "msg": f"ERROR — {msg}"})
+            return {"error": msg, "messages": messages}
+        if raw_path.stat().st_size == 0:
+            msg = f"Raw data file is empty: {csv_paths['raw_file']}"
+            logger.error(f"SUPERVISOR: {msg}")
+            messages.append({"agent": "SUPERVISOR", "msg": f"ERROR — {msg}"})
+            return {"error": msg, "messages": messages}
+        msg = f"Session {session_id} validated. Raw data file confirmed: {raw_path.name} ({raw_path.stat().st_size:,} bytes). Routing to SANITISER."
+        logger.info(f"SUPERVISOR: {msg}")
+        messages.append({"agent": "SUPERVISOR", "msg": msg})
+        return {
+            "session_id":        session_id,
+            "redesign_count":    0,
+            "validation_passed": False,
+            "awaiting_human_review": False,
+            "human_approved":    None,
+            "human_feedback":    "",
+            "error":             None,
+            "messages":          messages,
+        }
+
     required = ["queue_managers", "queues", "applications", "channels"]
     missing = [k for k in required if k not in csv_paths]
     if missing:
@@ -200,7 +227,17 @@ def analyst_agent(state: dict) -> dict:
     logger.info("ANALYST: Computing as-is complexity metrics")
     messages = state.get("messages", [])
 
-    G = state["as_is_graph"]
+    # Bail if upstream failed
+    if state.get("error"):
+        messages.append({"agent": "ANALYST", "msg": f"SKIPPED — upstream error: {state['error']}"})
+        return {"messages": messages}
+
+    G = state.get("as_is_graph")
+    if G is None:
+        err = "ANALYST: No as_is_graph in state — did Researcher run?"
+        messages.append({"agent": "ANALYST", "msg": err})
+        return {"error": err, "messages": messages}
+
     metrics = compute_complexity(G)
 
     msg = (
@@ -228,44 +265,58 @@ def architect_agent(state: dict) -> dict:
     messages = state.get("messages", [])
     adrs = state.get("adrs", [])
     redesign_count = state.get("redesign_count", 0)
-    raw_data = state["raw_data"]
 
-    # Try LLM approach first
-    llm_result = _architect_llm(state)
+    # Bail if upstream failed
+    if state.get("error"):
+        messages.append({"agent": "ARCHITECT", "msg": f"SKIPPED — upstream error: {state['error']}"})
+        return {"messages": messages}
 
-    if llm_result is not None:
-        # LLM succeeded — build graph from its output
-        target_graph, llm_adrs = _build_target_from_llm(llm_result, state)
-        adrs.extend(llm_adrs)
-        method = "llm"
-        logger.info(f"ARCHITECT: LLM method succeeded — {len(llm_adrs)} ADRs generated")
-    else:
-        # Fallback to deterministic rules
-        target_graph = _build_target_rules(state)
-        rule_adrs = _generate_rule_adrs(state, target_graph, redesign_count)
-        adrs.extend(rule_adrs)
-        method = "rules_fallback"
-        logger.info(f"ARCHITECT: Fell back to rule-based method — {len(rule_adrs)} ADRs")
+    raw_data = state.get("raw_data")
+    if not raw_data:
+        err = "ARCHITECT: No raw_data in state"
+        messages.append({"agent": "ARCHITECT", "msg": err})
+        return {"error": err, "messages": messages}
 
-    original_qm_count = sum(1 for _, d in state["as_is_graph"].nodes(data=True) if d.get("type") == "qm")
-    target_qm_count = sum(1 for _, d in target_graph.nodes(data=True) if d.get("type") == "qm")
-    target_ch_count = sum(1 for _, _, d in target_graph.edges(data=True) if d.get("rel") == "channel")
+    try:
+        # Try LLM approach first
+        llm_result = _architect_llm(state)
 
-    msg = (
-        f"Target state designed using {method}: "
-        f"{target_qm_count} QMs (was {original_qm_count}), "
-        f"{target_ch_count} channels. "
-        f"{len(adrs)} ADRs written."
-    )
-    messages.append({"agent": "ARCHITECT", "msg": msg})
+        if llm_result is not None:
+            target_graph, llm_adrs = _build_target_from_llm(llm_result, state)
+            adrs.extend(llm_adrs)
+            method = "llm"
+            logger.info(f"ARCHITECT: LLM method succeeded — {len(llm_adrs)} ADRs generated")
+        else:
+            target_graph = _build_target_rules(state)
+            rule_adrs = _generate_rule_adrs(state, target_graph, redesign_count)
+            adrs.extend(rule_adrs)
+            method = "rules_fallback"
+            logger.info(f"ARCHITECT: Fell back to rule-based method — {len(rule_adrs)} ADRs")
 
-    return {
-        "target_graph": target_graph,
-        "adrs": adrs,
-        "redesign_count": redesign_count + 1,
-        "architect_method": method,
-        "messages": messages,
-    }
+        as_is = state.get("as_is_graph")
+        original_qm_count = sum(1 for _, d in as_is.nodes(data=True) if d.get("type") == "qm") if as_is else 0
+        target_qm_count = sum(1 for _, d in target_graph.nodes(data=True) if d.get("type") == "qm")
+        target_ch_count = sum(1 for _, _, d in target_graph.edges(data=True) if d.get("rel") == "channel")
+
+        msg = (
+            f"Target state designed using {method}: "
+            f"{target_qm_count} QMs (was {original_qm_count}), "
+            f"{target_ch_count} channels. "
+            f"{len(adrs)} ADRs written."
+        )
+        messages.append({"agent": "ARCHITECT", "msg": msg})
+
+        return {
+            "target_graph": target_graph,
+            "adrs": adrs,
+            "redesign_count": redesign_count + 1,
+            "architect_method": method,
+            "messages": messages,
+        }
+    except Exception as e:
+        logger.exception(f"ARCHITECT: Crashed — {e}")
+        messages.append({"agent": "ARCHITECT", "msg": f"CRASHED: {e}"})
+        return {"error": f"ARCHITECT crashed: {e}", "messages": messages}
 
 
 def _architect_llm(state: dict) -> dict | None:
@@ -520,6 +571,49 @@ def _build_target_rules(state: dict) -> nx.DiGraph:
                     xmit_queue=f"{to_qm}.XMITQ",
                 )
 
+    # Infer channels from REMOTE queue definitions
+    for q in raw_data.get("queues", []):
+        if q.get("queue_type") != "REMOTE":
+            continue
+        remote_qm = q.get("remote_qm")
+        if not remote_qm:
+            continue
+        from_qm = q["qm_id"]
+        to_qm = remote_qm if remote_qm in needed_qms else None
+        if not to_qm or from_qm == to_qm or from_qm not in needed_qms:
+            continue
+        pair = (from_qm, to_qm)
+        if pair not in added_channels:
+            added_channels.add(pair)
+            G_target.add_edge(
+                from_qm, to_qm, rel="channel",
+                channel_name=f"{from_qm}.{to_qm}",
+                status="RUNNING",
+                xmit_queue=f"{to_qm}.XMITQ",
+            )
+
+    # Safety net: connect any isolated QM (has apps, no channels) to the hub
+    qms_with_apps = set(app_qm_ownership.values()) & set(G_target.nodes)
+    for qm in list(qms_with_apps):
+        has_any_channel = any(
+            d.get("rel") == "channel"
+            for _, _, d in list(G_target.out_edges(qm, data=True)) + list(G_target.in_edges(qm, data=True))
+        )
+        if not has_any_channel and len(qms_with_apps) > 1:
+            hub = max(
+                (q for q in qms_with_apps if q != qm),
+                key=lambda q: sum(1 for _, _, d in list(G_target.out_edges(q, data=True)) + list(G_target.in_edges(q, data=True)) if d.get("rel") == "channel"),
+                default=None,
+            )
+            if hub and (qm, hub) not in added_channels:
+                added_channels.add((qm, hub))
+                G_target.add_edge(
+                    qm, hub, rel="channel",
+                    channel_name=f"{qm}.{hub}",
+                    status="RUNNING",
+                    xmit_queue=f"{hub}.XMITQ",
+                )
+
     return G_target
 
 
@@ -580,6 +674,17 @@ def _generate_rule_adrs(state: dict, target_graph: nx.DiGraph, redesign_count: i
 def optimizer_agent(state: dict) -> dict:
     logger.info("OPTIMIZER: Running two-phase graph optimisation")
     messages = state.get("messages", [])
+
+    # Bail if upstream failed
+    if state.get("error"):
+        messages.append({"agent": "OPTIMIZER", "msg": f"SKIPPED — upstream error: {state['error']}"})
+        return {"messages": messages}
+
+    if not state.get("target_graph"):
+        err = "OPTIMIZER: No target_graph in state — did Architect run?"
+        messages.append({"agent": "OPTIMIZER", "msg": err})
+        return {"error": err, "messages": messages}
+
     G = state["target_graph"].copy()
 
     qm_nodes = [n for n, d in G.nodes(data=True) if d.get("type") == "qm"]
@@ -790,6 +895,16 @@ def optimizer_agent(state: dict) -> dict:
 def tester_agent(state: dict) -> dict:
     logger.info("TESTER: Validating constraints on target state")
     messages = state.get("messages", [])
+
+    if state.get("error"):
+        messages.append({"agent": "TESTER", "msg": f"SKIPPED — upstream error: {state['error']}"})
+        return {"validation_passed": False, "messages": messages}
+
+    if not state.get("optimised_graph"):
+        err = "TESTER: No optimised_graph in state — did Optimizer run?"
+        messages.append({"agent": "TESTER", "msg": err})
+        return {"validation_passed": False, "error": err, "messages": messages}
+
     G = state["optimised_graph"]
     violations = []
 
@@ -1290,7 +1405,163 @@ def _generate_target_csvs(G: nx.DiGraph, state: dict) -> dict:
         ["app_id", "app_name", "qm_id", "direction", "queue_id", "description"]
     )
 
+    # ── MQ_Raw_Data_Target.csv — SAME FORMAT AS INPUT ─────────────────────
+    # One CSV with the original 29 columns, reflecting the optimised topology.
+    # Judges can feed this back into MQ-TITAN to verify complexity dropped.
+    csvs["MQ_Raw_Data_Target"] = _generate_unified_target_csv(G, state)
+
     return csvs
+
+
+def _generate_unified_target_csv(G: nx.DiGraph, state: dict) -> str:
+    """
+    Generate the target state as a single CSV with the same 29 columns
+    as the original input file. Each row = one app-queue relationship.
+    """
+    INPUT_COLUMNS = [
+        "Discrete Queue Name", "ProducerName", "Consumer Name",
+        "Primary App_Full_Name", "PrimaryAppDisp", "PrimaryAppRole",
+        "Primary Application Id q_type", "Primary Neighbourhood",
+        "Primary Hosting Type", "Primary Data Classification",
+        "Primary Enterprise Critical Payment Application", "Primary PCI",
+        "Primary Publicly Accessible", "Primary TRTC",
+        "q_type", "queue_manager_name", "app_id", "line_of_business",
+        "cluster_name", "cluster_namelist", "def_persistence",
+        "def_put_response", "inhibit_get", "inhibit_put",
+        "remote_q_mgr_name", "remote_q_name", "usage",
+        "xmit_q_name", "Neighborhood",
+    ]
+
+    raw_data = state.get("raw_data", {})
+
+    # Build lookup maps from graph
+    app_qm_map = {}
+    app_name_map = {}
+    for n, d in G.nodes(data=True):
+        if d.get("type") == "app":
+            app_name_map[n] = d.get("name", n)
+            for _, v, ed in G.out_edges(n, data=True):
+                if ed.get("rel") == "connects_to":
+                    app_qm_map[n] = v
+
+    qm_region_map = {}
+    qm_lob_map = {}
+    for n, d in G.nodes(data=True):
+        if d.get("type") == "qm":
+            qm_region_map[n] = d.get("region", "")
+            # Get line_of_business from raw data
+            for qm_row in raw_data.get("queue_managers", []):
+                if qm_row["qm_id"] == n:
+                    qm_lob_map[n] = qm_row.get("line_of_business", "")
+                    break
+
+    # Build original app metadata lookup from raw input
+    app_meta = {}
+    for row in raw_data.get("applications", []):
+        aid = row["app_id"]
+        if aid not in app_meta:
+            app_meta[aid] = {
+                "app_name": row.get("app_name", aid),
+                "direction": row.get("direction", "UNKNOWN"),
+            }
+
+    # Collect channels: from_qm → to_qm
+    channels = []
+    for u, v, d in G.edges(data=True):
+        if d.get("rel") == "channel":
+            channels.append({
+                "from_qm": u, "to_qm": v,
+                "channel_name": d.get("channel_name", f"{u}.{v}"),
+                "xmit_queue": d.get("xmit_queue", f"{v}.XMITQ"),
+            })
+
+    rows = []
+
+    # For each app, generate rows showing its queue relationships
+    for app_id, qm_id in app_qm_map.items():
+        meta = app_meta.get(app_id, {"app_name": app_id, "direction": "UNKNOWN"})
+        region = qm_region_map.get(qm_id, "")
+        lob = qm_lob_map.get(qm_id, "")
+        direction = meta["direction"]
+        role = "Producer" if direction == "PUT" else "Consumer" if direction == "GET" else "Unknown"
+
+        # 1. Local queue for this app (every app has one)
+        local_q = f"LOCAL.{app_id}.IN"
+        rows.append({
+            "Discrete Queue Name": local_q,
+            "ProducerName": app_name_map.get(app_id, app_id) if role == "Producer" else "",
+            "Consumer Name": app_name_map.get(app_id, app_id) if role == "Consumer" else "",
+            "Primary App_Full_Name": app_name_map.get(app_id, app_id),
+            "PrimaryAppDisp": region,
+            "PrimaryAppRole": role,
+            "Primary Application Id q_type": "Local",
+            "Primary Neighbourhood": region,
+            "Primary Hosting Type": "Internal",
+            "Primary Data Classification": "Confidential",
+            "Primary Enterprise Critical Payment Application": "No",
+            "Primary PCI": "No",
+            "Primary Publicly Accessible": "No",
+            "Primary TRTC": "00 = 0-30 Minutes",
+            "q_type": "Local",
+            "queue_manager_name": qm_id,
+            "app_id": app_id,
+            "line_of_business": lob,
+            "cluster_name": "",
+            "cluster_namelist": "",
+            "def_persistence": "Yes",
+            "def_put_response": "Synchronous",
+            "inhibit_get": "Enabled",
+            "inhibit_put": "Enabled",
+            "remote_q_mgr_name": "",
+            "remote_q_name": "",
+            "usage": "Normal",
+            "xmit_q_name": "",
+            "Neighborhood": region,
+        })
+
+        # 2. Remote queues: for each outbound channel from this app's QM
+        for ch in channels:
+            if ch["from_qm"] != qm_id:
+                continue
+            to_qm = ch["to_qm"]
+            # Find consumer apps on the target QM
+            consumer_apps = [a for a, q in app_qm_map.items() if q == to_qm]
+            for cons_app in consumer_apps:
+                rq_name = f"REMOTE.{cons_app}.VIA.{to_qm}"
+                remote_local_q = f"LOCAL.{cons_app}.IN"
+                rows.append({
+                    "Discrete Queue Name": rq_name,
+                    "ProducerName": app_name_map.get(app_id, app_id),
+                    "Consumer Name": app_name_map.get(cons_app, cons_app),
+                    "Primary App_Full_Name": app_name_map.get(app_id, app_id),
+                    "PrimaryAppDisp": region,
+                    "PrimaryAppRole": "Producer",
+                    "Primary Application Id q_type": "Remote",
+                    "Primary Neighbourhood": region,
+                    "Primary Hosting Type": "Internal",
+                    "Primary Data Classification": "Confidential",
+                    "Primary Enterprise Critical Payment Application": "No",
+                    "Primary PCI": "No",
+                    "Primary Publicly Accessible": "No",
+                    "Primary TRTC": "00 = 0-30 Minutes",
+                    "q_type": "Remote",
+                    "queue_manager_name": qm_id,
+                    "app_id": app_id,
+                    "line_of_business": lob,
+                    "cluster_name": "",
+                    "cluster_namelist": "",
+                    "def_persistence": "Yes",
+                    "def_put_response": "Synchronous",
+                    "inhibit_get": "",
+                    "inhibit_put": "Enabled",
+                    "remote_q_mgr_name": to_qm,
+                    "remote_q_name": remote_local_q,
+                    "usage": "",
+                    "xmit_q_name": ch["xmit_queue"],
+                    "Neighborhood": region,
+                })
+
+    return _to_csv(rows, INPUT_COLUMNS)
 
 
 def _to_csv(rows: list, fieldnames: list) -> str:

@@ -3,19 +3,18 @@ main.py
 FastAPI server — MQ-TITAN pipeline with human review gate.
 
 Flow:
-  POST /api/demo or /api/analyse
-    → Runs pipeline up to human_review_gate
+  POST /api/upload (single .xlsx/.csv file — PRIMARY mode)
+    → Saves file, runs pipeline up to human_review_gate
     → Returns with awaiting_human_review: true
-    → Frontend shows review panel to user
+
+  POST /api/analyse (legacy 4-CSV upload — still supported)
+    → Same flow as before
 
   GET  /api/review/{session_id}
-    → Returns the pending review data (metrics, ADRs, graphs)
+    → Returns the pending review data
 
   POST /api/review/{session_id}
-    → Human submits {approved: true} or {approved: false, feedback: "..."}
-    → If approved: continues pipeline to provisioner → doc_expert
-    → If rejected: injects feedback and reruns from architect
-    → Returns final result
+    → Human submits approve/revise/abort decision
 """
 import os
 import uuid
@@ -28,7 +27,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, List
 
-from backend.orchestration.workflow import mq_titan_workflow
+from backend.orchestration.workflow import mq_titan_workflow, mq_titan_revise_workflow
 from backend.agents.agents import provisioner_agent, migration_planner_agent, doc_expert_agent
 from backend.graph.mq_graph import graph_to_dict, sanitise
 from backend.llm.llm_client import call_llm_chat
@@ -39,7 +38,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="MQ-TITAN API",
     description="MQ Topology Intelligence & Transformation Agent Network",
-    version="2.0.0",
+    version="3.0.0",
 )
 
 app.add_middleware(
@@ -53,20 +52,18 @@ UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 # In-memory session store
-# Stores both the pipeline result state and the final response
 sessions: dict = {}        # session_id -> full pipeline state (for resume)
 responses: dict = {}       # session_id -> API response (for GET endpoints)
 
 
-# ── Pydantic model for review submission ─────────────────────────────────────
+# ── Pydantic models ──────────────────────────────────────────────────────────
 class ReviewDecision(BaseModel):
     approved: bool
-    abort: bool = False            # True = stop pipeline entirely, generate failure report
-    feedback: Optional[str] = ""   # required if approved=False and abort=False
-
+    abort: bool = False
+    feedback: Optional[str] = ""
 
 class ChatMessage(BaseModel):
-    role: str       # "user" or "assistant"
+    role: str
     content: str
 
 class ChatRequest(BaseModel):
@@ -122,12 +119,15 @@ def _run_pipeline(session_id: str, csv_paths: dict) -> dict:
         "adrs":                  [],
     }
 
-    result = mq_titan_workflow.invoke(initial_state)
+    # Limit recursion: 7 linear agents + 3 retry cycles × 3 agents + review + outputs = ~25 max
+    result = mq_titan_workflow.invoke(
+        initial_state,
+        config={"recursion_limit": 50},
+    )
 
-    # Single place to catch supervisor/pipeline errors
     if result.get("error"):
         raise HTTPException(status_code=422, detail=result["error"])
-    
+
     return result
 
 
@@ -144,59 +144,27 @@ def _calc_reduction(result: dict) -> dict:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "MQ-TITAN", "version": "2.0.0"}
+    return {"status": "ok", "service": "MQ-TITAN", "version": "3.0.0"}
 
 
-@app.post("/api/demo")
-def run_demo():
-    """Run pipeline on synthetic CSV data. Pauses at human review gate."""
-    base = Path("data/sample_input")
-    csv_paths = {
-        "queue_managers": str(base / "queue_managers.csv"),
-        "queues":         str(base / "queues.csv"),
-        "applications":   str(base / "applications.csv"),
-        "channels":       str(base / "channels.csv"),
-    }
-
-    session_id = "DEMO"
-
-    try:
-        result = _run_pipeline(session_id, csv_paths)
-    except Exception as e:
-        logger.exception("Demo pipeline error")
-        raise HTTPException(status_code=500, detail=str(e))
-
-    # Store raw state for resume after human review
-    sessions[session_id] = result
-
-    response = _build_response(session_id, result)
-    responses[session_id] = response
-    return JSONResponse(content=response)
-
-
-@app.post("/api/analyse")
-async def analyse(
-    queue_managers: UploadFile = File(...),
-    queues:         UploadFile = File(...),
-    applications:   UploadFile = File(...),
-    channels:       UploadFile = File(...),
-):
-    """Upload 4 CSVs. Runs pipeline and pauses at human review gate."""
+@app.post("/api/upload")
+async def upload_single_file(file: UploadFile = File(...)):
+    """
+    Upload a single MQ Raw Data file (CSV or Excel).
+    csv_ingest auto-detects the format and transforms into 4 logical tables.
+    """
     session_id = str(uuid.uuid4())[:8]
     session_dir = UPLOAD_DIR / session_id
     session_dir.mkdir(exist_ok=True)
 
-    csv_paths = {}
-    for name, upload in [
-        ("queue_managers", queue_managers),
-        ("queues",         queues),
-        ("applications",   applications),
-        ("channels",       channels),
-    ]:
-        dest = session_dir / f"{name}.csv"
-        with open(dest, "wb") as f:
-            shutil.copyfileobj(upload.file, f)
-        csv_paths[name] = str(dest)
+    # Preserve original extension so csv_ingest can detect format
+    original_name = file.filename or "raw_data.csv"
+    ext = Path(original_name).suffix.lower() or ".csv"
+    dest = session_dir / f"raw_data{ext}"
+    with open(dest, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    csv_paths = {"raw_file": str(dest)}
 
     try:
         result = _run_pipeline(session_id, csv_paths)
@@ -204,8 +172,35 @@ async def analyse(
         logger.exception("Pipeline error")
         raise HTTPException(status_code=500, detail=str(e))
 
-    if result.get("error"):
-        raise HTTPException(status_code=422, detail=result["error"])
+    # Debug: log which state keys have non-None values
+    state_keys = [k for k in result.keys() if result.get(k) is not None]
+    logger.info(f"Upload pipeline done. Non-None state keys: {state_keys}")
+
+    sessions[session_id] = result
+    response = _build_response(session_id, result)
+    responses[session_id] = response
+    return JSONResponse(content=response)
+
+
+@app.post("/api/demo")
+def run_demo():
+    """Run pipeline on the bundled demo CSV."""
+    session_id = "DEMO"
+
+    demo_csv = Path("data/MQ_Raw_Data.csv")
+    if not demo_csv.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="No demo data found. Place MQ_Raw_Data.csv in data/ or upload via the UI."
+        )
+
+    csv_paths = {"raw_file": str(demo_csv)}
+
+    try:
+        result = _run_pipeline(session_id, csv_paths)
+    except Exception as e:
+        logger.exception("Demo pipeline error")
+        raise HTTPException(status_code=500, detail=str(e))
 
     sessions[session_id] = result
     response = _build_response(session_id, result)
@@ -215,10 +210,6 @@ async def analyse(
 
 @app.get("/api/review/{session_id}")
 def get_pending_review(session_id: str):
-    """
-    Get the pending human review data for a session.
-    Called by the frontend to populate the review panel.
-    """
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
 
@@ -249,13 +240,6 @@ def get_pending_review(session_id: str):
 
 @app.post("/api/review/{session_id}")
 def submit_review(session_id: str, decision: ReviewDecision):
-    """
-    Human submits one of three decisions:
-
-    Approve:  pipeline continues → provisioner → migration_planner → doc_expert → final output
-    Revise:   feedback injected → reruns from architect → pauses again at review gate
-    Abort:    pipeline stops → doc_expert generates failure/cancellation report → final output
-    """
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
 
@@ -267,20 +251,24 @@ def submit_review(session_id: str, decision: ReviewDecision):
     if not decision.approved and not decision.abort and not decision.feedback:
         raise HTTPException(status_code=400, detail="Revision requires a feedback reason")
 
-    # Inject human decision into stored state
     result["human_approved"]        = decision.approved
     result["human_feedback"]        = decision.feedback or ""
     result["human_aborted"]         = decision.abort
     result["awaiting_human_review"] = False
 
+    # Debug: what's in the stored state?
+    state_keys = [k for k in result.keys() if result.get(k) is not None]
+    logger.info(f"Review submit. Decision: approved={decision.approved}, abort={decision.abort}")
+    logger.info(f"Stored state keys: {state_keys}")
+    logger.info(f"Has optimised_graph: {'optimised_graph' in result and result['optimised_graph'] is not None}")
+    logger.info(f"Has target_graph: {'target_graph' in result and result['target_graph'] is not None}")
+    logger.info(f"Has as_is_graph: {'as_is_graph' in result and result['as_is_graph'] is not None}")
+
     try:
         if decision.abort:
-            # Abort: just run doc_expert for cancellation report
             updates = doc_expert_agent(result)
             result.update(updates)
         elif decision.approved:
-            # Approve: run the 3 remaining agents directly
-            # (Avoids re-running the full pipeline from supervisor)
             updates = provisioner_agent(result)
             result.update(updates)
             updates = migration_planner_agent(result)
@@ -288,20 +276,16 @@ def submit_review(session_id: str, decision: ReviewDecision):
             updates = doc_expert_agent(result)
             result.update(updates)
         else:
-            # Reject: re-run full pipeline with feedback injected
-            # (Architect needs to redesign based on feedback)
-            final_result = mq_titan_workflow.invoke(result)
-            # Force flags after re-run (pipeline may overwrite them)
-            final_result["human_approved"]        = None  # reset for next review
-            final_result["human_feedback"]        = ""
-            final_result["human_aborted"]         = False
-            final_result["awaiting_human_review"] = True  # will pause at gate again
-            result = final_result
+            # Revise: run architect → optimizer → tester → human_review via LangGraph
+            # Skips supervisor/sanitiser/researcher/analyst (data unchanged)
+            result = mq_titan_revise_workflow.invoke(
+                result,
+                config={"recursion_limit": 50},
+            )
     except Exception as e:
         logger.exception("Pipeline resume error")
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Store updated state
     sessions[session_id] = result
     response = _build_response(session_id, result)
     responses[session_id] = response
@@ -318,7 +302,6 @@ def get_session(session_id: str):
 
 @app.get("/api/session/{session_id}/csv/{csv_name}")
 def download_target_csv(session_id: str, csv_name: str):
-    """Download a specific target state CSV file."""
     from fastapi.responses import PlainTextResponse
     if session_id not in responses:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -334,6 +317,7 @@ def download_target_csv(session_id: str, csv_name: str):
         headers={"Content-Disposition": f"attachment; filename={csv_name}.csv"}
     )
 
+
 # ── Chat with Architect AI ───────────────────────────────────────────────────
 
 CHAT_SYSTEM_PROMPT = """You are the MQ-TITAN Architect AI. You designed the proposed target state for an IBM MQ topology.
@@ -346,13 +330,11 @@ Keep responses under 150 words. Be direct and technical."""
 
 @app.post("/api/chat/{session_id}")
 def chat_with_architect(session_id: str, req: ChatRequest):
-    """Chat with the Architect AI about the current design."""
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
 
     result = sessions[session_id]
 
-    # Build context about the current design
     adrs = result.get("adrs", [])
     as_is = result.get("as_is_metrics", {}) or {}
     target = result.get("target_metrics", {}) or {}
@@ -378,13 +360,11 @@ def chat_with_architect(session_id: str, req: ChatRequest):
 
     system = f"{CHAT_SYSTEM_PROMPT}\n\n## CURRENT DESIGN CONTEXT:\n{context}"
 
-    # Build message history for LLM
     llm_messages = []
     for msg in req.history:
         llm_messages.append({"role": msg.role, "content": msg.content})
     llm_messages.append({"role": "user", "content": req.message})
 
-    # Try LLM call
     reply = call_llm_chat(
         system_prompt=system,
         messages=llm_messages,
@@ -393,7 +373,6 @@ def chat_with_architect(session_id: str, req: ChatRequest):
     )
 
     if not reply:
-        # Fallback — generate a contextual response based on user's question
         q = req.message.lower()
         adr_text = "; ".join(f"{a.get('id','')}: {a.get('decision','')}" for a in adrs[:3])
 
@@ -428,7 +407,7 @@ def chat_with_architect(session_id: str, req: ChatRequest):
             reply = (
                 f"I designed this topology using {method}. "
                 f"Score: {as_is.get('total_score', '?')} → {target.get('total_score', '?')} "
-                f"({result.get('complexity_reduction', {}).get('reduction_pct', '?')}% reduction). "
+                f"({_calc_reduction(result).get('reduction_pct', '?')}% reduction). "
                 f"Decisions: {adr_text or 'none'}. "
                 f"You can ask about specific QMs, channels, scores, or tell me what to change."
             )

@@ -543,7 +543,7 @@ function LoadingOverlay() {
   const [step, setStep] = useState(0);
   const steps = [
     "Validating session...",
-    "Sanitising CSV data...",
+    "Transforming raw data...",
     "Building topology graph...",
     "Analysing complexity...",
     "LLM designing target state...",
@@ -713,10 +713,16 @@ export default function App() {
 
   async function handleUpload(e) {
     e.preventDefault();
-    const form = new FormData(e.target);
+    const fileInput = e.target.querySelector('input[name="mq_raw_data"]');
+    if (!fileInput?.files?.length) {
+      setError("Please select an MQ Raw Data CSV file");
+      return;
+    }
+    const form = new FormData();
+    form.append("file", fileInput.files[0]);
     setLoading(true); setError(null); setUserDecision(null);
     try {
-      const res = await fetch(`${API}/api/analyse`, { method: "POST", body: form });
+      const res = await fetch(`${API}/api/upload`, { method: "POST", body: form });
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
       setResult(data);
@@ -1258,7 +1264,7 @@ export default function App() {
 
           {/* ── No result placeholder ── */}
           {!result && tab !== "upload" && !loading && (
-            <EmptyState icon="◇" message="No analysis run yet. Go to the Upload tab and run the demo or upload your CSV files." />
+            <EmptyState icon="◇" message="No analysis run yet. Go to the Upload tab and upload your MQ Raw Data file." />
           )}
         </div>
       </div>
@@ -1673,7 +1679,20 @@ function PipelineDiagram() {
    ═══════════════════════════════════════════════════════════════════════════ */
 
 function UploadTab({ runDemo, handleUpload }) {
-  const [showUpload, setShowUpload] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+  const fileInputRef = useRef(null);
+
+  function handleDrop(e) {
+    e.preventDefault();
+    setDragOver(false);
+    const file = e.dataTransfer?.files?.[0];
+    if (file && fileInputRef.current) {
+      // Create a new DataTransfer to set the file input
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      fileInputRef.current.files = dt.files;
+    }
+  }
 
   return (
     <div style={{ animation: "fadeUp 0.4s ease-out", maxWidth: 640, margin: "0 auto" }}>
@@ -1700,62 +1719,126 @@ function UploadTab({ runDemo, handleUpload }) {
           animation: "fadeUp 0.5s ease-out 0.2s both",
         }}>
           10 AI agents analyse, redesign, and provision your IBM MQ infrastructure.
-          Complexity scoring, architecture decisions, MQSC generation, and migration planning — all in one run.
+          Upload your MQ Raw Data export to begin.
         </p>
       </div>
 
-      {/* Giant demo button */}
+      {/* Upload area — single file */}
       <div style={{ animation: "fadeUp 0.5s ease-out 0.3s both" }}>
-        <button onClick={runDemo} style={{
-          width: "100%", padding: "22px 28px",
-          borderRadius: T.r2,
-          background: `linear-gradient(135deg, ${T.cyan}12, ${T.cyan}06)`,
-          border: `1px solid ${T.cyan}30`,
-          cursor: "pointer",
-          display: "flex", alignItems: "center", gap: 20,
-          transition: "all 0.2s",
-          boxShadow: `0 0 30px ${T.cyan}08`,
-          position: "relative",
-          overflow: "hidden",
-        }}
-          onMouseEnter={e => {
-            e.currentTarget.style.borderColor = `${T.cyan}60`;
-            e.currentTarget.style.boxShadow = `0 0 40px ${T.cyan}15, 0 4px 20px rgba(0,0,0,0.3)`;
-            e.currentTarget.style.transform = "translateY(-1px)";
-          }}
-          onMouseLeave={e => {
-            e.currentTarget.style.borderColor = `${T.cyan}30`;
-            e.currentTarget.style.boxShadow = `0 0 30px ${T.cyan}08`;
-            e.currentTarget.style.transform = "translateY(0)";
-          }}
-        >
-          {/* Play icon */}
-          <div style={{
-            width: 56, height: 56, borderRadius: 14,
-            background: `linear-gradient(135deg, ${T.cyan}, ${T.cyanDim})`,
-            display: "flex", alignItems: "center", justifyContent: "center",
-            fontSize: 22, color: T.bg0, flexShrink: 0,
-            boxShadow: `0 4px 16px ${T.cyan}40`,
-          }}>▶</div>
-          <div style={{ textAlign: "left", flex: 1 }}>
-            <div style={{ fontSize: 18, fontWeight: 700, color: T.t1, fontFamily: T.fontDisplay }}>
-              Launch Demo Analysis
+        <Card glow={dragOver ? T.cyan : undefined} style={{ marginBottom: 20 }}>
+          <CardHeader right={
+            <span style={{ fontSize: 9, color: T.t4, fontFamily: T.fontMono }}>.csv / .xlsx</span>
+          }>Upload MQ Raw Data</CardHeader>
+          <form onSubmit={handleUpload}>
+            <div
+              onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+              onDragLeave={() => setDragOver(false)}
+              onDrop={handleDrop}
+              style={{
+                padding: "36px 24px", textAlign: "center",
+                borderBottom: `1px solid ${T.border0}`,
+                background: dragOver ? `${T.cyan}08` : "transparent",
+                transition: "background 0.2s",
+              }}
+            >
+              <div style={{
+                width: 52, height: 52, borderRadius: 12, margin: "0 auto 16px",
+                background: `${T.cyan}10`, border: `1.5px dashed ${dragOver ? T.cyan : T.border2}`,
+                display: "flex", alignItems: "center", justifyContent: "center",
+                fontSize: 22, color: dragOver ? T.cyan : T.t3,
+                transition: "all 0.2s",
+              }}>⬆</div>
+              <div style={{ fontSize: 13, color: T.t2, marginBottom: 8 }}>
+                Drop your <strong style={{ color: T.t1 }}>MQ Raw Data</strong> file here
+              </div>
+              <div style={{ fontSize: 11, color: T.t4, marginBottom: 16 }}>
+                or click to browse — supports .csv and .xlsx
+              </div>
+              <div style={{ position: "relative", display: "inline-block" }}>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  name="mq_raw_data"
+                  accept=".csv,.xlsx,.xls"
+                  required
+                  style={{
+                    position: "absolute", inset: 0, opacity: 0, cursor: "pointer", width: "100%", height: "100%",
+                  }}
+                  onChange={e => {
+                    // Force re-render to show filename
+                    const fname = e.target.files?.[0]?.name;
+                    if (fname) e.target.closest("form").querySelector("[data-filename]").textContent = fname;
+                  }}
+                />
+                <div style={{
+                  padding: "8px 20px", borderRadius: T.r1,
+                  border: `1px solid ${T.border1}`,
+                  background: T.bg3, color: T.t2,
+                  fontSize: 11, fontFamily: T.fontMono,
+                  cursor: "pointer",
+                }}>
+                  <span data-filename="">Choose file...</span>
+                </div>
+              </div>
             </div>
-            <div style={{ fontSize: 12, color: T.t3, marginTop: 4, lineHeight: 1.5 }}>
-              Runs the full 10-agent pipeline on a synthetic MQ environment
-              with 8 queue managers, 60+ channels, and 20 applications
+            <div style={{ padding: "14px 16px" }}>
+              <button type="submit" style={{
+                width: "100%", padding: "14px",
+                borderRadius: T.r1, border: "none",
+                background: `linear-gradient(180deg, ${T.green}, ${T.greenDim})`,
+                color: "#fff", fontSize: 14, fontWeight: 600,
+                cursor: "pointer", fontFamily: T.fontSans,
+                boxShadow: `0 2px 12px ${T.green}40`,
+                transition: "all 0.15s",
+              }}
+                onMouseEnter={e => { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = `0 4px 20px ${T.green}50`; }}
+                onMouseLeave={e => { e.currentTarget.style.transform = "translateY(0)"; e.currentTarget.style.boxShadow = `0 2px 12px ${T.green}40`; }}
+              >
+                ▶ Analyse My MQ Environment
+              </button>
+            </div>
+          </form>
+        </Card>
+
+        {/* Data format info */}
+        <Card delay={0.1} style={{ marginBottom: 20 }}>
+          <CardHeader>Expected Data Format</CardHeader>
+          <div style={{ padding: "14px 16px", fontSize: 11, color: T.t3, lineHeight: 1.7 }}>
+            <div style={{ marginBottom: 10 }}>
+              Single Excel or CSV file with MQ topology rows. Each row = one <strong style={{ color: T.t2 }}>app→queue</strong> relationship. Required columns:
+            </div>
+            <div style={{
+              display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px 16px",
+              fontFamily: T.fontMono, fontSize: 10,
+            }}>
+              {[
+                ["queue_manager_name", "QM hosting the queue"],
+                ["app_id", "Application identifier"],
+                ["Discrete Queue Name", "Queue name"],
+                ["PrimaryAppRole", "Producer / Consumer"],
+                ["q_type", "Local / Remote / Alias"],
+                ["remote_q_mgr_name", "Target QM (remote)"],
+                ["remote_q_name", "Target queue (remote)"],
+                ["xmit_q_name", "Transmission queue"],
+                ["Neighborhood", "Region / LOB"],
+                ["line_of_business", "Business unit"],
+              ].map(([col, desc]) => (
+                <div key={col} style={{ padding: "3px 0", display: "flex", gap: 6 }}>
+                  <span style={{ color: T.cyan, fontWeight: 600, minWidth: 140 }}>{col}</span>
+                  <span style={{ color: T.t4 }}>{desc}</span>
+                </div>
+              ))}
             </div>
           </div>
-          <div style={{ color: T.cyan, fontSize: 22, flexShrink: 0, opacity: 0.6 }}>→</div>
-        </button>
+        </Card>
       </div>
 
       {/* Animated pipeline diagram */}
       <PipelineDiagram />
 
-      {/* Collapsible custom upload */}
-      <div style={{ marginTop: 36, animation: "fadeUp 0.5s ease-out 0.5s both" }}>
-        <button onClick={() => setShowUpload(!showUpload)} style={{
+      {/* Demo fallback — small and secondary */}
+      <div style={{ marginTop: 24, animation: "fadeUp 0.5s ease-out 0.5s both" }}>
+        <button onClick={runDemo} style={{
           width: "100%", padding: "12px 16px",
           borderRadius: T.r1,
           background: "transparent",
@@ -1767,52 +1850,8 @@ function UploadTab({ runDemo, handleUpload }) {
           onMouseEnter={e => { e.currentTarget.style.borderColor = T.border1; e.currentTarget.style.color = T.t3; }}
           onMouseLeave={e => { e.currentTarget.style.borderColor = T.border0; e.currentTarget.style.color = T.t4; }}
         >
-          <span style={{
-            transform: showUpload ? "rotate(180deg)" : "rotate(0deg)",
-            transition: "transform 0.2s", fontSize: 10,
-          }}>▼</span>
-          {showUpload ? "Hide custom upload" : "Or upload your own MQ environment CSVs"}
+          ▸ Or run with bundled demo data (if available)
         </button>
-
-        {showUpload && (
-          <Card delay={0} style={{ marginTop: 12, animation: "fadeUp 0.3s ease-out" }}>
-            <CardHeader>Upload Custom CSVs</CardHeader>
-            <form onSubmit={handleUpload} style={{ padding: 20 }}>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 16 }}>
-                {["queue_managers", "queues", "applications", "channels"].map(name => (
-                  <div key={name}>
-                    <label style={{
-                      display: "block", fontSize: 10, fontWeight: 600, marginBottom: 6,
-                      color: T.t3, textTransform: "uppercase", letterSpacing: "0.06em", fontFamily: T.fontMono,
-                    }}>
-                      {name.replace("_", " ")}
-                    </label>
-                    <div style={{
-                      position: "relative", padding: "10px 12px",
-                      borderRadius: T.r1, border: `1px dashed ${T.border1}`,
-                      background: T.bg3,
-                    }}>
-                      <input type="file" name={name} accept=".csv" required style={{
-                        fontSize: 11, color: T.t2, width: "100%",
-                        fontFamily: T.fontMono,
-                      }} />
-                    </div>
-                  </div>
-                ))}
-              </div>
-              <button type="submit" style={{
-                width: "100%", padding: "12px",
-                borderRadius: T.r1, border: `1px solid ${T.green}40`,
-                background: `linear-gradient(180deg, ${T.green}15, ${T.green}08)`,
-                color: T.green, fontSize: 13, fontWeight: 600,
-                cursor: "pointer", fontFamily: T.fontSans,
-                transition: "all 0.15s",
-              }}>
-                Analyse My Environment
-              </button>
-            </form>
-          </Card>
-        )}
       </div>
     </div>
   );
