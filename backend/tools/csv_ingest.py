@@ -144,13 +144,24 @@ def load_and_clean(csv_paths: dict) -> tuple[dict, dict]:
                 break
         app_name_map[r["app_id"]] = name
 
-    # Dedup to unique (app_id, qm_id, direction)
-    adf = adf.drop_duplicates(subset=["app_id", "queue_manager_name", "direction"])
+    # Keep per-queue detail: one row per (app_id, qm_id, queue, direction)
+    # This preserves the graph density needed for accurate complexity scoring
+    adf["queue_name"] = df["Discrete Queue Name"]
+    adf = adf.drop_duplicates(subset=["app_id", "queue_manager_name", "queue_name", "direction"])
+    
+    # Generate queue_id to match
+    import hashlib as _hl
+    adf["queue_id"] = (adf["queue_manager_name"] + ":" + adf["queue_name"]).apply(
+        lambda x: f"Q_{_hl.md5(x.encode()).hexdigest()[:8].upper()}"
+    )
+    
     app_rows = [
         {
             "app_id": r["app_id"],
             "app_name": app_name_map.get(r["app_id"], r["app_id"]),
             "qm_id": r["queue_manager_name"],
+            "queue_id": r["queue_id"],
+            "queue_name": r["queue_name"],
             "direction": r["direction"],
         }
         for _, r in adf.iterrows()
