@@ -340,13 +340,14 @@ def architect_agent(state: dict) -> dict:
 
 def _enforce_single_qm(G: nx.DiGraph, raw_data: dict) -> int:
     """
-    Belt-and-suspenders: scan every app node in the target graph.
-    If any app has >1 connects_to edge, keep only the best one
-    (most connections in raw data) and remove the rest.
-    Returns the number of duplicate edges removed.
+    Belt-and-suspenders: enforce strict 1:1 app↔QM ownership.
+    1) Each app has exactly 1 connects_to edge (remove duplicates)
+    2) Each QM has exactly 1 app (if multiple, split into new QMs)
+    Returns the number of corrections made.
     """
-    removed = 0
+    corrections = 0
     app_nodes = [n for n, d in G.nodes(data=True) if d.get("type") == "app"]
+    qm_nodes = [n for n, d in G.nodes(data=True) if d.get("type") == "qm"]
 
     # Pre-compute connection counts per (app, QM) from raw data
     app_qm_counts = {}
@@ -354,25 +355,49 @@ def _enforce_single_qm(G: nx.DiGraph, raw_data: dict) -> int:
         key = (row["app_id"], row["qm_id"])
         app_qm_counts[key] = app_qm_counts.get(key, 0) + 1
 
+    # Pass 1: each app → exactly 1 QM
     for app in app_nodes:
         connected = [(v, d) for _, v, d in G.out_edges(app, data=True) if d.get("rel") == "connects_to"]
         if len(connected) <= 1:
             continue
-
-        # Pick the best QM by raw data connection count
         best_qm = max(
             (qm for qm, _ in connected),
             key=lambda qm: app_qm_counts.get((app, qm), 0),
         )
-
-        # Remove all connects_to edges except the best
         for qm, _ in connected:
             if qm != best_qm:
                 G.remove_edge(app, qm)
-                removed += 1
+                corrections += 1
                 logger.warning(f"_enforce_single_qm: removed duplicate {app}→{qm} (keeping {best_qm})")
 
-    return removed
+    # Pass 2: each QM → exactly 1 app
+    for qm in qm_nodes:
+        apps_on_qm = [u for u, _, d in G.in_edges(qm, data=True) if d.get("rel") == "connects_to"]
+        if len(apps_on_qm) <= 1:
+            continue
+
+        # Keep the app with the most raw connections to this QM
+        apps_sorted = sorted(
+            apps_on_qm,
+            key=lambda a: app_qm_counts.get((a, qm), 0),
+            reverse=True,
+        )
+        winner = apps_sorted[0]
+        region = G.nodes[qm].get("region", "UNKNOWN")
+
+        for app in apps_sorted[1:]:
+            # Create a new dedicated QM for this app
+            new_qm = f"QM_{app}"
+            if new_qm not in G.nodes:
+                G.add_node(new_qm, type="qm",
+                           name=f"QM for {G.nodes[app].get('name', app)}",
+                           region=region)
+            G.remove_edge(app, qm)
+            G.add_edge(app, new_qm, rel="connects_to")
+            corrections += 1
+            logger.warning(f"_enforce_single_qm: split {app} off {qm} → new {new_qm} (winner={winner})")
+
+    return corrections
 
 
 def _architect_llm(state: dict) -> dict | None:
@@ -586,17 +611,20 @@ def _build_target_rules(state: dict) -> nx.DiGraph:
     """
     Deterministic rule-based target state builder.
     Used as fallback when LLM is unavailable.
+
+    CORE CONSTRAINT: 1 App = 1 QM (strict 1:1 ownership).
+    - If a QM currently has 5 apps, 1 app keeps it, the other 4 get new QMs.
+    - The app with the MOST connections to the QM keeps the original.
+    - Channels are introduced ONLY where a producer app on QM_A needs to
+      send messages to a consumer app on QM_B.
     """
     raw_data = state["raw_data"]
     G_target = nx.DiGraph()
 
-    # ── Build canonical app→QM ownership map (1 QM per app, enforced) ─────
-    # Strategy: pick the QM where the app has the MOST queue connections.
-    # Tie-breakers: 1) same region preference  2) fewer total apps on QM
-    #
-    # Step 1: count connections per (app, QM)
+    # ── Step 1: Identify unique apps and their primary QM ─────────────────
+    # For each app, find the QM it connects to most (weighted majority).
+    # This determines which EXISTING QM the app prefers.
     app_qm_counts = {}   # {app_id: {qm_id: connection_count}}
-    app_qm_regions = {}  # {qm_id: region}
     for row in raw_data["applications"]:
         app_id = row["app_id"]
         qm_id = row["qm_id"]
@@ -604,114 +632,146 @@ def _build_target_rules(state: dict) -> nx.DiGraph:
             app_qm_counts[app_id] = {}
         app_qm_counts[app_id][qm_id] = app_qm_counts[app_id].get(qm_id, 0) + 1
 
-    # Build QM metadata lookup
+    app_preferred_qm = {}
+    for app_id, qm_counts in app_qm_counts.items():
+        app_preferred_qm[app_id] = max(qm_counts, key=lambda qm: qm_counts[qm])
+
+    # ── Step 2: Assign QMs — 1:1 strict mapping ──────────────────────────
+    # Group apps by their preferred QM, then for each QM:
+    #   - The app with the most connections KEEPS the original QM name
+    #   - Other apps get a NEW QM named QM_{APP_ID}
+    qm_app_groups = {}  # {qm_id: [app_ids]}
+    for app_id, qm_id in app_preferred_qm.items():
+        if qm_id not in qm_app_groups:
+            qm_app_groups[qm_id] = []
+        qm_app_groups[qm_id].append(app_id)
+
     qm_map = {row["qm_id"]: row for row in raw_data["queue_managers"]}
-    for qm_id, row in qm_map.items():
-        app_qm_regions[qm_id] = row.get("region", "UNKNOWN")
-
-    # Step 2: count total apps per QM (for load-balance tie-breaking)
-    qm_total_apps = {}
-    for app_id, qm_counts in app_qm_counts.items():
-        for qm_id in qm_counts:
-            qm_total_apps[qm_id] = qm_total_apps.get(qm_id, 0) + 1
-
-    # Step 3: for each app, pick best QM
-    app_qm_ownership = {}
-    for app_id, qm_counts in app_qm_counts.items():
-        if len(qm_counts) == 1:
-            # Only one QM — simple case
-            app_qm_ownership[app_id] = next(iter(qm_counts))
-        else:
-            # Multiple QMs — pick by: most connections → fewest total apps → alphabetical
-            best_qm = max(
-                qm_counts.keys(),
-                key=lambda qm: (
-                    qm_counts[qm],                          # most connections first
-                    -qm_total_apps.get(qm, 0),              # fewer total apps (negate for max)
-                    qm,                                       # alphabetical stability
-                ),
-            )
-            app_qm_ownership[app_id] = best_qm
-
-    needed_qms = set(app_qm_ownership.values())
-
-    # Add QM nodes
-    for qm_id in needed_qms:
-        if qm_id in qm_map:
-            row = qm_map[qm_id]
-            G_target.add_node(qm_id, type="qm", name=row.get("qm_name", qm_id), region=row.get("region", ""))
-
-    # Add app nodes with single QM ownership
     app_name_map = {}
     for row in raw_data["applications"]:
         if row["app_id"] not in app_name_map:
             app_name_map[row["app_id"]] = row.get("app_name", row["app_id"])
 
+    # app_qm_ownership: the final 1:1 mapping {app_id: assigned_qm_id}
+    app_qm_ownership = {}
+
+    for original_qm, apps in qm_app_groups.items():
+        qm_meta = qm_map.get(original_qm, {})
+        region = qm_meta.get("region", "UNKNOWN")
+
+        if len(apps) == 1:
+            # Single app — keeps the original QM
+            app_qm_ownership[apps[0]] = original_qm
+            G_target.add_node(original_qm, type="qm",
+                              name=qm_meta.get("qm_name", original_qm),
+                              region=region)
+        else:
+            # Multiple apps — sort by connection count descending.
+            # Winner keeps original QM, others get new QMs.
+            apps_sorted = sorted(
+                apps,
+                key=lambda a: app_qm_counts[a].get(original_qm, 0),
+                reverse=True,
+            )
+            # First app keeps the original QM
+            winner = apps_sorted[0]
+            app_qm_ownership[winner] = original_qm
+            G_target.add_node(original_qm, type="qm",
+                              name=qm_meta.get("qm_name", original_qm),
+                              region=region)
+
+            # Remaining apps each get a dedicated QM
+            for app_id in apps_sorted[1:]:
+                new_qm = f"QM_{app_id}"
+                app_qm_ownership[app_id] = new_qm
+                G_target.add_node(new_qm, type="qm",
+                                  name=f"QM for {app_name_map.get(app_id, app_id)}",
+                                  region=region)  # inherit region from parent QM
+
+    # ── Step 3: Add app nodes with their 1:1 QM ──────────────────────────
     for app_id, qm_id in app_qm_ownership.items():
         G_target.add_node(app_id, type="app", name=app_name_map.get(app_id, app_id))
-        if qm_id in G_target.nodes:
-            G_target.add_edge(app_id, qm_id, rel="connects_to")
+        G_target.add_edge(app_id, qm_id, rel="connects_to")
 
-    # Channels from as-is (active senders between needed QMs)
-    added_channels = set()
-    for row in raw_data["channels"]:
-        if row.get("channel_type") != "SENDER":
+    # ── Step 4: Determine required channels ───────────────────────────────
+    # A channel FROM_QM→TO_QM is needed if and only if:
+    #   - An app on FROM_QM produces messages (PUT)
+    #   - An app on TO_QM consumes messages (GET)
+    #   - There was an actual data flow between them in the as-is topology
+    #
+    # We derive flows from the as-is data: if app_A (PUT) and app_B (GET)
+    # both appear on the same queue in the source data, they have a flow.
+    # After 1:1 assignment, if they're on different QMs, we need a channel.
+
+    # Build per-app direction info
+    app_directions = {}  # {app_id: set of directions}
+    app_queues = {}      # {app_id: set of queue names}
+    for row in raw_data["applications"]:
+        aid = row["app_id"]
+        if aid not in app_directions:
+            app_directions[aid] = set()
+            app_queues[aid] = set()
+        app_directions[aid].add(row.get("direction", "UNKNOWN"))
+        qname = row.get("queue_name", "")
+        if qname:
+            app_queues[aid].add(qname)
+
+    # Build queue→apps map to find producer-consumer pairs
+    queue_producers = {}  # {queue_name: set of app_ids that PUT}
+    queue_consumers = {}  # {queue_name: set of app_ids that GET}
+    for row in raw_data["applications"]:
+        aid = row["app_id"]
+        qname = row.get("queue_name", "")
+        if not qname:
             continue
-        from_qm, to_qm = row["from_qm"], row["to_qm"]
-        if from_qm in needed_qms and to_qm in needed_qms and row.get("status", "").upper() != "STOPPED":
-            pair = (from_qm, to_qm)
-            if pair not in added_channels:
-                added_channels.add(pair)
-                G_target.add_edge(
-                    from_qm, to_qm,
-                    rel="channel",
-                    channel_name=f"{from_qm}.{to_qm}",
-                    status="RUNNING",
-                    xmit_queue=f"{to_qm}.XMITQ",
-                )
+        direction = row.get("direction", "").upper()
+        if direction in ("PUT", "PRODUCER"):
+            queue_producers.setdefault(qname, set()).add(aid)
+        elif direction in ("GET", "CONSUMER"):
+            queue_consumers.setdefault(qname, set()).add(aid)
 
-    # Infer channels from REMOTE queue definitions
+    # Find all required QM-to-QM connections from producer→consumer flows
+    required_channels = set()  # set of (from_qm, to_qm)
+    for queue_name in set(queue_producers.keys()) & set(queue_consumers.keys()):
+        for prod_app in queue_producers[queue_name]:
+            for cons_app in queue_consumers[queue_name]:
+                if prod_app == cons_app:
+                    continue
+                from_qm = app_qm_ownership.get(prod_app)
+                to_qm = app_qm_ownership.get(cons_app)
+                if from_qm and to_qm and from_qm != to_qm:
+                    required_channels.add((from_qm, to_qm))
+
+    # Also infer channels from REMOTE queue definitions in the as-is data
     for q in raw_data.get("queues", []):
         if q.get("queue_type") != "REMOTE":
             continue
-        remote_qm = q.get("remote_qm")
-        if not remote_qm:
+        remote_qm_name = q.get("remote_qm")
+        source_qm_name = q.get("qm_id")
+        if not remote_qm_name or not source_qm_name:
             continue
-        from_qm = q["qm_id"]
-        to_qm = remote_qm if remote_qm in needed_qms else None
-        if not to_qm or from_qm == to_qm or from_qm not in needed_qms:
-            continue
-        pair = (from_qm, to_qm)
-        if pair not in added_channels:
-            added_channels.add(pair)
+        # Map old QM names to new QM names via apps
+        # Find apps on the source QM and their new QMs
+        source_apps = [a for a, qm in app_preferred_qm.items() if qm == source_qm_name]
+        target_apps = [a for a, qm in app_preferred_qm.items() if qm == remote_qm_name]
+        for sa in source_apps:
+            for ta in target_apps:
+                from_qm = app_qm_ownership.get(sa)
+                to_qm = app_qm_ownership.get(ta)
+                if from_qm and to_qm and from_qm != to_qm:
+                    required_channels.add((from_qm, to_qm))
+
+    # Add channel edges
+    for from_qm, to_qm in required_channels:
+        if from_qm in G_target.nodes and to_qm in G_target.nodes:
+            channel_name = f"{from_qm}.{to_qm}"
             G_target.add_edge(
-                from_qm, to_qm, rel="channel",
-                channel_name=f"{from_qm}.{to_qm}",
+                from_qm, to_qm,
+                rel="channel",
+                channel_name=channel_name,
                 status="RUNNING",
                 xmit_queue=f"{to_qm}.XMITQ",
             )
-
-    # Safety net: connect any isolated QM (has apps, no channels) to the hub
-    qms_with_apps = set(app_qm_ownership.values()) & set(G_target.nodes)
-    for qm in list(qms_with_apps):
-        has_any_channel = any(
-            d.get("rel") == "channel"
-            for _, _, d in list(G_target.out_edges(qm, data=True)) + list(G_target.in_edges(qm, data=True))
-        )
-        if not has_any_channel and len(qms_with_apps) > 1:
-            hub = max(
-                (q for q in qms_with_apps if q != qm),
-                key=lambda q: sum(1 for _, _, d in list(G_target.out_edges(q, data=True)) + list(G_target.in_edges(q, data=True)) if d.get("rel") == "channel"),
-                default=None,
-            )
-            if hub and (qm, hub) not in added_channels:
-                added_channels.add((qm, hub))
-                G_target.add_edge(
-                    qm, hub, rel="channel",
-                    channel_name=f"{qm}.{hub}",
-                    status="RUNNING",
-                    xmit_queue=f"{hub}.XMITQ",
-                )
 
     return G_target
 
@@ -726,33 +786,55 @@ def _generate_rule_adrs(state: dict, target_graph: nx.DiGraph, redesign_count: i
     target_qms = set(n for n, d in target_graph.nodes(data=True) if d.get("type") == "qm")
     as_is_qms = set(n for n, d in as_is_graph.nodes(data=True) if d.get("type") == "qm")
     removed_qms = as_is_qms - target_qms
+    new_qms = target_qms - as_is_qms
+
+    # ADR: 1:1 QM ownership enforcement
+    target_app_count = sum(1 for _, d in target_graph.nodes(data=True) if d.get("type") == "app")
+    adrs.append({
+        "id": f"ADR-{redesign_count+1:02d}-001",
+        "decision": f"Enforce strict 1:1 app-to-QM ownership — {len(target_qms)} QMs for {target_app_count} apps",
+        "context": (
+            f"As-is has {original_qm_count} QMs shared across {target_app_count} apps. "
+            f"Constraint requires each application to own exactly one queue manager."
+        ),
+        "rationale": (
+            "1:1 ownership eliminates multi-app coupling, establishes clear ownership boundaries, "
+            "and makes each QM independently deployable. Cross-QM communication is handled "
+            "by MQ routing (QREMOTE + XMITQ + sender/receiver channels)."
+        ),
+        "consequences": (
+            f"{len(new_qms)} new QMs created for apps that previously shared. "
+            f"Each app's connection string points to its dedicated QM. "
+            f"Channels introduced only where producer→consumer flows exist."
+        ),
+    })
 
     if removed_qms:
         adrs.append({
-            "id": f"ADR-{redesign_count+1:02d}-001",
-            "decision": f"Remove {len(removed_qms)} QMs: {', '.join(sorted(removed_qms))}",
-            "context": f"As-is has {original_qm_count} QMs. {len(removed_qms)} have no active app ownership.",
-            "rationale": "Orphan QMs contribute to Channel Count and Fan-Out complexity with zero application value. Removing them reduces operational overhead.",
-            "consequences": "Operational teams must decommission these QMs. Any unknown legacy consumers must be identified before removal.",
+            "id": f"ADR-{redesign_count+1:02d}-002",
+            "decision": f"Remove {len(removed_qms)} orphan QMs: {', '.join(sorted(removed_qms))}",
+            "context": f"These QMs have no active app ownership after 1:1 reassignment.",
+            "rationale": "Orphan QMs contribute to operational overhead with zero application value.",
+            "consequences": "Operational teams must decommission these QMs.",
         })
 
     multi_qm = violations.get("multi_qm_apps", [])
     if multi_qm:
         adrs.append({
-            "id": f"ADR-{redesign_count+1:02d}-002",
-            "decision": f"Enforce single-QM ownership for {len(multi_qm)} apps with multiple QM connections",
-            "context": f"Apps {[m['app'] for m in multi_qm]} each connect to multiple QMs, violating the 1-QM-per-app constraint.",
-            "rationale": "Each app is assigned to its primary QM. Secondary connections replaced with remoteQ+xmitq+channel routing.",
-            "consequences": "Application connection strings must be updated to point only to the assigned QM.",
+            "id": f"ADR-{redesign_count+1:02d}-003",
+            "decision": f"Resolve {len(multi_qm)} multi-QM apps via dedicated QM assignment",
+            "context": f"Apps {[m['app'] for m in multi_qm]} each connected to multiple QMs.",
+            "rationale": "Each app assigned to a single dedicated QM. All cross-QM flows routed via channels.",
+            "consequences": "Application connection strings updated. Remote queues + channels replace direct connections.",
         })
 
     stopped = violations.get("stopped_channels", [])
     if stopped:
         adrs.append({
-            "id": f"ADR-{redesign_count+1:02d}-003",
+            "id": f"ADR-{redesign_count+1:02d}-004",
             "decision": f"Remove {len(stopped)} stopped/inactive channels",
             "context": "Channels with STOPPED status represent unused routing paths.",
-            "rationale": "Stopped channels increase Channel Count score and represent latent configuration risk.",
+            "rationale": "Stopped channels increase complexity score and represent latent configuration risk.",
             "consequences": "MQSC DELETE CHANNEL commands will be generated.",
         })
 
@@ -848,12 +930,16 @@ def optimizer_agent(state: dict) -> dict:
 
     # ══════════════════════════════════════════════════════════════════════
     # PHASE 2: GRAPH-THEORETIC OPTIMISATION
-    # On surviving channels, apply weighted MST to find the minimum set of
-    # edges keeping all active QMs connected. Weight = inverse of app
-    # density on each end (denser = more important = lower weight = keep).
-    # Edges NOT in MST are candidates for removal, subject to a safety
-    # check: never remove if it breaks producer→consumer reachability.
-    # Then Kernighan-Lin bisection detects natural topology clusters.
+    # With 1:1 app-to-QM mapping, the architect already creates channels
+    # only where actual producer→consumer flows exist. Phase 2 focuses on:
+    #   a) MST to find redundant channels (where multiple paths exist)
+    #   b) Kernighan-Lin bisection for cluster detection (informational)
+    #
+    # PERFORMANCE NOTE: With N apps = N QMs, the old per-edge reachability
+    # check was O(removable × producers × consumers × graph_copy).
+    # New approach: compute MST, trust it directly for redundant edges
+    # since each channel was flow-justified by the architect. Only remove
+    # edges NOT in MST where the graph remains connected without them.
     # ══════════════════════════════════════════════════════════════════════
     surviving_channels = [(u, v, d) for u, v, d in G.edges(data=True) if d.get("rel") == "channel"]
     phase2_removed = []
@@ -863,100 +949,106 @@ def optimizer_agent(state: dict) -> dict:
     # Build undirected QM graph with weighted edges for MST
     G_qm = nx.Graph()
     active_qms = [qm for qm in qm_nodes if qm in qms_with_apps]
+    active_qm_set = set(active_qms)
     G_qm.add_nodes_from(active_qms)
+
+    # Pre-compute apps-per-QM count (O(1) lookup instead of O(N) scan)
+    qm_app_count = {}
+    for _, qm in app_qm_map.items():
+        qm_app_count[qm] = qm_app_count.get(qm, 0) + 1
+
     for u, v, d in surviving_channels:
-        if u in active_qms and v in active_qms:
-            src_apps = len([a for a, q in app_qm_map.items() if q == u])
-            dst_apps = len([a for a, q in app_qm_map.items() if q == v])
+        if u in active_qm_set and v in active_qm_set:
+            src_apps = qm_app_count.get(u, 0)
+            dst_apps = qm_app_count.get(v, 0)
             weight = max(1, 10 - (src_apps + dst_apps))
             G_qm.add_edge(u, v, weight=weight)
 
-    # MST: minimum spanning tree — edges NOT in MST are redundant
-    if len(active_qms) > 1 and G_qm.number_of_edges() > 0 and nx.is_connected(G_qm):
-        mst = nx.minimum_spanning_tree(G_qm, weight="weight")
-        mst_edges = set(frozenset(e) for e in mst.edges())
-        current_edges = set(frozenset((u, v)) for u, v, _ in surviving_channels
-                           if u in active_qms and v in active_qms)
-        removable = current_edges - mst_edges
-        mst_applied = True
+    # MST-based pruning — only on connected components
+    if len(active_qms) > 1 and G_qm.number_of_edges() > 0:
+        # Process each connected component separately (handles disconnected topologies)
+        for component in nx.connected_components(G_qm):
+            if len(component) < 2:
+                continue
+            comp_sub = G_qm.subgraph(component).copy()
+            if comp_sub.number_of_edges() <= len(component) - 1:
+                # Already a tree — nothing to remove
+                continue
 
-        if removable:
+            mst = nx.minimum_spanning_tree(comp_sub, weight="weight")
+            mst_edges = set(frozenset(e) for e in mst.edges())
+            comp_edges = set(frozenset(e) for e in comp_sub.edges())
+            removable = comp_edges - mst_edges
+            mst_applied = True
+
             for edge_set in removable:
                 u, v = tuple(edge_set)
+                # Try both directions since our directed graph stores one direction
                 for src, dst in [(u, v), (v, u)]:
                     if not G.has_edge(src, dst):
                         continue
                     if G[src][dst].get("rel") != "channel":
                         continue
-
-                    # Safety: verify all producer→consumer paths survive
-                    # Use undirected projection since MQ sender/receiver pairs
-                    # create bidirectional logical connectivity
-                    G_test = G.copy()
-                    G_test.remove_edge(src, dst)
-                    reachability_ok = True
-                    qm_sub = G_test.subgraph(qm_nodes).to_undirected()
-                    for p_qm in producer_qms:
-                        for c_qm in consumer_qms:
-                            if p_qm == c_qm:
-                                continue
-                            if p_qm not in qm_sub.nodes or c_qm not in qm_sub.nodes:
-                                continue
-                            if not nx.has_path(qm_sub, p_qm, c_qm):
-                                reachability_ok = False
-                                break
-                        if not reachability_ok:
-                            break
-
-                    if reachability_ok:
-                        ch_name = G[src][dst].get("channel_name", f"{src}.{dst}")
-                        phase2_removed.append((src, dst, ch_name))
-                        G.remove_edge(src, dst)
+                    ch_name = G[src][dst].get("channel_name", f"{src}.{dst}")
+                    phase2_removed.append((src, dst, ch_name))
+                    G.remove_edge(src, dst)
 
     # Kernighan-Lin bisection — detect natural cluster boundaries
+    # Only run on the largest connected component to avoid hanging
     kl_insight = ""
     G_qm_post = nx.Graph()
     post_channels = [(u, v) for u, v, d in G.edges(data=True)
-                     if d.get("rel") == "channel" and u in active_qms and v in active_qms]
+                     if d.get("rel") == "channel" and u in active_qm_set and v in active_qm_set]
     G_qm_post.add_nodes_from(active_qms)
     G_qm_post.add_edges_from(post_channels)
 
-    if len(active_qms) >= 4 and G_qm_post.number_of_edges() > 0 and nx.is_connected(G_qm_post):
-        try:
-            partition = nx.community.kernighan_lin_bisection(G_qm_post)
-            set_a, set_b = partition
-            cross_edges = sum(
-                1 for u, v in post_channels
-                if (u in set_a and v in set_b) or (u in set_b and v in set_a)
-            )
-            kl_applied = True
+    if len(active_qms) >= 4 and G_qm_post.number_of_edges() > 0:
+        # Find the largest connected component for KL bisection
+        largest_comp = max(nx.connected_components(G_qm_post), key=len)
+        if len(largest_comp) >= 4:
+            comp_sub = G_qm_post.subgraph(largest_comp).copy()
+            try:
+                partition = nx.community.kernighan_lin_bisection(comp_sub)
+                set_a, set_b = partition
+                cross_edges = sum(
+                    1 for u, v in comp_sub.edges()
+                    if (u in set_a and v in set_b) or (u in set_b and v in set_a)
+                )
+                kl_applied = True
+                kl_insight = (
+                    f"Kernighan-Lin bisection identified 2 natural clusters: "
+                    f"{len(set_a)} QMs and {len(set_b)} QMs "
+                    f"with {cross_edges} cross-cluster channel(s). "
+                )
+            except Exception:
+                kl_insight = "Kernighan-Lin bisection: could not partition topology. "
+        else:
             kl_insight = (
-                f"Kernighan-Lin bisection identified 2 natural clusters: "
-                f"{sorted(set_a)} and {sorted(set_b)} "
-                f"with {cross_edges} cross-cluster channel(s). "
+                f"Kernighan-Lin bisection: skipped "
+                f"(largest component has {len(largest_comp)} QMs, requires ≥4). "
             )
-        except Exception:
-            kl_insight = "Kernighan-Lin bisection: could not partition topology. "
     elif len(active_qms) >= 2:
         kl_insight = (
             f"Kernighan-Lin bisection: skipped "
-            f"({len(active_qms)} active QMs, requires ≥4 for meaningful partitioning). "
+            f"({len(active_qms)} active QMs, insufficient connected edges). "
         )
 
     # ══════════════════════════════════════════════════════════════════════
     # CYCLE DETECTION — informational metric for architectural awareness
     # Cycles = redundant routing paths. May be intentional for HA or
     # accidental from legacy config. Reported but not a constraint.
+    # Skip on very large topologies (>100 QMs) to avoid slow enumeration.
     # ══════════════════════════════════════════════════════════════════════
     qm_subgraph = G.subgraph(qm_nodes)
     cycles = []
-    try:
-        for i, c in enumerate(nx.simple_cycles(qm_subgraph)):
-            cycles.append(c)
-            if i >= 20:
-                break
-    except Exception:
-        pass
+    if len(qm_nodes) <= 100:
+        try:
+            for i, c in enumerate(nx.simple_cycles(qm_subgraph)):
+                cycles.append(c)
+                if i >= 20:
+                    break
+        except Exception:
+            pass
     cycle_info = ""
     if cycles:
         formatted = [" → ".join(c + [c[0]]) for c in cycles[:3]]
@@ -1039,6 +1131,17 @@ def tester_agent(state: dict) -> dict:
                 "rule": "ONE_QM_PER_APP",
                 "entity": app,
                 "detail": f"App connects to {len(connected_qms)} QMs: {connected_qms}",
+                "severity": "CRITICAL",
+            })
+
+    # ── V-001b: Exactly one app per QM (1:1 ownership) ───────────────────
+    for qm in qm_nodes:
+        apps_on_qm = [u for u, v, d in G.in_edges(qm, data=True) if d.get("rel") == "connects_to"]
+        if len(apps_on_qm) > 1:
+            violations.append({
+                "rule": "ONE_APP_PER_QM",
+                "entity": qm,
+                "detail": f"QM has {len(apps_on_qm)} apps: {apps_on_qm} — constraint requires 1:1 ownership",
                 "severity": "CRITICAL",
             })
 
