@@ -376,6 +376,239 @@ def analyse_subgraphs(G: nx.DiGraph) -> list:
     return results
 
 
+def detect_communities(G: nx.DiGraph) -> dict:
+    """
+    Louvain community detection on the QM channel graph.
+    Identifies natural clusters of queue managers that communicate
+    frequently — useful for regional grouping and blast-radius analysis.
+
+    Returns:
+      - communities: list of sets of QM IDs
+      - modularity: float (0-1, higher = more modular = cleaner separation)
+      - community_map: {qm_id: community_index}
+    """
+    qm_nodes = set(n for n, d in G.nodes(data=True) if d.get("type") == "qm")
+    if len(qm_nodes) < 2:
+        return {"communities": [qm_nodes] if qm_nodes else [], "modularity": 0.0, "community_map": {}}
+
+    # Build undirected weighted QM graph
+    G_qm = nx.Graph()
+    G_qm.add_nodes_from(qm_nodes)
+    edge_weights = {}
+    for u, v, d in G.edges(data=True):
+        if d.get("rel") == "channel" and u in qm_nodes and v in qm_nodes:
+            key = frozenset((u, v))
+            edge_weights[key] = edge_weights.get(key, 0) + 1
+    for edge, w in edge_weights.items():
+        u, v = tuple(edge)
+        G_qm.add_edge(u, v, weight=w)
+
+    if G_qm.number_of_edges() == 0:
+        # No channels — each QM is its own community
+        return {
+            "communities": [{qm} for qm in qm_nodes],
+            "modularity": 0.0,
+            "community_map": {qm: i for i, qm in enumerate(sorted(qm_nodes))},
+        }
+
+    try:
+        # Louvain method — greedy modularity optimisation
+        communities = list(nx.community.louvain_communities(G_qm, weight="weight", seed=42))
+        modularity = nx.community.modularity(G_qm, communities, weight="weight")
+    except Exception:
+        # Fallback: connected components as communities
+        communities = [set(c) for c in nx.connected_components(G_qm)]
+        modularity = 0.0
+
+    community_map = {}
+    for idx, comm in enumerate(communities):
+        for qm in comm:
+            community_map[qm] = idx
+
+    return {
+        "communities": [sorted(c) for c in communities],
+        "modularity": round(modularity, 4),
+        "community_map": community_map,
+        "num_communities": len(communities),
+    }
+
+
+def compute_centrality(G: nx.DiGraph) -> dict:
+    """
+    Betweenness centrality on the QM channel graph.
+    Identifies single points of failure (SPOFs) — QMs through which
+    a disproportionate share of message routes must pass.
+
+    Also computes degree centrality for hub detection.
+
+    Returns:
+      - betweenness: {qm_id: score} — higher = more critical SPOF
+      - degree: {qm_id: score} — higher = more connections
+      - spof_qms: list of QMs with betweenness > 2× the mean (risk hotspots)
+      - hub_qms: list of QMs with degree > 2× the mean
+    """
+    qm_nodes = set(n for n, d in G.nodes(data=True) if d.get("type") == "qm")
+    if len(qm_nodes) < 2:
+        return {"betweenness": {}, "degree": {}, "spof_qms": [], "hub_qms": []}
+
+    # Build undirected QM graph for centrality
+    G_qm = nx.Graph()
+    G_qm.add_nodes_from(qm_nodes)
+    for u, v, d in G.edges(data=True):
+        if d.get("rel") == "channel" and u in qm_nodes and v in qm_nodes:
+            G_qm.add_edge(u, v)
+
+    if G_qm.number_of_edges() == 0:
+        return {
+            "betweenness": {qm: 0.0 for qm in qm_nodes},
+            "degree": {qm: 0.0 for qm in qm_nodes},
+            "spof_qms": [], "hub_qms": [],
+        }
+
+    # Betweenness: fraction of shortest paths passing through each QM
+    betweenness = nx.betweenness_centrality(G_qm, normalized=True)
+    # Degree: fraction of possible connections each QM has
+    degree = nx.degree_centrality(G_qm)
+
+    # Detect SPOFs and hubs (>2× mean)
+    bw_values = list(betweenness.values())
+    bw_mean = sum(bw_values) / len(bw_values) if bw_values else 0
+    spof_qms = sorted([qm for qm, bw in betweenness.items() if bw > 2 * bw_mean and bw > 0.05],
+                       key=lambda q: betweenness[q], reverse=True)
+
+    deg_values = list(degree.values())
+    deg_mean = sum(deg_values) / len(deg_values) if deg_values else 0
+    hub_qms = sorted([qm for qm, dg in degree.items() if dg > 2 * deg_mean and dg > 0.05],
+                      key=lambda q: degree[q], reverse=True)
+
+    return {
+        "betweenness": {k: round(v, 4) for k, v in betweenness.items()},
+        "degree": {k: round(v, 4) for k, v in degree.items()},
+        "spof_qms": spof_qms[:10],
+        "hub_qms": hub_qms[:10],
+        "betweenness_mean": round(bw_mean, 4),
+        "degree_mean": round(deg_mean, 4),
+    }
+
+
+def compute_graph_entropy(G: nx.DiGraph) -> dict:
+    """
+    Shannon entropy of the QM degree distribution.
+    Measures how "uniform" or "skewed" the topology is:
+      - High entropy = even distribution of channels (healthy)
+      - Low entropy = few QMs dominate connections (fragile hub-and-spoke)
+
+    Also computes graph density and clustering coefficient.
+
+    Returns:
+      - degree_entropy: float (bits)
+      - density: float (0-1, actual edges / possible edges)
+      - avg_clustering: float (0-1, how cliquey the QMs are)
+      - degree_distribution: {degree: count}
+    """
+    import math
+
+    qm_nodes = set(n for n, d in G.nodes(data=True) if d.get("type") == "qm")
+    if len(qm_nodes) < 2:
+        return {"degree_entropy": 0.0, "density": 0.0, "avg_clustering": 0.0, "degree_distribution": {}}
+
+    G_qm = nx.Graph()
+    G_qm.add_nodes_from(qm_nodes)
+    for u, v, d in G.edges(data=True):
+        if d.get("rel") == "channel" and u in qm_nodes and v in qm_nodes:
+            G_qm.add_edge(u, v)
+
+    # Degree distribution
+    degrees = [G_qm.degree(n) for n in G_qm.nodes()]
+    total = sum(degrees) or 1
+    degree_dist = {}
+    for d in degrees:
+        degree_dist[d] = degree_dist.get(d, 0) + 1
+
+    # Shannon entropy: H = -Σ p(d) * log2(p(d))
+    entropy = 0.0
+    for count in degree_dist.values():
+        p = count / len(degrees) if degrees else 0
+        if p > 0:
+            entropy -= p * math.log2(p)
+
+    # Graph density: actual / possible edges
+    n = len(qm_nodes)
+    max_edges = n * (n - 1) / 2
+    density = G_qm.number_of_edges() / max_edges if max_edges > 0 else 0.0
+
+    # Average clustering coefficient (transitivity)
+    try:
+        avg_clustering = nx.average_clustering(G_qm)
+    except Exception:
+        avg_clustering = 0.0
+
+    return {
+        "degree_entropy": round(entropy, 3),
+        "density": round(density, 4),
+        "avg_clustering": round(avg_clustering, 4),
+        "degree_distribution": degree_dist,
+        "max_entropy": round(math.log2(n) if n > 1 else 0, 3),  # theoretical max for uniform dist
+        "entropy_ratio": round(entropy / math.log2(n), 3) if n > 1 and math.log2(n) > 0 else 0.0,
+    }
+
+
+def compare_topologies(G_source: nx.DiGraph, G_target: nx.DiGraph) -> dict:
+    """
+    Quantitative comparison of source and target topologies.
+    Produces a structured diff with mathematical metrics suitable for
+    the complexity-scores.csv deliverable.
+    """
+    def _stats(G):
+        qm_n = [n for n, d in G.nodes(data=True) if d.get("type") == "qm"]
+        app_n = [n for n, d in G.nodes(data=True) if d.get("type") == "app"]
+        ch_e = [(u, v) for u, v, d in G.edges(data=True) if d.get("rel") == "channel"]
+
+        G_qm = nx.Graph()
+        G_qm.add_nodes_from(qm_n)
+        for u, v in ch_e:
+            G_qm.add_edge(u, v)
+
+        components = nx.number_connected_components(G_qm) if qm_n else 0
+        degrees = [G_qm.degree(n) for n in G_qm.nodes()] if qm_n else []
+        avg_degree = sum(degrees) / len(degrees) if degrees else 0
+        max_degree = max(degrees) if degrees else 0
+
+        n = len(qm_n)
+        max_edges = n * (n - 1) / 2
+        density = G_qm.number_of_edges() / max_edges if max_edges > 0 else 0
+
+        return {
+            "qm_count": len(qm_n),
+            "app_count": len(app_n),
+            "channel_count": len(ch_e),
+            "components": components,
+            "avg_degree": round(avg_degree, 2),
+            "max_degree": max_degree,
+            "density": round(density, 4),
+        }
+
+    src = _stats(G_source)
+    tgt = _stats(G_target)
+
+    def _pct(before, after):
+        if before == 0:
+            return 0.0
+        return round(((before - after) / before) * 100, 1)
+
+    return {
+        "source": src,
+        "target": tgt,
+        "reductions": {
+            "qm_count": _pct(src["qm_count"], tgt["qm_count"]),
+            "channel_count": _pct(src["channel_count"], tgt["channel_count"]),
+            "avg_degree": _pct(src["avg_degree"], tgt["avg_degree"]),
+            "max_degree": _pct(src["max_degree"], tgt["max_degree"]),
+            "density": _pct(src["density"], tgt["density"]),
+        },
+    }
+
+
 def graph_to_dict(G: nx.DiGraph) -> dict:
     """Serialise graph to JSON-friendly dict for API responses."""
     return {

@@ -26,7 +26,11 @@ from typing import Any
 from pathlib import Path
 
 from backend.tools.csv_ingest import load_and_clean
-from backend.graph.mq_graph import build_graph, detect_violations, compute_complexity, graph_to_dict, analyse_subgraphs
+from backend.graph.mq_graph import (
+    build_graph, detect_violations, compute_complexity, graph_to_dict,
+    analyse_subgraphs, detect_communities, compute_centrality,
+    compute_graph_entropy, compare_topologies,
+)
 from backend.llm.llm_client import call_llm, validate_architect_response
 from backend.llm.prompts import ARCHITECT_SYSTEM_PROMPT, build_architect_prompt
 
@@ -221,6 +225,21 @@ def researcher_agent(state: dict) -> dict:
     )
     messages.append({"agent": "RESEARCHER", "msg": sub_msg})
 
+    # ── Advanced graph analytics on as-is topology ────────────────────────
+    as_is_communities = detect_communities(as_is_graph)
+    as_is_centrality = compute_centrality(as_is_graph)
+    as_is_entropy = compute_graph_entropy(as_is_graph)
+
+    analytics_msg = (
+        f"Graph analytics: "
+        f"Louvain detected {as_is_communities.get('num_communities', 0)} communities "
+        f"(modularity={as_is_communities.get('modularity', 0)}). "
+        f"{'SPOFs: ' + ', '.join(as_is_centrality.get('spof_qms', [])[:3]) + '. ' if as_is_centrality.get('spof_qms') else 'No SPOFs detected. '}"
+        f"Degree entropy: {as_is_entropy.get('degree_entropy', 0)} bits "
+        f"(density={as_is_entropy.get('density', 0)})."
+    )
+    messages.append({"agent": "RESEARCHER", "msg": analytics_msg})
+
     # Merge violations into existing quality report
     quality_report = state.get("data_quality_report", {})
     quality_report["topology_violations"] = violations
@@ -228,6 +247,9 @@ def researcher_agent(state: dict) -> dict:
     return {
         "as_is_graph": as_is_graph,
         "as_is_subgraphs": as_is_subgraphs,
+        "as_is_communities": as_is_communities,
+        "as_is_centrality": as_is_centrality,
+        "as_is_entropy": as_is_entropy,
         "data_quality_report": quality_report,
         "messages": messages,
     }
@@ -1058,23 +1080,53 @@ def optimizer_agent(state: dict) -> dict:
     # ── Target subgraph analysis ──────────────────────────────────────────
     target_subgraphs = analyse_subgraphs(G)
 
+    # ── Advanced graph analytics ──────────────────────────────────────────
+    # Louvain community detection — natural QM clusters
+    target_communities = detect_communities(G)
+    # Betweenness centrality — SPOF detection
+    target_centrality = compute_centrality(G)
+    # Shannon entropy — degree distribution health
+    target_entropy = compute_graph_entropy(G)
+
     phase1_names = [name for _, _, name in phase1_removed if name]
     phase2_names = [name for _, _, name in phase2_removed if name]
 
     target_isolated = sum(1 for s in target_subgraphs if s["is_isolated"])
+
+    # Build analytics insight string
+    analytics_insight = ""
+    if target_communities.get("num_communities", 0) > 1:
+        analytics_insight += (
+            f"Louvain community detection: {target_communities['num_communities']} natural clusters "
+            f"(modularity={target_communities['modularity']}). "
+        )
+    if target_centrality.get("spof_qms"):
+        analytics_insight += (
+            f"SPOF analysis: {len(target_centrality['spof_qms'])} high-betweenness QM(s) "
+            f"({', '.join(target_centrality['spof_qms'][:3])}). "
+        )
+    else:
+        analytics_insight += "SPOF analysis: no single points of failure detected. "
+    analytics_insight += (
+        f"Topology entropy: {target_entropy['degree_entropy']} bits "
+        f"({target_entropy['entropy_ratio']:.0%} of theoretical max — "
+        f"{'healthy distribution' if target_entropy['entropy_ratio'] > 0.6 else 'skewed — some QMs over-connected'}). "
+    )
+
     msg = (
         f"Two-phase optimisation complete. "
         f"Channels: {initial_channels} → {after_phase1} (Phase 1: reachability) "
         f"→ {final_channels} (Phase 2: MST). "
         f"Total removed: {initial_channels - final_channels}. "
         f"Phase 1 (reachability pruning): removed {len(phase1_removed)} dead channel(s)"
-        f"{' (' + ', '.join(phase1_names) + ')' if phase1_names else ''}. "
+        f"{' (' + ', '.join(phase1_names[:5]) + ')' if phase1_names else ''}. "
         f"Phase 2 (graph-theoretic): "
         f"weighted MST {'applied' if mst_applied else 'skipped (graph disconnected or trivial)'}, "
         f"removed {len(phase2_removed)} redundant channel(s)"
-        f"{' (' + ', '.join(phase2_names) + ')' if phase2_names else ''}. "
+        f"{' (' + ', '.join(phase2_names[:5]) + ')' if phase2_names else ''}. "
         f"{kl_insight}"
         f"{cycle_info}"
+        f"{analytics_insight}"
         f"Target subgraphs: {len(target_subgraphs)} component(s), {target_isolated} isolated. "
         f"Target complexity score: {target_metrics['total_score']}/100."
     )
@@ -1084,6 +1136,9 @@ def optimizer_agent(state: dict) -> dict:
         "optimised_graph": G,
         "target_metrics": target_metrics,
         "target_subgraphs": target_subgraphs,
+        "target_communities": target_communities,
+        "target_centrality": target_centrality,
+        "target_entropy": target_entropy,
         "messages": messages,
     }
 

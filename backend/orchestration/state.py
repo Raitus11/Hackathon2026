@@ -37,6 +37,9 @@ class MQTitanState(TypedDict):
     # ── Researcher output ──────────────────────────────
     as_is_graph: Optional[Any]         # nx.DiGraph
     as_is_subgraphs: Optional[list]    # list of component dicts from analyse_subgraphs()
+    as_is_communities: Optional[dict]  # Louvain community detection results
+    as_is_centrality: Optional[dict]   # betweenness + degree centrality
+    as_is_entropy: Optional[dict]      # Shannon entropy + density + clustering
 
     # ── Analyst output ─────────────────────────────────
     as_is_metrics: Optional[ComplexityMetrics]
@@ -52,6 +55,9 @@ class MQTitanState(TypedDict):
     optimised_graph: Optional[Any]     # nx.DiGraph
     target_metrics: Optional[ComplexityMetrics]
     target_subgraphs: Optional[list]   # list of component dicts from analyse_subgraphs()
+    target_communities: Optional[dict] # Louvain community detection results
+    target_centrality: Optional[dict]  # betweenness + degree centrality
+    target_entropy: Optional[dict]     # Shannon entropy + density + clustering
 
     # ── Tester output ──────────────────────────────────
     validation_passed: bool
