@@ -26,7 +26,7 @@ from typing import Any
 from pathlib import Path
 
 from backend.tools.csv_ingest import load_and_clean
-from backend.graph.mq_graph import build_graph, detect_violations, compute_complexity, graph_to_dict
+from backend.graph.mq_graph import build_graph, detect_violations, compute_complexity, graph_to_dict, analyse_subgraphs
 from backend.llm.llm_client import call_llm, validate_architect_response
 from backend.llm.prompts import ARCHITECT_SYSTEM_PROMPT, build_architect_prompt
 
@@ -208,12 +208,26 @@ def researcher_agent(state: dict) -> dict:
     )
     messages.append({"agent": "RESEARCHER", "msg": msg})
 
+    # ── Subgraph analysis (disconnected component decomposition) ──────────
+    as_is_subgraphs = analyse_subgraphs(as_is_graph)
+    isolated_count = sum(1 for s in as_is_subgraphs if s["is_isolated"])
+    sub_msg = (
+        f"Subgraph analysis: {len(as_is_subgraphs)} connected component(s) detected. "
+        f"{isolated_count} isolated QM(s) (single QM, no channels). "
+        f"Largest component: {as_is_subgraphs[0]['qm_count']} QMs, "
+        f"{as_is_subgraphs[0]['app_count']} apps."
+        if as_is_subgraphs else
+        "Subgraph analysis: no QMs found."
+    )
+    messages.append({"agent": "RESEARCHER", "msg": sub_msg})
+
     # Merge violations into existing quality report
     quality_report = state.get("data_quality_report", {})
     quality_report["topology_violations"] = violations
 
     return {
         "as_is_graph": as_is_graph,
+        "as_is_subgraphs": as_is_subgraphs,
         "data_quality_report": quality_report,
         "messages": messages,
     }
@@ -293,6 +307,11 @@ def architect_agent(state: dict) -> dict:
             method = "rules_fallback"
             logger.info(f"ARCHITECT: Fell back to rule-based method — {len(rule_adrs)} ADRs")
 
+        # ── SAFETY NET: enforce 1-QM-per-app on whatever graph was built ────
+        dupes_removed = _enforce_single_qm(target_graph, raw_data)
+        if dupes_removed:
+            logger.warning(f"ARCHITECT: _enforce_single_qm removed {dupes_removed} duplicate connects_to edges")
+
         as_is = state.get("as_is_graph")
         original_qm_count = sum(1 for _, d in as_is.nodes(data=True) if d.get("type") == "qm") if as_is else 0
         target_qm_count = sum(1 for _, d in target_graph.nodes(data=True) if d.get("type") == "qm")
@@ -317,6 +336,43 @@ def architect_agent(state: dict) -> dict:
         logger.exception(f"ARCHITECT: Crashed — {e}")
         messages.append({"agent": "ARCHITECT", "msg": f"CRASHED: {e}"})
         return {"error": f"ARCHITECT crashed: {e}", "messages": messages}
+
+
+def _enforce_single_qm(G: nx.DiGraph, raw_data: dict) -> int:
+    """
+    Belt-and-suspenders: scan every app node in the target graph.
+    If any app has >1 connects_to edge, keep only the best one
+    (most connections in raw data) and remove the rest.
+    Returns the number of duplicate edges removed.
+    """
+    removed = 0
+    app_nodes = [n for n, d in G.nodes(data=True) if d.get("type") == "app"]
+
+    # Pre-compute connection counts per (app, QM) from raw data
+    app_qm_counts = {}
+    for row in raw_data.get("applications", []):
+        key = (row["app_id"], row["qm_id"])
+        app_qm_counts[key] = app_qm_counts.get(key, 0) + 1
+
+    for app in app_nodes:
+        connected = [(v, d) for _, v, d in G.out_edges(app, data=True) if d.get("rel") == "connects_to"]
+        if len(connected) <= 1:
+            continue
+
+        # Pick the best QM by raw data connection count
+        best_qm = max(
+            (qm for qm, _ in connected),
+            key=lambda qm: app_qm_counts.get((app, qm), 0),
+        )
+
+        # Remove all connects_to edges except the best
+        for qm, _ in connected:
+            if qm != best_qm:
+                G.remove_edge(app, qm)
+                removed += 1
+                logger.warning(f"_enforce_single_qm: removed duplicate {app}→{qm} (keeping {best_qm})")
+
+    return removed
 
 
 def _architect_llm(state: dict) -> dict | None:
@@ -395,7 +451,10 @@ def _build_target_from_llm(llm_result: dict, state: dict) -> tuple:
 
         if app_id not in G_target.nodes:
             G_target.add_node(app_id, type="app", name=app_name_map.get(app_id, app_id))
-        G_target.add_edge(app_id, assigned_qm, rel="connects_to")
+        # Only add if this app doesn't already have a connects_to edge
+        existing_qms = [v for _, v, d in G_target.out_edges(app_id, data=True) if d.get("rel") == "connects_to"]
+        if not existing_qms:
+            G_target.add_edge(app_id, assigned_qm, rel="connects_to")
 
     # Ensure ALL apps from source data are assigned (LLM might miss some)
     assigned_apps = set(
@@ -411,7 +470,10 @@ def _build_target_from_llm(llm_result: dict, state: dict) -> tuple:
             qm = original_qms[0] if original_qms else sorted(qms_to_keep)[0]
             if app_id not in G_target.nodes:
                 G_target.add_node(app_id, type="app", name=app_name_map.get(app_id, app_id))
-            G_target.add_edge(app_id, qm, rel="connects_to")
+            # Only add if no connects_to edge exists yet
+            existing_qms = [v for _, v, d in G_target.out_edges(app_id, data=True) if d.get("rel") == "connects_to"]
+            if not existing_qms:
+                G_target.add_edge(app_id, qm, rel="connects_to")
 
     # Add channels from LLM required_connections
     for conn in llm_result.get("required_connections", []):
@@ -528,28 +590,65 @@ def _build_target_rules(state: dict) -> nx.DiGraph:
     raw_data = state["raw_data"]
     G_target = nx.DiGraph()
 
-    # Build canonical app→QM ownership map (1 QM per app, enforced)
-    app_qm_ownership = {}
+    # ── Build canonical app→QM ownership map (1 QM per app, enforced) ─────
+    # Strategy: pick the QM where the app has the MOST queue connections.
+    # Tie-breakers: 1) same region preference  2) fewer total apps on QM
+    #
+    # Step 1: count connections per (app, QM)
+    app_qm_counts = {}   # {app_id: {qm_id: connection_count}}
+    app_qm_regions = {}  # {qm_id: region}
     for row in raw_data["applications"]:
         app_id = row["app_id"]
         qm_id = row["qm_id"]
-        if app_id not in app_qm_ownership:
-            app_qm_ownership[app_id] = qm_id
+        if app_id not in app_qm_counts:
+            app_qm_counts[app_id] = {}
+        app_qm_counts[app_id][qm_id] = app_qm_counts[app_id].get(qm_id, 0) + 1
+
+    # Build QM metadata lookup
+    qm_map = {row["qm_id"]: row for row in raw_data["queue_managers"]}
+    for qm_id, row in qm_map.items():
+        app_qm_regions[qm_id] = row.get("region", "UNKNOWN")
+
+    # Step 2: count total apps per QM (for load-balance tie-breaking)
+    qm_total_apps = {}
+    for app_id, qm_counts in app_qm_counts.items():
+        for qm_id in qm_counts:
+            qm_total_apps[qm_id] = qm_total_apps.get(qm_id, 0) + 1
+
+    # Step 3: for each app, pick best QM
+    app_qm_ownership = {}
+    for app_id, qm_counts in app_qm_counts.items():
+        if len(qm_counts) == 1:
+            # Only one QM — simple case
+            app_qm_ownership[app_id] = next(iter(qm_counts))
+        else:
+            # Multiple QMs — pick by: most connections → fewest total apps → alphabetical
+            best_qm = max(
+                qm_counts.keys(),
+                key=lambda qm: (
+                    qm_counts[qm],                          # most connections first
+                    -qm_total_apps.get(qm, 0),              # fewer total apps (negate for max)
+                    qm,                                       # alphabetical stability
+                ),
+            )
+            app_qm_ownership[app_id] = best_qm
 
     needed_qms = set(app_qm_ownership.values())
 
     # Add QM nodes
-    qm_map = {row["qm_id"]: row for row in raw_data["queue_managers"]}
     for qm_id in needed_qms:
         if qm_id in qm_map:
             row = qm_map[qm_id]
             G_target.add_node(qm_id, type="qm", name=row.get("qm_name", qm_id), region=row.get("region", ""))
 
     # Add app nodes with single QM ownership
+    app_name_map = {}
+    for row in raw_data["applications"]:
+        if row["app_id"] not in app_name_map:
+            app_name_map[row["app_id"]] = row.get("app_name", row["app_id"])
+
     for app_id, qm_id in app_qm_ownership.items():
-        app_rows = [r for r in raw_data["applications"] if r["app_id"] == app_id]
-        app_name = app_rows[0].get("app_name", app_id) if app_rows else app_id
-        G_target.add_node(app_id, type="app", name=app_name)
+        G_target.add_node(app_id, type="app", name=app_name_map.get(app_id, app_id))
         if qm_id in G_target.nodes:
             G_target.add_edge(app_id, qm_id, rel="connects_to")
 
@@ -687,6 +786,12 @@ def optimizer_agent(state: dict) -> dict:
 
     G = state["target_graph"].copy()
 
+    # Belt-and-suspenders: enforce 1-QM-per-app on entry
+    raw_data = state.get("raw_data", {})
+    dupes = _enforce_single_qm(G, raw_data)
+    if dupes:
+        logger.warning(f"OPTIMIZER: entry check removed {dupes} duplicate connects_to edges")
+
     qm_nodes = [n for n, d in G.nodes(data=True) if d.get("type") == "qm"]
     app_nodes = [n for n, d in G.nodes(data=True) if d.get("type") == "app"]
     channel_edges = [(u, v, d) for u, v, d in G.edges(data=True) if d.get("rel") == "channel"]
@@ -785,16 +890,18 @@ def optimizer_agent(state: dict) -> dict:
                         continue
 
                     # Safety: verify all producer→consumer paths survive
+                    # Use undirected projection since MQ sender/receiver pairs
+                    # create bidirectional logical connectivity
                     G_test = G.copy()
                     G_test.remove_edge(src, dst)
                     reachability_ok = True
+                    qm_sub = G_test.subgraph(qm_nodes).to_undirected()
                     for p_qm in producer_qms:
                         for c_qm in consumer_qms:
                             if p_qm == c_qm:
                                 continue
-                            if p_qm not in G_test.nodes or c_qm not in G_test.nodes:
+                            if p_qm not in qm_sub.nodes or c_qm not in qm_sub.nodes:
                                 continue
-                            qm_sub = G_test.subgraph(qm_nodes)
                             if not nx.has_path(qm_sub, p_qm, c_qm):
                                 reachability_ok = False
                                 break
@@ -867,9 +974,13 @@ def optimizer_agent(state: dict) -> dict:
     as_is_baselines = state.get("as_is_metrics", {}).get("baselines")
     target_metrics = compute_complexity(G, baseline_overrides=as_is_baselines)
 
+    # ── Target subgraph analysis ──────────────────────────────────────────
+    target_subgraphs = analyse_subgraphs(G)
+
     phase1_names = [name for _, _, name in phase1_removed if name]
     phase2_names = [name for _, _, name in phase2_removed if name]
 
+    target_isolated = sum(1 for s in target_subgraphs if s["is_isolated"])
     msg = (
         f"Two-phase optimisation complete. "
         f"Channels: {initial_channels} → {after_phase1} (Phase 1: reachability) "
@@ -883,6 +994,7 @@ def optimizer_agent(state: dict) -> dict:
         f"{' (' + ', '.join(phase2_names) + ')' if phase2_names else ''}. "
         f"{kl_insight}"
         f"{cycle_info}"
+        f"Target subgraphs: {len(target_subgraphs)} component(s), {target_isolated} isolated. "
         f"Target complexity score: {target_metrics['total_score']}/100."
     )
     messages.append({"agent": "OPTIMIZER", "msg": msg})
@@ -890,6 +1002,7 @@ def optimizer_agent(state: dict) -> dict:
     return {
         "optimised_graph": G,
         "target_metrics": target_metrics,
+        "target_subgraphs": target_subgraphs,
         "messages": messages,
     }
 

@@ -36,6 +36,7 @@ class MQTitanState(TypedDict):
 
     # ── Researcher output ──────────────────────────────
     as_is_graph: Optional[Any]         # nx.DiGraph
+    as_is_subgraphs: Optional[list]    # list of component dicts from analyse_subgraphs()
 
     # ── Analyst output ─────────────────────────────────
     as_is_metrics: Optional[ComplexityMetrics]
@@ -50,6 +51,7 @@ class MQTitanState(TypedDict):
     # ── Optimizer output ───────────────────────────────
     optimised_graph: Optional[Any]     # nx.DiGraph
     target_metrics: Optional[ComplexityMetrics]
+    target_subgraphs: Optional[list]   # list of component dicts from analyse_subgraphs()
 
     # ── Tester output ──────────────────────────────────
     validation_passed: bool

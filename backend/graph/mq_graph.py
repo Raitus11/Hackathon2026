@@ -150,15 +150,34 @@ def compute_complexity(G: nx.DiGraph, baseline_overrides: dict = None) -> dict:
     CI = float(np.mean(coupling_values)) if coupling_values else 0.0
 
     # RD: Routing Depth — max shortest path between any two QMs
+    # For disconnected graphs: max diameter across all components +
+    # fragmentation penalty (each extra component adds routing complexity
+    # because messages between components are impossible without bridging).
     qm_subgraph = G.subgraph(qm_nodes)
     try:
         G_undir = qm_subgraph.to_undirected()
-        if len(qm_nodes) > 1 and nx.is_connected(G_undir):
-            path_lengths = dict(nx.all_pairs_shortest_path_length(qm_subgraph))
+        if len(qm_nodes) <= 1:
+            RD = 0.0
+        elif nx.is_connected(G_undir):
+            path_lengths = dict(nx.all_pairs_shortest_path_length(G_undir))
             all_lengths = [l for d in path_lengths.values() for l in d.values() if l > 0]
             RD = float(max(all_lengths)) if all_lengths else 1.0
         else:
-            RD = float(nx.number_weakly_connected_components(qm_subgraph))
+            # Disconnected: max diameter across components + fragmentation penalty
+            components = list(nx.connected_components(G_undir))
+            max_diameter = 0.0
+            for comp in components:
+                if len(comp) < 2:
+                    continue
+                sub = G_undir.subgraph(comp)
+                try:
+                    diam = nx.diameter(sub)
+                    max_diameter = max(max_diameter, float(diam))
+                except Exception:
+                    max_diameter = max(max_diameter, 1.0)
+            # Penalty: each disconnected component beyond 1 adds 1.0
+            fragmentation_penalty = float(len(components) - 1)
+            RD = max_diameter + fragmentation_penalty
     except Exception:
         RD = 1.0
 
@@ -262,6 +281,99 @@ def compute_complexity(G: nx.DiGraph, baseline_overrides: dict = None) -> dict:
             "oo_weighted": round(0.10 * norm(OO, oo_worst), 1),
         },
     }
+
+
+def analyse_subgraphs(G: nx.DiGraph) -> list:
+    """
+    Decompose the topology into weakly connected subgraphs (components).
+    Returns a list of component dicts sorted by size (largest first).
+
+    Each component contains:
+      - component_id: int (1-based)
+      - qm_ids: list of queue manager IDs
+      - app_ids: list of application IDs connected to QMs in this component
+      - channel_count: number of inter-QM channels within this component
+      - queue_count: number of queues owned by QMs in this component
+      - is_isolated: True if single QM with no channels
+      - hub_qm: the QM with the highest degree (most connections)
+      - regions: unique regions represented
+    """
+    qm_nodes = set(n for n, d in G.nodes(data=True) if d.get("type") == "qm")
+    app_nodes = set(n for n, d in G.nodes(data=True) if d.get("type") == "app")
+
+    if not qm_nodes:
+        return []
+
+    # Build undirected QM-only graph for component detection
+    # Include channel edges only
+    G_qm = nx.Graph()
+    G_qm.add_nodes_from(qm_nodes)
+    for u, v, d in G.edges(data=True):
+        if d.get("rel") == "channel" and u in qm_nodes and v in qm_nodes:
+            G_qm.add_edge(u, v)
+
+    # Build app→QM and QM→apps maps
+    qm_apps = {qm: [] for qm in qm_nodes}
+    for app in app_nodes:
+        for _, qm, d in G.out_edges(app, data=True):
+            if d.get("rel") == "connects_to" and qm in qm_nodes:
+                qm_apps[qm].append(app)
+
+    # Build QM→queues map
+    qm_queues = {qm: [] for qm in qm_nodes}
+    for qm in qm_nodes:
+        for _, q, d in G.out_edges(qm, data=True):
+            if d.get("rel") == "owns":
+                qm_queues[qm].append(q)
+
+    components = list(nx.connected_components(G_qm))
+    # Sort largest first
+    components.sort(key=lambda c: len(c), reverse=True)
+
+    results = []
+    for idx, comp_qms in enumerate(components, 1):
+        comp_qms = sorted(comp_qms)
+        comp_apps = sorted(set(
+            app for qm in comp_qms for app in qm_apps.get(qm, [])
+        ))
+        comp_queues = sum(len(qm_queues.get(qm, [])) for qm in comp_qms)
+
+        # Count channels within this component
+        ch_count = 0
+        for u, v, d in G.edges(data=True):
+            if d.get("rel") == "channel" and u in comp_qms and v in comp_qms:
+                ch_count += 1
+
+        # Find hub (QM with most channel connections)
+        hub_qm = None
+        max_degree = -1
+        for qm in comp_qms:
+            deg = G_qm.degree(qm) if qm in G_qm else 0
+            if deg > max_degree:
+                max_degree = deg
+                hub_qm = qm
+
+        # Collect regions
+        regions = sorted(set(
+            G.nodes[qm].get("region", "UNKNOWN")
+            for qm in comp_qms if qm in G.nodes
+        ))
+
+        results.append({
+            "component_id": idx,
+            "qm_ids": comp_qms,
+            "qm_count": len(comp_qms),
+            "app_ids": comp_apps,
+            "app_count": len(comp_apps),
+            "channel_count": ch_count,
+            "queue_count": comp_queues,
+            "is_isolated": len(comp_qms) == 1 and ch_count == 0,
+            "hub_qm": hub_qm,
+            "hub_degree": max_degree,
+            "regions": regions,
+        })
+
+    return results
 
 
 def graph_to_dict(G: nx.DiGraph) -> dict:
