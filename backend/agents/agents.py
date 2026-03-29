@@ -742,24 +742,12 @@ def _build_target_rules(state: dict) -> nx.DiGraph:
                 if from_qm and to_qm and from_qm != to_qm:
                     required_channels.add((from_qm, to_qm))
 
-    # Also infer channels from REMOTE queue definitions in the as-is data
-    for q in raw_data.get("queues", []):
-        if q.get("queue_type") != "REMOTE":
-            continue
-        remote_qm_name = q.get("remote_qm")
-        source_qm_name = q.get("qm_id")
-        if not remote_qm_name or not source_qm_name:
-            continue
-        # Map old QM names to new QM names via apps
-        # Find apps on the source QM and their new QMs
-        source_apps = [a for a, qm in app_preferred_qm.items() if qm == source_qm_name]
-        target_apps = [a for a, qm in app_preferred_qm.items() if qm == remote_qm_name]
-        for sa in source_apps:
-            for ta in target_apps:
-                from_qm = app_qm_ownership.get(sa)
-                to_qm = app_qm_ownership.get(ta)
-                if from_qm and to_qm and from_qm != to_qm:
-                    required_channels.add((from_qm, to_qm))
+    # NOTE: We intentionally do NOT infer channels from REMOTE queue
+    # definitions. The queue-level producer→consumer flow analysis above
+    # already captures every legitimate message flow. REMOTE queue inference
+    # would create channels between ALL apps on the old source QM and ALL
+    # apps on the old target QM — a full mesh that defeats the purpose of
+    # 1:1 simplification. Only actual queue-level data flows matter.
 
     # Add channel edges
     for from_qm, to_qm in required_channels:
