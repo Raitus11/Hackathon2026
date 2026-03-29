@@ -270,16 +270,41 @@ function TopologyGraph({ graphData, title, height = 360, badge }) {
     const nodes = graphData.nodes.map(d => ({ ...d }));
     const edges = graphData.edges.map(d => ({ ...d }));
 
+    // Scale forces to panel size so the graph fills the available space
+    const nodeCount = nodes.length;
+    const chargeStrength = nodeCount > 200 ? -120 : nodeCount > 80 ? -200 : -350;
+    const linkDist = nodeCount > 200 ? 20 : nodeCount > 80 ? 30 : 35;
+    const chDist = nodeCount > 200 ? 50 : nodeCount > 80 ? 70 : 100;
+
     const sim = d3.forceSimulation(nodes)
       .force("link", d3.forceLink(edges).id(d => d.id)
-        .distance(d => d.rel === "connects_to" ? 35 : 100)
+        .distance(d => d.rel === "connects_to" ? linkDist : chDist)
         .strength(d => d.rel === "connects_to" ? 1.5 : 0.3))
-      .force("charge", d3.forceManyBody().strength(-350))
+      .force("charge", d3.forceManyBody().strength(chargeStrength))
       .force("center", d3.forceCenter(w / 2, h / 2))
-      .force("collide", d3.forceCollide(35));
+      .force("collide", d3.forceCollide(nodeCount > 200 ? 15 : 25));
 
     const g = svg.append("g");
-    svg.call(d3.zoom().scaleExtent([0.2, 4]).on("zoom", e => g.attr("transform", e.transform)));
+    const zoom = d3.zoom().scaleExtent([0.1, 5]).on("zoom", e => g.attr("transform", e.transform));
+    svg.call(zoom);
+
+    // Auto zoom-to-fit after simulation settles
+    sim.on("end", () => {
+      const allX = nodes.map(n => n.x).filter(v => isFinite(v));
+      const allY = nodes.map(n => n.y).filter(v => isFinite(v));
+      if (!allX.length) return;
+      const xMin = Math.min(...allX), xMax = Math.max(...allX);
+      const yMin = Math.min(...allY), yMax = Math.max(...allY);
+      const gw = xMax - xMin || 1, gh = yMax - yMin || 1;
+      const pad = 40;
+      const scale = Math.min((w - pad * 2) / gw, (h - pad * 2) / gh, 2);
+      const tx = (w - gw * scale) / 2 - xMin * scale;
+      const ty = (h - gh * scale) / 2 - yMin * scale;
+      svg.transition().duration(600).call(
+        zoom.transform,
+        d3.zoomIdentity.translate(tx, ty).scale(scale)
+      );
+    });
 
     // Glow filters
     const defs = svg.append("defs");
@@ -882,9 +907,9 @@ export default function App() {
           {tab === "topology" && result && !loading && (
             <div style={{ animation: "fadeUp 0.4s ease-out" }}>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 16 }}>
-                <TopologyGraph graphData={result.as_is_graph} title="As-Is Topology" height={620}
+                <TopologyGraph graphData={result.as_is_graph} title="As-Is Topology" height={520}
                   badge={<Badge color={T.t3} style={{ fontSize: 9 }}>CURRENT</Badge>} />
-                <TopologyGraph graphData={result.target_graph} title="Target State" height={620}
+                <TopologyGraph graphData={result.target_graph} title="Target State" height={520}
                   badge={<Badge color={T.green} style={{ fontSize: 9 }}>OPTIMISED</Badge>} />
               </div>
 
@@ -1379,8 +1404,8 @@ function ReviewChatPanel({ result, architectMethod, reviewLoading, onApprove, on
 
       {/* TOPOLOGY — Always visible */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-        <TopologyGraph graphData={result.as_is_graph} title="As-Is Topology" height={480} />
-        <TopologyGraph graphData={result.target_graph} title="Proposed Target" height={480}
+        <TopologyGraph graphData={result.as_is_graph} title="As-Is Topology" height={360} />
+        <TopologyGraph graphData={result.target_graph} title="Proposed Target" height={360}
           badge={<Badge color={T.green} style={{ fontSize: 8 }}>NEW</Badge>} />
       </div>
 
