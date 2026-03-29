@@ -896,12 +896,13 @@ def optimizer_agent(state: dict) -> dict:
     # ══════════════════════════════════════════════════════════════════════
     # PHASE 1: REACHABILITY PRUNING
     # Remove channels where source has no producers OR target has no
-    # consumers. Dead channels are always safe to remove.
+    # consumers. With 1:1 mapping, a channel is only needed if the
+    # source QM hosts a producer app AND the target hosts a consumer app.
     # ══════════════════════════════════════════════════════════════════════
     required_channels = set()
     for from_qm, to_qm, d in channel_edges:
-        has_producer = from_qm in producer_qms or from_qm in qms_with_apps
-        has_consumer = to_qm in consumer_qms or to_qm in qms_with_apps
+        has_producer = from_qm in producer_qms
+        has_consumer = to_qm in consumer_qms
         if has_producer and has_consumer:
             required_channels.add((from_qm, to_qm))
 

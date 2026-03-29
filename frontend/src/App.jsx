@@ -882,9 +882,9 @@ export default function App() {
           {tab === "topology" && result && !loading && (
             <div style={{ animation: "fadeUp 0.4s ease-out" }}>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 16 }}>
-                <TopologyGraph graphData={result.as_is_graph} title="As-Is Topology" height={380}
+                <TopologyGraph graphData={result.as_is_graph} title="As-Is Topology" height={620}
                   badge={<Badge color={T.t3} style={{ fontSize: 9 }}>CURRENT</Badge>} />
-                <TopologyGraph graphData={result.target_graph} title="Target State" height={380}
+                <TopologyGraph graphData={result.target_graph} title="Target State" height={620}
                   badge={<Badge color={T.green} style={{ fontSize: 9 }}>OPTIMISED</Badge>} />
               </div>
 
@@ -1379,8 +1379,8 @@ function ReviewChatPanel({ result, architectMethod, reviewLoading, onApprove, on
 
       {/* TOPOLOGY — Always visible */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-        <TopologyGraph graphData={result.as_is_graph} title="As-Is Topology" height={220} />
-        <TopologyGraph graphData={result.target_graph} title="Proposed Target" height={220}
+        <TopologyGraph graphData={result.as_is_graph} title="As-Is Topology" height={480} />
+        <TopologyGraph graphData={result.target_graph} title="Proposed Target" height={480}
           badge={<Badge color={T.green} style={{ fontSize: 8 }}>NEW</Badge>} />
       </div>
 
