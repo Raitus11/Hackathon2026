@@ -783,6 +783,44 @@ def _build_target_rules(state: dict) -> nx.DiGraph:
                 xmit_queue=f"{to_qm}.XMITQ",
             )
 
+    # ── Step 5: Build full MQ object model ────────────────────────────────
+    # Reference architecture per Objective.md §5:
+    #   App_A → QM_A → REMOTE_Q → XMITQ → [Sender Ch] → QM_B → LOCAL_Q → App_B
+    #
+    # For each app: create a LOCAL queue on its QM (consumer reads from this)
+    # For each channel (from_qm → to_qm): create XMITQ on from_qm, REMOTE_Q on from_qm
+
+    # 5a. LOCAL queues — one per app on its dedicated QM
+    for app_id, qm_id in app_qm_ownership.items():
+        lq_id = f"LQ.{app_id}"
+        G_target.add_node(lq_id, type="queue", name=f"LOCAL.{app_id}.IN",
+                          queue_type="LOCAL", usage="NORMAL")
+        G_target.add_edge(qm_id, lq_id, rel="owns")
+
+    # 5b. For each channel: XMITQ on source QM + REMOTE queue definitions
+    seen_xmitq = set()
+    for from_qm, to_qm in required_channels:
+        if from_qm not in G_target.nodes or to_qm not in G_target.nodes:
+            continue
+
+        # XMITQ — one per target QM on the source QM
+        xmitq_id = f"XMITQ.{from_qm}.{to_qm}"
+        if xmitq_id not in seen_xmitq:
+            seen_xmitq.add(xmitq_id)
+            G_target.add_node(xmitq_id, type="queue", name=f"{to_qm}.XMITQ",
+                              queue_type="LOCAL", usage="XMITQ")
+            G_target.add_edge(from_qm, xmitq_id, rel="owns")
+
+        # REMOTE queue — one per consumer app reachable via this channel
+        consumer_app = [a for a, q in app_qm_ownership.items() if q == to_qm]
+        for cons_app in consumer_app:
+            rq_id = f"RQ.{from_qm}.{cons_app}"
+            G_target.add_node(rq_id, type="queue", name=f"REMOTE.{cons_app}.VIA.{to_qm}",
+                              queue_type="REMOTE", usage="NORMAL",
+                              remote_qm=to_qm, remote_queue=f"LOCAL.{cons_app}.IN",
+                              xmit_queue=f"{to_qm}.XMITQ")
+            G_target.add_edge(from_qm, rq_id, rel="owns")
+
     return G_target
 
 

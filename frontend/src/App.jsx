@@ -255,7 +255,7 @@ const NODE_COLORS = {
   queue: T.amber,
 };
 
-function TopologyGraph({ graphData, title, height = 360, badge }) {
+function TopologyGraph({ graphData, title, height = 360, badge, showQueues = false }) {
   const svgRef = useRef(null);
   const containerRef = useRef(null);
 
@@ -267,22 +267,34 @@ function TopologyGraph({ graphData, title, height = 360, badge }) {
     const w = containerRef.current?.clientWidth || 600;
     const h = height;
 
-    const nodes = graphData.nodes.map(d => ({ ...d }));
-    const edges = graphData.edges.map(d => ({ ...d }));
+    // Filter nodes based on showQueues flag
+    const nodes = graphData.nodes
+      .filter(d => showQueues ? true : (d.type === "qm" || d.type === "app"))
+      .map(d => ({ ...d }));
+    const nodeIds = new Set(nodes.map(n => n.id));
+    const edges = graphData.edges
+      .filter(d => {
+        if (!nodeIds.has(d.source) && !nodeIds.has(d.source?.id)) return false;
+        if (!nodeIds.has(d.target) && !nodeIds.has(d.target?.id)) return false;
+        if (showQueues) return true;
+        return d.rel === "channel" || d.rel === "connects_to";
+      })
+      .map(d => ({ ...d }));
 
     // Scale forces to panel size so the graph fills the available space
     const nodeCount = nodes.length;
-    const chargeStrength = nodeCount > 200 ? -120 : nodeCount > 80 ? -200 : -350;
-    const linkDist = nodeCount > 200 ? 20 : nodeCount > 80 ? 30 : 35;
-    const chDist = nodeCount > 200 ? 50 : nodeCount > 80 ? 70 : 100;
+    const chargeStrength = nodeCount > 400 ? -40 : nodeCount > 200 ? -80 : nodeCount > 80 ? -200 : -350;
+    const linkDist = nodeCount > 400 ? 10 : nodeCount > 200 ? 15 : nodeCount > 80 ? 30 : 35;
+    const chDist = nodeCount > 400 ? 25 : nodeCount > 200 ? 35 : nodeCount > 80 ? 70 : 100;
+    const ownsDist = 18;  // queues sit close to their QM
 
     const sim = d3.forceSimulation(nodes)
       .force("link", d3.forceLink(edges).id(d => d.id)
-        .distance(d => d.rel === "connects_to" ? linkDist : chDist)
-        .strength(d => d.rel === "connects_to" ? 1.5 : 0.3))
+        .distance(d => d.rel === "connects_to" ? linkDist : d.rel === "owns" ? ownsDist : chDist)
+        .strength(d => d.rel === "connects_to" ? 1.5 : d.rel === "owns" ? 2.0 : 0.3))
       .force("charge", d3.forceManyBody().strength(chargeStrength))
       .force("center", d3.forceCenter(w / 2, h / 2))
-      .force("collide", d3.forceCollide(nodeCount > 200 ? 15 : 25));
+      .force("collide", d3.forceCollide(nodeCount > 400 ? 6 : nodeCount > 200 ? 10 : 25));
 
     const g = svg.append("g");
     const zoom = d3.zoom().scaleExtent([0.1, 5]).on("zoom", e => g.attr("transform", e.transform));
@@ -317,7 +329,7 @@ function TopologyGraph({ graphData, title, height = 360, badge }) {
     });
 
     // Arrow markers
-    ["channel", "connects_to"].forEach(rel => {
+    ["channel", "connects_to", "owns"].forEach(rel => {
       defs.append("marker")
         .attr("id", `arrow-${rel}-${title}`)
         .attr("viewBox", "0 0 10 10")
@@ -326,22 +338,22 @@ function TopologyGraph({ graphData, title, height = 360, badge }) {
         .attr("orient", "auto")
         .append("path")
         .attr("d", "M1 2L7 5L1 8")
-        .attr("fill", rel === "channel" ? T.cyan : T.green)
+        .attr("fill", rel === "channel" ? T.cyan : rel === "owns" ? T.amber : T.green)
         .attr("opacity", 0.6);
     });
 
     // Edges
     g.selectAll("line.edge")
-      .data(edges.filter(e => e.rel === "channel" || e.rel === "connects_to"))
+      .data(edges.filter(e => e.rel === "channel" || e.rel === "connects_to" || e.rel === "owns"))
       .join("line").attr("class", "edge")
-      .attr("stroke", d => d.rel === "channel" ? `${T.cyan}50` : `${T.green}60`)
-      .attr("stroke-width", d => d.rel === "channel" ? 1.5 : 0.9)
-      .attr("stroke-dasharray", d => d.rel === "connects_to" ? "3 3" : null)
-      .attr("marker-end", d => `url(#arrow-${d.rel}-${title})`);
+      .attr("stroke", d => d.rel === "channel" ? `${T.cyan}50` : d.rel === "owns" ? `${T.amber}30` : `${T.green}60`)
+      .attr("stroke-width", d => d.rel === "channel" ? 1.5 : d.rel === "owns" ? 0.6 : 0.9)
+      .attr("stroke-dasharray", d => d.rel === "connects_to" ? "3 3" : d.rel === "owns" ? "2 2" : null)
+      .attr("marker-end", d => d.rel === "owns" ? null : `url(#arrow-${d.rel}-${title})`);
 
-    // Nodes
+    // Nodes — render all types present in filtered data
     const node = g.selectAll("g.node")
-      .data(nodes.filter(n => n.type === "qm" || n.type === "app"))
+      .data(nodes)
       .join("g").attr("class", "node")
       .style("cursor", "grab")
       .call(d3.drag()
@@ -350,34 +362,43 @@ function TopologyGraph({ graphData, title, height = 360, badge }) {
         .on("end", (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; })
       );
 
+    const nodeRadius = d => d.type === "qm" ? 18 : d.type === "app" ? 12 : 7;
+
     // Glow circle (behind)
     node.append("circle")
-      .attr("r", d => d.type === "qm" ? 22 : 15)
-      .attr("fill", d => `${NODE_COLORS[d.type]}15`)
+      .attr("r", d => nodeRadius(d) + 4)
+      .attr("fill", d => `${NODE_COLORS[d.type] || T.amber}15`)
       .attr("stroke", "none");
 
     // Main circle
     node.append("circle")
-      .attr("r", d => d.type === "qm" ? 18 : 12)
+      .attr("r", nodeRadius)
       .attr("fill", T.bg1)
-      .attr("stroke", d => NODE_COLORS[d.type])
-      .attr("stroke-width", 2);
+      .attr("stroke", d => NODE_COLORS[d.type] || T.amber)
+      .attr("stroke-width", d => d.type === "queue" ? 1 : 2);
 
     // Icon text
     node.append("text")
-      .text(d => d.type === "qm" ? "◆" : "●")
+      .text(d => d.type === "qm" ? "◆" : d.type === "app" ? "●" : d.queue_type === "XMITQ" || d.usage === "XMITQ" ? "⇄" : d.queue_type === "REMOTE" ? "↗" : "▪")
       .attr("text-anchor", "middle").attr("dy", "0.35em")
-      .attr("fill", d => NODE_COLORS[d.type])
-      .attr("font-size", d => d.type === "qm" ? "10px" : "8px");
+      .attr("fill", d => NODE_COLORS[d.type] || T.amber)
+      .attr("font-size", d => d.type === "qm" ? "10px" : d.type === "app" ? "8px" : "6px");
 
-    // Label
-    node.append("text")
+    // Label — only show for QM and app nodes (queues are too small)
+    node.filter(d => d.type !== "queue").append("text")
       .text(d => (d.name || d.id).replace("QM_", "").replace("APP_", "").slice(0, 16))
       .attr("text-anchor", "middle").attr("dy", d => d.type === "qm" ? "2.8em" : "2.4em")
       .attr("fill", T.t3)
       .attr("font-size", "9px").attr("font-family", T.fontMono);
 
-    node.append("title").text(d => `${d.id}\nType: ${d.type}\nRegion: ${d.region || "-"}`);
+    node.append("title").text(d => {
+      let tip = `${d.id}\nType: ${d.type}`;
+      if (d.region) tip += `\nRegion: ${d.region}`;
+      if (d.queue_type) tip += `\nQueue Type: ${d.queue_type}`;
+      if (d.usage && d.usage !== "NORMAL") tip += `\nUsage: ${d.usage}`;
+      if (d.remote_qm) tip += `\nRemote QM: ${d.remote_qm}`;
+      return tip;
+    });
 
     const link = g.selectAll("line.edge");
     sim.on("tick", () => {
@@ -385,7 +406,12 @@ function TopologyGraph({ graphData, title, height = 360, badge }) {
            .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
       node.attr("transform", d => `translate(${d.x},${d.y})`);
     });
-  }, [graphData, height, title]);
+  }, [graphData, height, title, showQueues]);
+
+  const legendItems = [["Queue Manager", T.cyan, "◆"], ["Application", T.green, "●"]];
+  if (showQueues) {
+    legendItems.push(["Local Queue", T.amber, "▪"], ["Remote Queue", T.amber, "↗"], ["XMITQ", T.amber, "⇄"]);
+  }
 
   return (
     <div ref={containerRef} style={{ background: T.bg1, borderRadius: T.r2, border: `1px solid ${T.border0}`, overflow: "hidden" }}>
@@ -397,8 +423,8 @@ function TopologyGraph({ graphData, title, height = 360, badge }) {
         {badge}
       </div>
       <svg ref={svgRef} width="100%" height={height} style={{ display: "block" }} />
-      <div style={{ padding: "8px 14px", display: "flex", gap: 16, borderTop: `1px solid ${T.border0}` }}>
-        {[["Queue Manager", T.cyan, "◆"], ["Application", T.green, "●"]].map(([l, c, i]) => (
+      <div style={{ padding: "8px 14px", display: "flex", gap: 16, borderTop: `1px solid ${T.border0}`, flexWrap: "wrap" }}>
+        {legendItems.map(([l, c, i]) => (
           <span key={l} style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 10, color: T.t3 }}>
             <span style={{ color: c, fontSize: 10 }}>{i}</span> {l}
           </span>
@@ -910,6 +936,7 @@ export default function App() {
                 <TopologyGraph graphData={result.as_is_graph} title="As-Is Topology" height={520}
                   badge={<Badge color={T.t3} style={{ fontSize: 9 }}>CURRENT</Badge>} />
                 <TopologyGraph graphData={result.target_graph} title="Target State" height={520}
+                  showQueues={true}
                   badge={<Badge color={T.green} style={{ fontSize: 9 }}>OPTIMISED</Badge>} />
               </div>
 
