@@ -787,39 +787,75 @@ def _build_target_rules(state: dict) -> nx.DiGraph:
     # Reference architecture per Objective.md §5:
     #   App_A → QM_A → REMOTE_Q → XMITQ → [Sender Ch] → QM_B → LOCAL_Q → App_B
     #
-    # For each app: create a LOCAL queue on its QM (consumer reads from this)
-    # For each channel (from_qm → to_qm): create XMITQ on from_qm, REMOTE_Q on from_qm
+    # OPTIMISATION: Only create queue objects for ACTUAL message flows.
+    # A REMOTE queue is needed only when a specific producer writes to a
+    # specific queue that a specific consumer reads from, and they're on
+    # different QMs. This avoids creating unnecessary objects.
 
-    # 5a. LOCAL queues — one per app on its dedicated QM
+    # 5a. LOCAL queues — one per app (consumer reads from this)
+    #     Only create for apps that actually CONSUME (GET) from queues
+    #     Pure producers don't need a local input queue
+    consumer_apps = set()
+    producer_apps = set()
+    for row in raw_data["applications"]:
+        d = row.get("direction", "").upper()
+        if d in ("GET", "CONSUMER"):
+            consumer_apps.add(row["app_id"])
+        elif d in ("PUT", "PRODUCER"):
+            producer_apps.add(row["app_id"])
+        else:
+            # Unknown direction — treat as both
+            consumer_apps.add(row["app_id"])
+            producer_apps.add(row["app_id"])
+
     for app_id, qm_id in app_qm_ownership.items():
-        lq_id = f"LQ.{app_id}"
-        G_target.add_node(lq_id, type="queue", name=f"LOCAL.{app_id}.IN",
-                          queue_type="LOCAL", usage="NORMAL")
-        G_target.add_edge(qm_id, lq_id, rel="owns")
+        if app_id in consumer_apps:
+            lq_id = f"LQ.{app_id}"
+            G_target.add_node(lq_id, type="queue", name=f"LOCAL.{app_id}.IN",
+                              queue_type="LOCAL", usage="NORMAL",
+                              owner_app=app_id)
+            G_target.add_edge(qm_id, lq_id, rel="owns")
 
-    # 5b. For each channel: XMITQ on source QM + REMOTE queue definitions
+    # 5b. XMITQ + REMOTE queues — only for actual cross-QM flows
+    # Build the actual flow map: (producer_app, queue_name, consumer_app)
     seen_xmitq = set()
-    for from_qm, to_qm in required_channels:
-        if from_qm not in G_target.nodes or to_qm not in G_target.nodes:
-            continue
+    seen_rq = set()
+    for queue_name in set(queue_producers.keys()) & set(queue_consumers.keys()):
+        for prod_app in queue_producers[queue_name]:
+            for cons_app in queue_consumers[queue_name]:
+                if prod_app == cons_app:
+                    continue
+                from_qm = app_qm_ownership.get(prod_app)
+                to_qm = app_qm_ownership.get(cons_app)
+                if not from_qm or not to_qm or from_qm == to_qm:
+                    continue
 
-        # XMITQ — one per target QM on the source QM
-        xmitq_id = f"XMITQ.{from_qm}.{to_qm}"
-        if xmitq_id not in seen_xmitq:
-            seen_xmitq.add(xmitq_id)
-            G_target.add_node(xmitq_id, type="queue", name=f"{to_qm}.XMITQ",
-                              queue_type="LOCAL", usage="XMITQ")
-            G_target.add_edge(from_qm, xmitq_id, rel="owns")
+                # XMITQ — one per (from_qm, to_qm) pair
+                xmitq_key = (from_qm, to_qm)
+                if xmitq_key not in seen_xmitq:
+                    seen_xmitq.add(xmitq_key)
+                    xmitq_id = f"XMITQ.{from_qm}.{to_qm}"
+                    G_target.add_node(xmitq_id, type="queue", name=f"{to_qm}.XMITQ",
+                                      queue_type="LOCAL", usage="XMITQ")
+                    G_target.add_edge(from_qm, xmitq_id, rel="owns")
 
-        # REMOTE queue — one per consumer app reachable via this channel
-        consumer_app = [a for a, q in app_qm_ownership.items() if q == to_qm]
-        for cons_app in consumer_app:
-            rq_id = f"RQ.{from_qm}.{cons_app}"
-            G_target.add_node(rq_id, type="queue", name=f"REMOTE.{cons_app}.VIA.{to_qm}",
-                              queue_type="REMOTE", usage="NORMAL",
-                              remote_qm=to_qm, remote_queue=f"LOCAL.{cons_app}.IN",
-                              xmit_queue=f"{to_qm}.XMITQ")
-            G_target.add_edge(from_qm, rq_id, rel="owns")
+                # REMOTE queue — one per (from_qm, consumer_app, queue_name)
+                # This is the actual QREMOTE on the producer's QM pointing to the
+                # consumer's local queue on the target QM
+                rq_key = (from_qm, cons_app, queue_name)
+                if rq_key not in seen_rq:
+                    seen_rq.add(rq_key)
+                    rq_id = f"RQ.{from_qm}.{cons_app}.{queue_name}"
+                    G_target.add_node(rq_id, type="queue",
+                                      name=f"RQ.{queue_name}.TO.{cons_app}",
+                                      queue_type="REMOTE", usage="NORMAL",
+                                      remote_qm=to_qm,
+                                      remote_queue=f"LOCAL.{cons_app}.IN",
+                                      xmit_queue=f"{to_qm}.XMITQ",
+                                      source_queue=queue_name,
+                                      owner_app=prod_app,
+                                      target_app=cons_app)
+                    G_target.add_edge(from_qm, rq_id, rel="owns")
 
     return G_target
 

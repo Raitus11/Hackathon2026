@@ -662,6 +662,8 @@ export default function App() {
   const [error, setError] = useState(null);
   const [reviewFeedback, setReviewFeedback] = useState("");
   const [reviewLoading, setReviewLoading] = useState(false);
+  const [topoShowQueues, setTopoShowQueues] = useState(false);
+  const [topoFilterApp, setTopoFilterApp] = useState("");
 
   // ── LOCAL approval tracking ──
   // The backend pipeline re-runs from start on resume (Known Limitation #1).
@@ -681,6 +683,69 @@ export default function App() {
   }, []);
 
   const architectMethod = result?.architect_method;
+
+  // ── App list for topology filter dropdown ────────────────────────────
+  const appList = useMemo(() => {
+    if (!result?.target_graph?.nodes) return [];
+    return result.target_graph.nodes
+      .filter(n => n.type === "app")
+      .map(n => ({ id: n.id, name: n.name || n.id }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [result?.target_graph]);
+
+  // ── Filtered graph for app path tracing ──────────────────────────────
+  const filteredTargetGraph = useMemo(() => {
+    if (!topoFilterApp || !result?.target_graph) return result?.target_graph;
+    const g = result.target_graph;
+    // Find the app's QM
+    const appEdge = g.edges.find(e =>
+      (e.source === topoFilterApp || e.source?.id === topoFilterApp) && e.rel === "connects_to"
+    );
+    if (!appEdge) return g;
+    const appQm = typeof appEdge.target === "string" ? appEdge.target : appEdge.target?.id;
+    
+    // Find all channels from/to this QM
+    const connectedQMs = new Set([appQm]);
+    const relevantChannels = g.edges.filter(e => {
+      if (e.rel !== "channel") return false;
+      const src = typeof e.source === "string" ? e.source : e.source?.id;
+      const tgt = typeof e.target === "string" ? e.target : e.target?.id;
+      if (src === appQm || tgt === appQm) {
+        connectedQMs.add(src);
+        connectedQMs.add(tgt);
+        return true;
+      }
+      return false;
+    });
+
+    // Find all apps on connected QMs
+    const relevantApps = new Set();
+    g.edges.forEach(e => {
+      if (e.rel !== "connects_to") return;
+      const src = typeof e.source === "string" ? e.source : e.source?.id;
+      const tgt = typeof e.target === "string" ? e.target : e.target?.id;
+      if (connectedQMs.has(tgt)) relevantApps.add(src);
+    });
+
+    // Find all queues owned by connected QMs
+    const relevantQueues = new Set();
+    g.edges.forEach(e => {
+      if (e.rel !== "owns") return;
+      const src = typeof e.source === "string" ? e.source : e.source?.id;
+      const tgt = typeof e.target === "string" ? e.target : e.target?.id;
+      if (connectedQMs.has(src)) relevantQueues.add(tgt);
+    });
+
+    const keepNodes = new Set([...connectedQMs, ...relevantApps, ...relevantQueues]);
+    return {
+      nodes: g.nodes.filter(n => keepNodes.has(n.id)),
+      edges: g.edges.filter(e => {
+        const src = typeof e.source === "string" ? e.source : e.source?.id;
+        const tgt = typeof e.target === "string" ? e.target : e.target?.id;
+        return keepNodes.has(src) && keepNodes.has(tgt);
+      }),
+    };
+  }, [result?.target_graph, topoFilterApp]);
 
   // ── Derived state flags — LOCAL userDecision is the source of truth ──
   // The backend may return contradictory flags because the pipeline re-runs
@@ -932,12 +997,57 @@ export default function App() {
           {/* ━━━ TOPOLOGY TAB ━━━ */}
           {tab === "topology" && result && !loading && (
             <div style={{ animation: "fadeUp 0.4s ease-out" }}>
+              {/* Controls bar */}
+              <div style={{ display: "flex", gap: 12, marginBottom: 14, alignItems: "center", flexWrap: "wrap" }}>
+                <button onClick={() => setTopoShowQueues(!topoShowQueues)} style={{
+                  padding: "6px 14px", borderRadius: T.r1, fontSize: 11, fontFamily: T.fontMono,
+                  background: topoShowQueues ? T.cyanBg : T.bg2,
+                  border: `1px solid ${topoShowQueues ? T.cyan : T.border1}`,
+                  color: topoShowQueues ? T.cyan : T.t2, cursor: "pointer",
+                }}>
+                  {topoShowQueues ? "◆ Full MQ Objects" : "◇ QM + App Only"}
+                </button>
+
+                <div style={{ width: 1, height: 24, background: T.border1 }} />
+
+                <span style={{ fontSize: 10, color: T.t3, fontFamily: T.fontMono }}>TRACE APP:</span>
+                <select
+                  value={topoFilterApp}
+                  onChange={e => setTopoFilterApp(e.target.value)}
+                  style={{
+                    padding: "5px 10px", borderRadius: T.r1, fontSize: 11, fontFamily: T.fontMono,
+                    background: T.bg2, border: `1px solid ${topoFilterApp ? T.green : T.border1}`,
+                    color: topoFilterApp ? T.green : T.t2, cursor: "pointer", maxWidth: 260,
+                  }}
+                >
+                  <option value="">All apps (no filter)</option>
+                  {appList.map(a => (
+                    <option key={a.id} value={a.id}>{a.name} ({a.id})</option>
+                  ))}
+                </select>
+                {topoFilterApp && (
+                  <button onClick={() => setTopoFilterApp("")} style={{
+                    padding: "4px 10px", borderRadius: T.r1, fontSize: 10,
+                    background: T.redBg, border: `1px solid ${T.redBorder}`,
+                    color: T.red, cursor: "pointer",
+                  }}>✕ Clear</button>
+                )}
+              </div>
+
+              {/* Main graphs — side by side */}
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 16 }}>
                 <TopologyGraph graphData={result.as_is_graph} title="As-Is Topology" height={520}
                   badge={<Badge color={T.t3} style={{ fontSize: 9 }}>CURRENT</Badge>} />
-                <TopologyGraph graphData={result.target_graph} title="Target State" height={520}
-                  showQueues={true}
-                  badge={<Badge color={T.green} style={{ fontSize: 9 }}>OPTIMISED</Badge>} />
+                <TopologyGraph
+                  graphData={topoFilterApp ? filteredTargetGraph : result.target_graph}
+                  title={topoFilterApp ? `Target — ${topoFilterApp}` : "Target State"}
+                  height={520}
+                  showQueues={topoShowQueues}
+                  badge={topoFilterApp
+                    ? <Badge color={T.green} style={{ fontSize: 9 }}>FILTERED</Badge>
+                    : <Badge color={T.green} style={{ fontSize: 9 }}>OPTIMISED</Badge>
+                  }
+                />
               </div>
 
               {/* Summary bar */}
