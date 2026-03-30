@@ -52,7 +52,7 @@ def call_llm(
     user_prompt: str,
     max_retries: int = 2,
     temperature: float = 0.1,
-    max_tokens: int = 4096,
+    max_tokens: int = 8192,
     model: str = "llama-3.3-70b-versatile",
 ) -> Optional[dict]:
     """
@@ -87,7 +87,7 @@ def call_llm(
                 temperature=temperature,
                 response_format={"type": "json_object"},
                 max_tokens=max_tokens,
-                timeout=45,
+                timeout=60,
             )
 
             raw = completion.choices[0].message.content
@@ -115,9 +115,13 @@ def call_llm(
         except Exception as e:
             error_str = str(e).lower()
 
+            # Payload too large (413) — prompt exceeds model's context window
+            if "413" in error_str or "payload too large" in error_str or "request too large" in error_str:
+                logger.warning(f"Payload too large for model — falling back to rules immediately.")
+                return None
+
             # Rate limit — set circuit breaker and fail fast
             if "rate_limit" in error_str or "429" in error_str:
-                # Extract wait time from error if possible, default to 60s
                 _rate_limited_until = time.time() + 60
                 logger.warning(f"Rate limited — circuit breaker set for 60s. Falling back to rules immediately.")
                 return None
@@ -141,14 +145,18 @@ def validate_architect_response(result: dict) -> list:
     """
     Validate that the LLM response has all required keys.
     Returns list of missing keys (empty = valid).
+
+    Schema (1:1 app-to-QM):
+      - target_app_assignments: each app → its dedicated QM
+      - channels: flow-justified QM-to-QM connections
+      - adrs: architecture decision records
+      - design_decisions: detailed change log
     """
     required = [
-        "design_decisions",
-        "adrs",
         "target_app_assignments",
-        "qms_to_remove",
-        "qms_to_keep",
-        "required_connections",
+        "channels",
+        "adrs",
+        "design_decisions",
     ]
     return [k for k in required if k not in result]
 

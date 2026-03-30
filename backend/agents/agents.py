@@ -333,6 +333,9 @@ def architect_agent(state: dict) -> dict:
         dupes_removed = _enforce_single_qm(target_graph, raw_data)
         if dupes_removed:
             logger.warning(f"ARCHITECT: _enforce_single_qm removed {dupes_removed} duplicate connects_to edges")
+            # _enforce_single_qm may have created new QMs that lack channels.
+            # Backfill channels from actual producer→consumer flows.
+            _backfill_channels(target_graph, raw_data)
 
         as_is = state.get("as_is_graph")
         original_qm_count = sum(1 for _, d in as_is.nodes(data=True) if d.get("type") == "qm") if as_is else 0
@@ -422,6 +425,110 @@ def _enforce_single_qm(G: nx.DiGraph, raw_data: dict) -> int:
     return corrections
 
 
+def _backfill_channels(G: nx.DiGraph, raw_data: dict):
+    """
+    Derive channels from actual producer→consumer queue-level flows
+    for any QM that currently has zero channels. Called after
+    _enforce_single_qm which may create new QMs without channels.
+    Also backfills queue objects (LOCAL, REMOTE, XMITQ) for new QMs.
+    """
+    # Build current app→QM map from graph
+    app_qm = {}
+    for n, d in G.nodes(data=True):
+        if d.get("type") == "app":
+            qms = [v for _, v, ed in G.out_edges(n, data=True) if ed.get("rel") == "connects_to"]
+            if qms:
+                app_qm[n] = qms[0]
+
+    # Build queue-level flow data
+    queue_prod = {}
+    queue_cons = {}
+    for row in raw_data.get("applications", []):
+        aid = row["app_id"]
+        qname = row.get("queue_name", "")
+        if not qname:
+            continue
+        direction = row.get("direction", "").upper()
+        if direction in ("PUT", "PRODUCER"):
+            queue_prod.setdefault(qname, set()).add(aid)
+        elif direction in ("GET", "CONSUMER"):
+            queue_cons.setdefault(qname, set()).add(aid)
+
+    # Derive all required channels
+    added = 0
+    for qname in set(queue_prod.keys()) & set(queue_cons.keys()):
+        for prod_app in queue_prod[qname]:
+            for cons_app in queue_cons[qname]:
+                if prod_app == cons_app:
+                    continue
+                from_qm = app_qm.get(prod_app)
+                to_qm = app_qm.get(cons_app)
+                if from_qm and to_qm and from_qm != to_qm:
+                    if from_qm in G.nodes and to_qm in G.nodes and not G.has_edge(from_qm, to_qm):
+                        G.add_edge(
+                            from_qm, to_qm, rel="channel",
+                            channel_name=f"{from_qm}.{to_qm}",
+                            status="RUNNING",
+                            xmit_queue=f"{to_qm}.XMITQ",
+                        )
+                        added += 1
+
+    if added:
+        logger.info(f"_backfill_channels: added {added} channels for new/isolated QMs")
+
+    # Backfill queue objects for any QM that has apps but no owned queues
+    consumer_apps = set()
+    for row in raw_data.get("applications", []):
+        d = row.get("direction", "").upper()
+        if d in ("GET", "CONSUMER"):
+            consumer_apps.add(row["app_id"])
+        elif d not in ("PUT", "PRODUCER"):
+            consumer_apps.add(row["app_id"])
+
+    for app_id, qm_id in app_qm.items():
+        if app_id in consumer_apps:
+            lq_id = f"LQ.{app_id}"
+            if lq_id not in G.nodes:
+                G.add_node(lq_id, type="queue", name=f"LOCAL.{app_id}.IN",
+                           queue_type="LOCAL", usage="NORMAL", owner_app=app_id)
+                G.add_edge(qm_id, lq_id, rel="owns")
+
+    seen_xmitq = set()
+    seen_rq = set()
+    for qname in set(queue_prod.keys()) & set(queue_cons.keys()):
+        for prod_app in queue_prod[qname]:
+            for cons_app in queue_cons[qname]:
+                if prod_app == cons_app:
+                    continue
+                from_qm = app_qm.get(prod_app)
+                to_qm = app_qm.get(cons_app)
+                if not from_qm or not to_qm or from_qm == to_qm:
+                    continue
+                xk = (from_qm, to_qm)
+                if xk not in seen_xmitq:
+                    seen_xmitq.add(xk)
+                    xid = f"XMITQ.{from_qm}.{to_qm}"
+                    if xid not in G.nodes:
+                        G.add_node(xid, type="queue", name=f"{to_qm}.XMITQ",
+                                   queue_type="LOCAL", usage="XMITQ")
+                        G.add_edge(from_qm, xid, rel="owns")
+                rk = (from_qm, cons_app, qname)
+                if rk not in seen_rq:
+                    seen_rq.add(rk)
+                    rid = f"RQ.{from_qm}.{cons_app}.{qname}"
+                    if rid not in G.nodes:
+                        G.add_node(rid, type="queue",
+                                   name=f"RQ.{qname}.TO.{cons_app}",
+                                   queue_type="REMOTE", usage="NORMAL",
+                                   remote_qm=to_qm,
+                                   remote_queue=f"LOCAL.{cons_app}.IN",
+                                   xmit_queue=f"{to_qm}.XMITQ",
+                                   source_queue=qname,
+                                   owner_app=prod_app,
+                                   target_app=cons_app)
+                        G.add_edge(from_qm, rid, rel="owns")
+
+
 def _architect_llm(state: dict) -> dict | None:
     """Call Groq LLM for architecture design. Returns parsed dict or None."""
     try:
@@ -431,7 +538,7 @@ def _architect_llm(state: dict) -> dict | None:
             user_prompt=user_prompt,
             max_retries=2,
             temperature=0.1,
-            max_tokens=4096,
+            max_tokens=8192,
         )
         if result is None:
             return None
@@ -451,171 +558,196 @@ def _architect_llm(state: dict) -> dict | None:
 def _build_target_from_llm(llm_result: dict, state: dict) -> tuple:
     """
     Build a NetworkX target graph from the LLM's structured output.
+    New schema (1:1): target_app_assignments, new_qms, removed_qms, channels.
     Returns (graph, adrs_list).
+
+    Safety: if the LLM misses any apps, they get assigned via the rules
+    fallback logic (weighted majority). _enforce_single_qm runs after
+    to guarantee 1:1.
     """
     raw_data = state["raw_data"]
     G_target = nx.DiGraph()
 
-    # Validate entity references against actual data
-    valid_qm_ids = set(q["qm_id"] for q in raw_data["queue_managers"])
     valid_app_ids = set(a["app_id"] for a in raw_data["applications"])
     qm_map = {row["qm_id"]: row for row in raw_data["queue_managers"]}
 
-    # Add QMs the LLM wants to keep
-    qms_to_keep = set()
-    for qm_id in llm_result.get("qms_to_keep", []):
-        if qm_id in valid_qm_ids and qm_id in qm_map:
-            row = qm_map[qm_id]
-            G_target.add_node(
-                qm_id, type="qm",
-                name=row.get("qm_name", qm_id),
-                region=row.get("region", ""),
-            )
-            qms_to_keep.add(qm_id)
-
-    # If LLM returned empty qms_to_keep, fall back
-    if not qms_to_keep:
-        logger.warning("LLM returned empty qms_to_keep — falling back to rules")
-        return _build_target_rules(state), []
-
-    # Add apps with LLM-assigned QMs
+    # Build app name lookup
     app_name_map = {}
     for row in raw_data["applications"]:
         if row["app_id"] not in app_name_map:
             app_name_map[row["app_id"]] = row.get("app_name", row["app_id"])
 
-    for assignment in llm_result.get("target_app_assignments", []):
-        app_id = assignment.get("app_id", "")
-        assigned_qm = assignment.get("assigned_qm", "")
-
-        if app_id not in valid_app_ids:
+    # ── Step 1: Process LLM app assignments ───────────────────────────────
+    assigned = {}  # {app_id: qm_id}
+    for entry in llm_result.get("target_app_assignments", []):
+        app_id = entry.get("app_id", "")
+        qm_id = entry.get("assigned_qm", "")
+        if app_id not in valid_app_ids or not qm_id:
             continue
-        if assigned_qm not in qms_to_keep:
-            # LLM assigned to a removed QM — pick first available
-            assigned_qm = sorted(qms_to_keep)[0] if qms_to_keep else None
-            if not assigned_qm:
+        assigned[app_id] = qm_id
+
+    if not assigned:
+        logger.warning("LLM returned empty target_app_assignments — falling back to rules")
+        return _build_target_rules(state), []
+
+    # ── Step 2: Create QM nodes ───────────────────────────────────────────
+    all_qms = set(assigned.values())
+    for qm_id in all_qms:
+        if qm_id in qm_map:
+            row = qm_map[qm_id]
+            G_target.add_node(qm_id, type="qm", name=row.get("qm_name", qm_id),
+                              region=row.get("region", ""))
+        else:
+            # New QM created by LLM (e.g. QM_A001)
+            # Try to infer region from the app's original QM
+            G_target.add_node(qm_id, type="qm", name=qm_id, region="")
+
+    # ── Step 3: Create app nodes + connects_to edges ──────────────────────
+    for app_id, qm_id in assigned.items():
+        G_target.add_node(app_id, type="app", name=app_name_map.get(app_id, app_id))
+        if qm_id in G_target.nodes:
+            existing = [v for _, v, d in G_target.out_edges(app_id, data=True)
+                        if d.get("rel") == "connects_to"]
+            if not existing:
+                G_target.add_edge(app_id, qm_id, rel="connects_to")
+
+    # ── Step 4: Assign missing apps via rules fallback ────────────────────
+    # LLM might miss some of the 150 apps. Assign them using weighted majority.
+    missing_apps = valid_app_ids - set(assigned.keys())
+    if missing_apps:
+        logger.warning(f"LLM missed {len(missing_apps)} apps — assigning via rules fallback")
+        app_qm_counts = {}
+        for row in raw_data["applications"]:
+            aid = row["app_id"]
+            if aid not in missing_apps:
                 continue
+            qm = row.get("qm_id", "")
+            app_qm_counts.setdefault(aid, {})
+            app_qm_counts[aid][qm] = app_qm_counts[aid].get(qm, 0) + 1
 
-        if app_id not in G_target.nodes:
+        for app_id, qm_counts in app_qm_counts.items():
+            best_qm = max(qm_counts, key=qm_counts.get)
+            # Check if best_qm is already taken by another app
+            apps_on_best = [u for u, v, d in G_target.in_edges(best_qm, data=True)
+                            if d.get("rel") == "connects_to"] if best_qm in G_target.nodes else []
+            if apps_on_best:
+                # QM taken — create a new one
+                new_qm = f"QM_{app_id}"
+                region = qm_map.get(best_qm, {}).get("region", "")
+                G_target.add_node(new_qm, type="qm", name=f"QM for {app_name_map.get(app_id, app_id)}",
+                                  region=region)
+                best_qm = new_qm
+            elif best_qm not in G_target.nodes:
+                row = qm_map.get(best_qm, {})
+                G_target.add_node(best_qm, type="qm", name=row.get("qm_name", best_qm),
+                                  region=row.get("region", ""))
+
             G_target.add_node(app_id, type="app", name=app_name_map.get(app_id, app_id))
-        # Only add if this app doesn't already have a connects_to edge
-        existing_qms = [v for _, v, d in G_target.out_edges(app_id, data=True) if d.get("rel") == "connects_to"]
-        if not existing_qms:
-            G_target.add_edge(app_id, assigned_qm, rel="connects_to")
+            G_target.add_edge(app_id, best_qm, rel="connects_to")
 
-    # Ensure ALL apps from source data are assigned (LLM might miss some)
-    assigned_apps = set(
-        n for n, d in G_target.nodes(data=True) if d.get("type") == "app"
-    )
-    for app_id in valid_app_ids:
-        if app_id not in assigned_apps:
-            # Find original QM, or first available
-            original_qms = [
-                r["qm_id"] for r in raw_data["applications"]
-                if r["app_id"] == app_id and r["qm_id"] in qms_to_keep
-            ]
-            qm = original_qms[0] if original_qms else sorted(qms_to_keep)[0]
-            if app_id not in G_target.nodes:
-                G_target.add_node(app_id, type="app", name=app_name_map.get(app_id, app_id))
-            # Only add if no connects_to edge exists yet
-            existing_qms = [v for _, v, d in G_target.out_edges(app_id, data=True) if d.get("rel") == "connects_to"]
-            if not existing_qms:
-                G_target.add_edge(app_id, qm, rel="connects_to")
-
-    # Add channels from LLM required_connections
-    for conn in llm_result.get("required_connections", []):
+    # ── Step 5: Add channels from LLM ─────────────────────────────────────
+    all_target_qms = set(n for n, d in G_target.nodes(data=True) if d.get("type") == "qm")
+    for conn in llm_result.get("channels", []):
         from_qm = conn.get("from_qm", "")
         to_qm = conn.get("to_qm", "")
-        if from_qm in qms_to_keep and to_qm in qms_to_keep and from_qm != to_qm:
-            channel_name = f"{from_qm}.{to_qm}"
+        if from_qm in all_target_qms and to_qm in all_target_qms and from_qm != to_qm:
             if not G_target.has_edge(from_qm, to_qm):
                 G_target.add_edge(
-                    from_qm, to_qm,
-                    rel="channel",
-                    channel_name=channel_name,
+                    from_qm, to_qm, rel="channel",
+                    channel_name=f"{from_qm}.{to_qm}",
                     status="RUNNING",
                     xmit_queue=f"{to_qm}.XMITQ",
                 )
 
-    # ── SAFETY NET: backfill channels for isolated QMs ────────────────────
-    # The LLM sometimes keeps a QM + apps but forgets to create channels for
-    # it. Find any QM that has apps but zero channels and restore relevant
-    # as-is channels so apps aren't stranded.
-    target_app_qm = {}
+    # ── Step 6: Backfill channels from actual flows ───────────────────────
+    # LLM often can't enumerate all 2,992 channels. Derive the rest from
+    # actual producer→consumer queue-level data (same logic as rules path).
+    app_qm_ownership = {}
     for n, d in G_target.nodes(data=True):
         if d.get("type") == "app":
-            for _, v, ed in G_target.out_edges(n, data=True):
-                if ed.get("rel") == "connects_to":
-                    target_app_qm[n] = v
+            qms = [v for _, v, ed in G_target.out_edges(n, data=True) if ed.get("rel") == "connects_to"]
+            if qms:
+                app_qm_ownership[n] = qms[0]
 
-    qms_with_apps = set(target_app_qm.values())
-
-    def _qm_has_channel(qm, graph):
-        for _, _, d in graph.out_edges(qm, data=True):
-            if d.get("rel") == "channel":
-                return True
-        for _, _, d in graph.in_edges(qm, data=True):
-            if d.get("rel") == "channel":
-                return True
-        return False
-
-    for qm in list(qms_with_apps):
-        if _qm_has_channel(qm, G_target):
+    queue_producers = {}
+    queue_consumers = {}
+    for row in raw_data["applications"]:
+        aid = row["app_id"]
+        qname = row.get("queue_name", "")
+        if not qname:
             continue
+        direction = row.get("direction", "").upper()
+        if direction in ("PUT", "PRODUCER"):
+            queue_producers.setdefault(qname, set()).add(aid)
+        elif direction in ("GET", "CONSUMER"):
+            queue_consumers.setdefault(qname, set()).add(aid)
 
-        # This QM is isolated — try to restore as-is channels
-        logger.warning(f"LLM left {qm} isolated — attempting channel backfill from as-is")
-        backfilled = False
-        for ch in raw_data.get("channels", []):
-            if ch.get("channel_type") != "SENDER":
-                continue
-            if ch.get("status", "").upper() == "STOPPED":
-                continue
-            from_qm_ch = ch["from_qm"]
-            to_qm_ch = ch["to_qm"]
-            if (from_qm_ch == qm and to_qm_ch in qms_to_keep) or \
-               (to_qm_ch == qm and from_qm_ch in qms_to_keep):
-                if not G_target.has_edge(from_qm_ch, to_qm_ch):
-                    channel_name = f"{from_qm_ch}.{to_qm_ch}"
-                    G_target.add_edge(
-                        from_qm_ch, to_qm_ch,
-                        rel="channel",
-                        channel_name=channel_name,
-                        status="RUNNING",
-                        xmit_queue=f"{to_qm_ch}.XMITQ",
-                    )
-                    backfilled = True
+    for queue_name in set(queue_producers.keys()) & set(queue_consumers.keys()):
+        for prod_app in queue_producers[queue_name]:
+            for cons_app in queue_consumers[queue_name]:
+                if prod_app == cons_app:
+                    continue
+                from_qm = app_qm_ownership.get(prod_app)
+                to_qm = app_qm_ownership.get(cons_app)
+                if from_qm and to_qm and from_qm != to_qm:
+                    if not G_target.has_edge(from_qm, to_qm):
+                        G_target.add_edge(
+                            from_qm, to_qm, rel="channel",
+                            channel_name=f"{from_qm}.{to_qm}",
+                            status="RUNNING",
+                            xmit_queue=f"{to_qm}.XMITQ",
+                        )
 
-        # If STILL isolated (no as-is channels existed for this QM at all),
-        # force-move its apps to the nearest connected QM and remove the QM.
-        if not backfilled or not _qm_has_channel(qm, G_target):
-            # Find a connected QM to absorb the apps — prefer same region
-            qm_region = G_target.nodes[qm].get("region", "")
-            connected_qms = [
-                q for q in qms_with_apps
-                if q != qm and _qm_has_channel(q, G_target)
-            ]
-            # Prefer same region
-            same_region = [q for q in connected_qms if G_target.nodes.get(q, {}).get("region") == qm_region]
-            absorber = same_region[0] if same_region else (connected_qms[0] if connected_qms else None)
+    # ── Step 7: Build queue objects (same as rules path Step 5) ───────────
+    consumer_apps = set()
+    for row in raw_data["applications"]:
+        d = row.get("direction", "").upper()
+        if d in ("GET", "CONSUMER"):
+            consumer_apps.add(row["app_id"])
+        elif d not in ("PUT", "PRODUCER"):
+            consumer_apps.add(row["app_id"])
 
-            if absorber:
-                apps_to_move = [a for a, q in target_app_qm.items() if q == qm]
-                logger.warning(
-                    f"No channels exist for {qm} even in as-is — "
-                    f"moving {apps_to_move} to {absorber} and removing {qm}"
-                )
-                for app in apps_to_move:
-                    # Remove old edge, add new one
-                    if G_target.has_edge(app, qm):
-                        G_target.remove_edge(app, qm)
-                    G_target.add_edge(app, absorber, rel="connects_to")
-                    target_app_qm[app] = absorber
-                # Remove the now-empty QM
-                G_target.remove_node(qm)
-                qms_to_keep.discard(qm)
+    for app_id, qm_id in app_qm_ownership.items():
+        if app_id in consumer_apps:
+            lq_id = f"LQ.{app_id}"
+            G_target.add_node(lq_id, type="queue", name=f"LOCAL.{app_id}.IN",
+                              queue_type="LOCAL", usage="NORMAL", owner_app=app_id)
+            G_target.add_edge(qm_id, lq_id, rel="owns")
 
-    # Parse ADRs from LLM — convert to our format
+    seen_xmitq = set()
+    seen_rq = set()
+    for queue_name in set(queue_producers.keys()) & set(queue_consumers.keys()):
+        for prod_app in queue_producers[queue_name]:
+            for cons_app in queue_consumers[queue_name]:
+                if prod_app == cons_app:
+                    continue
+                from_qm = app_qm_ownership.get(prod_app)
+                to_qm = app_qm_ownership.get(cons_app)
+                if not from_qm or not to_qm or from_qm == to_qm:
+                    continue
+                xmitq_key = (from_qm, to_qm)
+                if xmitq_key not in seen_xmitq:
+                    seen_xmitq.add(xmitq_key)
+                    xmitq_id = f"XMITQ.{from_qm}.{to_qm}"
+                    G_target.add_node(xmitq_id, type="queue", name=f"{to_qm}.XMITQ",
+                                      queue_type="LOCAL", usage="XMITQ")
+                    G_target.add_edge(from_qm, xmitq_id, rel="owns")
+                rq_key = (from_qm, cons_app, queue_name)
+                if rq_key not in seen_rq:
+                    seen_rq.add(rq_key)
+                    rq_id = f"RQ.{from_qm}.{cons_app}.{queue_name}"
+                    G_target.add_node(rq_id, type="queue",
+                                      name=f"RQ.{queue_name}.TO.{cons_app}",
+                                      queue_type="REMOTE", usage="NORMAL",
+                                      remote_qm=to_qm,
+                                      remote_queue=f"LOCAL.{cons_app}.IN",
+                                      xmit_queue=f"{to_qm}.XMITQ",
+                                      source_queue=queue_name,
+                                      owner_app=prod_app,
+                                      target_app=cons_app)
+                    G_target.add_edge(from_qm, rq_id, rel="owns")
+
+    # ── Parse ADRs + insights ─────────────────────────────────────────────
     adrs = []
     for adr in llm_result.get("adrs", []):
         adrs.append({

@@ -1,222 +1,290 @@
 """
 prompts.py
 Architect agent prompt templates and graph-to-text serialisation.
-Feeds topology data to Groq LLM for AI-driven architecture decisions.
+Feeds topology data to LLM for AI-driven architecture decisions.
+
+Designed for Tachyon (production) with Groq/Llama 3.3 fallback.
+Token-optimised: summarises 13K rows into ~3K tokens of structured text.
 """
-import pandas as pd
 from typing import Optional
+from collections import Counter
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SYSTEM PROMPT — IBM MQ domain expert persona
 # ─────────────────────────────────────────────────────────────────────────────
-ARCHITECT_SYSTEM_PROMPT = """You are a senior IBM MQ infrastructure architect with 20 years of experience designing enterprise messaging topologies. You are analysing an existing IBM MQ deployment and designing an optimised target state.
+ARCHITECT_SYSTEM_PROMPT = """You are a senior IBM MQ infrastructure architect designing a target state topology from a legacy MQ environment. You must produce a VALID, CONSTRAINT-COMPLIANT design.
 
-## YOUR CONSTRAINTS — EVERY DECISION MUST SATISFY ALL OF THESE:
+## HARD CONSTRAINTS — VIOLATING ANY OF THESE MAKES THE DESIGN INVALID
 
-1. ONE QM PER APP: Every application ID connects to exactly one queue manager. No exceptions.
-2. REMOTE QUEUE PATTERN: Data producers write to a REMOTE queue definition (QREMOTE) on their local QM. The QREMOTE points to the consumer's LOCAL queue on the target QM via an XMITQ.
-3. TRANSMISSION QUEUES: Every QREMOTE uses an XMITQ to route messages to the target QM. One XMITQ per target QM.
-4. CHANNEL NAMING: Sender channels are named {fromQM}.{toQM}. Receiver channels use the SAME name on the remote QM.
-5. SENDER/RECEIVER PAIRS: Every channel connection has a SENDER on the source QM and a RECEIVER on the destination QM.
-6. CONSUMER LOCAL QUEUES: Consumers GET from LOCAL queues on their own QM. These are fed by inbound channels.
+### C1: STRICT 1:1 APP-TO-QM OWNERSHIP
+- Each application ID gets its own DEDICATED queue manager. No sharing.
+- N apps = N queue managers. No exceptions.
+- The app with the most connections to an existing QM keeps that QM's name.
+- All other apps get a new QM named QM_{APP_ID}.
+- Orphan QMs (zero apps after reassignment) are removed.
 
-## YOUR OBJECTIVES (in priority order):
+### C2: CANONICAL MESSAGE FLOW (must be followed exactly)
+```
+Producer App → [Server Connection] → QM_A
+  QM_A has: QREMOTE(name) RQMNAME(QM_B) RNAME(LOCAL.{consumer}.IN) XMITQ({QM_B}.XMITQ)
+  QM_A has: QLOCAL({QM_B}.XMITQ) USAGE(XMITQ)
+  QM_A has: CHANNEL({QM_A}.{QM_B}) CHLTYPE(SDR) XMITQ({QM_B}.XMITQ)
+  → network →
+  QM_B has: CHANNEL({QM_A}.{QM_B}) CHLTYPE(RCVR)
+  QM_B has: QLOCAL(LOCAL.{consumer}.IN)
+Consumer App → [Server Connection] → QM_B → GET(LOCAL.{consumer}.IN)
+```
 
-1. Fix all constraint violations in the as-is topology
-2. AGGRESSIVELY minimise the number of queue managers — remove every QM that has zero apps after consolidation. A QM with no apps is waste. Do NOT keep QMs "for future use" or "regional presence" — if no app needs it, remove it.
-3. AGGRESSIVELY minimise channels — a channel is ONLY needed if a PRODUCER app on QM_A sends messages to a CONSUMER app on QM_B. If no such flow exists, the channel must be removed. Do NOT keep channels "for convenience."
-4. Preserve all application message flows (no app loses ability to communicate)
-5. Prefer regional affinity (keep apps on QMs in their region where possible)
-6. TARGET: achieve at least 30% complexity reduction. If you keep too many QMs or channels, the score won't improve enough. Be bold.
+### C3: CHANNEL RULES
+- Channels do NOT exist in input data — you introduce them.
+- A channel is needed ONLY when a producer app on QM_A writes to a queue consumed by an app on QM_B (and QM_A ≠ QM_B).
+- Sender channel name: {FROM_QM}.{TO_QM}
+- Receiver channel: same name, on the receiver QM.
+- One XMITQ per target QM (shared by all REMOTE queues targeting that QM).
 
-## OUTPUT FORMAT:
+### C4: QUEUE RULES
+- LOCAL queue: one per consumer app on its QM. Named LOCAL.{APP_ID}.IN.
+- REMOTE queue: one per (producer_app, queue_name, consumer_app) flow where they are on different QMs.
+- XMITQ: one per (source_QM, target_QM) pair. Named {TARGET_QM}.XMITQ.
 
-Return a JSON object with exactly this structure:
+## YOUR OBJECTIVES (priority order)
+
+1. Enforce strict 1:1 app-to-QM ownership (C1)
+2. Determine channels from actual producer→consumer queue-level flows only (C3)
+3. Preserve ALL application message flows — zero broken paths
+4. Remove orphan QMs that have zero apps after 1:1 reassignment
+5. Respect regional affinity where possible
+6. Produce Architecture Decision Records (ADRs) explaining your reasoning
+7. Surface insights: SPOFs, hub QMs, orphan objects, anti-patterns in the as-is topology
+
+## OUTPUT FORMAT — RETURN ONLY VALID JSON
+
 {
+  "target_app_assignments": [
+    {
+      "app_id": "A000",
+      "assigned_qm": "QM007",
+      "region": "Risk & Compliance",
+      "reason": "Highest connection count (12) to QM007 among 20 QMs"
+    }
+  ],
+  "new_qms": ["QM_A001", "QM_A002"],
+  "removed_qms": ["QM030"],
+  "channels": [
+    {
+      "from_qm": "QM007",
+      "to_qm": "QM_A010",
+      "reason": "A000 on QM007 produces to Q.ORDERS consumed by A010 on QM_A010"
+    }
+  ],
   "design_decisions": [
     {
       "id": "DD-001",
-      "type": "CONSOLIDATE_APP | REMOVE_QM | ADD_CHANNEL | REMOVE_CHANNEL | REASSIGN_APP",
-      "affected_entities": ["QM_NAME", "APP_ID"],
+      "type": "ASSIGN_DEDICATED_QM | CREATE_CHANNEL | REMOVE_QM",
+      "affected_entities": ["A000", "QM007"],
       "description": "What you are doing",
-      "rationale": "Why — referencing specific data from the topology"
+      "rationale": "Why — reference specific apps, queues, flow counts"
     }
   ],
   "adrs": [
     {
       "id": "ADR-001",
-      "title": "Short title of the decision",
-      "context": "The specific problem in the as-is topology with entity names and data",
-      "decision": "What change is being made",
-      "rationale": "Why this approach over alternatives. Mention trade-offs.",
-      "consequences": "What changes as a result. Reference affected apps, queues, channels by name."
+      "title": "Enforce 1:1 app-to-QM ownership",
+      "context": "As-is has N apps across M shared QMs with avg coupling of X",
+      "decision": "Create N dedicated QMs, one per app",
+      "rationale": "Eliminates multi-app coupling, enables independent deployment",
+      "consequences": "QM count changes from M to N. Channels derived from actual flows."
     }
   ],
-  "target_app_assignments": [
+  "insights": [
     {
-      "app_id": "APP001",
-      "assigned_qm": "QM_LONDON",
-      "reason": "Brief reason for this assignment"
-    }
-  ],
-  "qms_to_remove": ["QM_ORPHAN1"],
-  "qms_to_keep": ["QM_LONDON", "QM_PARIS"],
-  "required_connections": [
-    {
-      "from_qm": "QM_LONDON",
-      "to_qm": "QM_PARIS",
-      "serving_apps": ["APP001", "APP005"],
-      "direction": "Messages flow from APP001 on QM_LONDON to APP005 on QM_PARIS"
+      "type": "SPOF | HUB | ANTI_PATTERN | ORPHAN | OBSERVATION",
+      "entity": "QM017",
+      "detail": "QM017 hosts 112 apps — single point of failure affecting 74% of apps."
     }
   ]
 }
 
-## RULES FOR YOUR REASONING:
+## REASONING RULES
 
-- NEVER reference entities that don't exist in the provided topology data
-- ALWAYS explain WHY you chose one QM over another for app consolidation
-- If an app PUTs to queues on multiple QMs, consolidate to the QM with the majority of its connections
-- If tie, prefer the QM with fewer existing apps (load balance)
-- An orphan QM is one with zero apps AND zero active message flows after consolidation — it MUST be removed
-- Only remove a QM if ALL its apps have been reassigned and ALL its message flows are served by other paths
-- Every ADR must reference at least 2 specific entity names from the topology
-- IMPORTANT: when multiple apps in the same region share a QM, consolidate them onto ONE QM and remove the rest. Do not keep QMs with only 1 app if another QM in the same region can host it.
-- Stopped/inactive channels MUST be removed — they are dead weight
-- qms_to_remove should contain EVERY QM not in qms_to_keep. Do not leave QMs unlisted.
-- CRITICAL: every QM in qms_to_keep MUST appear in at least one required_connection (either as from_qm or to_qm). A QM with apps but no channels is ISOLATED and useless — either connect it or move its apps to another QM and remove it.
-- If a QM in the as-is topology has CONSUMER apps but NO inbound channel feeding it, that QM is already broken. Move its apps to a QM that IS connected, and remove the broken QM."""
+- Reference ACTUAL entity names from the provided topology data only.
+- For 1:1 assignment: pick the QM where the app has the MOST queue connections. Ties → fewer total apps on QM → alphabetical.
+- A channel exists ONLY where a specific producer app writes to a queue consumed by a specific consumer app, and they are on DIFFERENT QMs after 1:1 assignment.
+- Do NOT create channels "for convenience" or "for future use."
+- Every ADR must reference at least 2 specific entity names.
+- Insights should surface non-obvious findings: hubs, SPOFs, regional imbalances, orphans, anti-patterns.
+- removed_qms = QMs with zero apps after 1:1 reassignment.
+- new_qms = QMs you create (named QM_{APP_ID}) for apps that couldn't keep their original."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# USER PROMPT TEMPLATE
+# USER PROMPT TEMPLATE — token-optimised for large datasets
 # ─────────────────────────────────────────────────────────────────────────────
-USER_PROMPT_TEMPLATE = """Analyse the following IBM MQ topology and design an optimised target state.
+USER_PROMPT_TEMPLATE = """Analyse this IBM MQ topology and design a 1:1 app-to-QM target state.
 
-## AS-IS TOPOLOGY SUMMARY
+## AS-IS SUMMARY
 
-Queue Managers ({num_qms} total):
-{qm_summary}
+{num_apps} apps across {num_qms} queue managers.
+{num_queues} queues ({num_local} local, {num_remote} remote, {num_alias} alias).
+{num_channels} inferred channels. {num_flows} producer→consumer flows across {num_flow_pairs} unique app pairs.
 
-Applications ({num_apps} total):
-{app_summary}
+### Coupling (every app here connects to multiple QMs — this MUST be fixed)
+{coupling_summary}
 
-Channels ({num_channels} total):
-{channel_summary}
+### QM Load Distribution (apps per QM — shows sharing that must be eliminated)
+{qm_load_summary}
 
-Queues ({num_queues} total):
-{queue_summary}
+### Top Producers by Fan-Out
+{flow_summary}
+
+### Regional Distribution
+{region_summary}
 
 ## DETECTED VIOLATIONS
-
 {violations_list}
 
-## CURRENT COMPLEXITY SCORE: {as_is_score}/100
-
-Factor breakdown:
-- Channel Count (CC): {cc_score} (weight: 30%) — reduce by removing unnecessary channels
-- Coupling Index (CI): {ci_score} (weight: 25%) — reduce by enforcing 1-QM-per-app
-- Routing Depth (RD): {rd_score} (weight: 20%) — reduce by eliminating multi-hop paths
-- Fan-Out (FO): {fo_score} (weight: 15%) — reduce by consolidating outbound channels
-- Orphan Objects (OO): {oo_score} (weight: 10%) — reduce by removing orphan QMs and stopped channels
-
-YOUR TARGET: reduce the total score by at least 30%. Be aggressive — remove every QM and channel that is not strictly required by an active application message flow.
+## COMPLEXITY SCORE: {as_is_score}/100
+- Channel Count (CC): {cc_raw} channels (weighted: {cc_score}/30)
+- Coupling Index (CI): {ci_raw} QMs/app (weighted: {ci_score}/25) — target is 1.0
+- Routing Depth (RD): {rd_raw} hops (weighted: {rd_score}/20)
+- Fan-Out (FO): {fo_raw} max outbound (weighted: {fo_score}/15)
+- Orphan Objects (OO): {oo_raw} (weighted: {oo_score}/10)
 
 {human_feedback_section}
 
-Design the optimised target state. Return ONLY valid JSON matching the specified schema."""
+Design the target state. Each app gets exactly ONE dedicated QM. Channels only where actual producer→consumer flows exist. Return ONLY valid JSON matching the schema."""
 
 
 def build_architect_prompt(state: dict) -> str:
     """
     Serialise pipeline state into the user prompt for the Architect LLM.
-    Converts graph data into readable text the LLM can reason about.
+    Token-optimised: summarises 13K rows into ~3K tokens of structured text.
     """
     raw_data = state["raw_data"]
     violations = state.get("data_quality_report", {}).get("topology_violations", {})
     metrics = state.get("as_is_metrics", {})
+    factor_scores = metrics.get("factor_scores", {})
 
-    # ── QM summary ────────────────────────────────────────────────────────
-    qm_lines = []
     qm_list = raw_data.get("queue_managers", [])
     app_list = raw_data.get("applications", [])
+    queue_list = raw_data.get("queues", [])
+    channel_list = raw_data.get("channels", [])
 
-    for qm in qm_list:
-        qm_id = qm["qm_id"]
-        apps_on_qm = [a for a in app_list if a.get("qm_id") == qm_id]
-        app_ids = list(set(a["app_id"] for a in apps_on_qm))
-        qm_lines.append(
-            f"  - {qm.get('qm_name', qm_id)} (id: {qm_id}, "
-            f"region: {qm.get('region', 'unknown')}, "
-            f"apps: {len(app_ids)} — {app_ids[:5]}{'...' if len(app_ids) > 5 else ''})"
-        )
-
-    # ── App summary — show QM connections and direction ───────────────────
-    app_groups = {}
+    # ── Coupling summary (apps → QM counts) ───────────────────────────────
+    app_qm_map = {}
+    app_qm_counts = {}
     for row in app_list:
         aid = row["app_id"]
-        if aid not in app_groups:
-            app_groups[aid] = {
-                "app_name": row.get("app_name", aid),
-                "qm_ids": set(),
-                "directions": set(),
-                "queues": [],
-            }
-        app_groups[aid]["qm_ids"].add(row.get("qm_id", ""))
-        app_groups[aid]["directions"].add(row.get("direction", "UNKNOWN"))
-        if row.get("queue_id"):
-            app_groups[aid]["queues"].append(row.get("queue_id", ""))
+        qm = row.get("qm_id", "")
+        app_qm_map.setdefault(aid, set()).add(qm)
+        key = (aid, qm)
+        app_qm_counts[key] = app_qm_counts.get(key, 0) + 1
 
-    app_lines = []
-    for aid, info in app_groups.items():
-        violation_flag = " ⚠ MULTI-QM VIOLATION" if len(info["qm_ids"]) > 1 else ""
-        app_lines.append(
-            f"  - {aid} ({info['app_name']}): "
-            f"QMs={sorted(info['qm_ids'])}, "
-            f"direction={','.join(info['directions'])}, "
-            f"queues={info['queues'][:3]}{violation_flag}"
+    coupling_lines = []
+    multi_qm_apps = sorted(
+        [(aid, qms) for aid, qms in app_qm_map.items() if len(qms) > 1],
+        key=lambda x: -len(x[1])
+    )
+    for aid, qms in multi_qm_apps[:20]:
+        qm_scores = {qm: app_qm_counts.get((aid, qm), 0) for qm in qms}
+        best_qm = max(qm_scores, key=qm_scores.get)
+        coupling_lines.append(
+            f"  {aid}: {len(qms)} QMs, best={best_qm}({qm_scores[best_qm]}), "
+            f"others=[{', '.join(sorted(qms - {best_qm})[:4])}]"
         )
+    if len(multi_qm_apps) > 20:
+        coupling_lines.append(f"  ... and {len(multi_qm_apps) - 20} more")
+    if not coupling_lines:
+        coupling_lines = ["  None — all apps already on single QMs"]
 
-    # ── Channel summary ───────────────────────────────────────────────────
-    channels = raw_data.get("channels", [])
-    ch_lines = []
-    for ch in channels:
-        ch_lines.append(
-            f"  - {ch.get('channel_name', '?')}: "
-            f"{ch.get('from_qm', '?')}→{ch.get('to_qm', '?')} "
-            f"type={ch.get('channel_type', '?')} "
-            f"status={ch.get('status', 'unknown')}"
-        )
+    # ── QM load distribution ──────────────────────────────────────────────
+    qm_app_sets = {}
+    for row in app_list:
+        qm_app_sets.setdefault(row.get("qm_id", ""), set()).add(row["app_id"])
 
-    # ── Queue summary ─────────────────────────────────────────────────────
-    queues = raw_data.get("queues", [])
-    q_lines = []
-    for q in queues[:20]:  # Cap to avoid token overflow
-        q_lines.append(
-            f"  - {q.get('queue_name', '?')} on {q.get('qm_id', '?')} "
-            f"type={q.get('queue_type', '?')} usage={q.get('usage', 'NORMAL')}"
+    qm_region_map = {qm["qm_id"]: qm.get("region", "?") for qm in qm_list}
+
+    qm_load_lines = []
+    for qm_id, apps in sorted(qm_app_sets.items(), key=lambda x: -len(x[1]))[:12]:
+        qm_load_lines.append(
+            f"  {qm_id}: {len(apps)} apps, region={qm_region_map.get(qm_id, '?')}"
         )
-    if len(queues) > 20:
-        q_lines.append(f"  ... and {len(queues) - 20} more queues")
+    if len(qm_app_sets) > 12:
+        qm_load_lines.append(f"  ... and {len(qm_app_sets) - 12} more QMs")
+
+    # ── Producer→Consumer flow summary ────────────────────────────────────
+    queue_prod = {}
+    queue_cons = {}
+    for row in app_list:
+        aid = row["app_id"]
+        d = row.get("direction", "UNKNOWN").upper()
+        qname = row.get("queue_name", "")
+        if not qname:
+            continue
+        if d in ("PUT", "PRODUCER"):
+            queue_prod.setdefault(qname, set()).add(aid)
+        elif d in ("GET", "CONSUMER"):
+            queue_cons.setdefault(qname, set()).add(aid)
+
+    flow_pairs = set()
+    total_flows = 0
+    for qname in set(queue_prod.keys()) & set(queue_cons.keys()):
+        for p in queue_prod[qname]:
+            for c in queue_cons[qname]:
+                if p != c:
+                    flow_pairs.add((p, c))
+                    total_flows += 1
+
+    app_fanout = Counter()
+    for p, _ in flow_pairs:
+        app_fanout[p] += 1
+    flow_lines = []
+    for aid, count in app_fanout.most_common(10):
+        flow_lines.append(f"  {aid}: → {count} consumers")
+    if len(app_fanout) > 10:
+        flow_lines.append(f"  ... and {len(app_fanout) - 10} more producers")
+    if not flow_lines:
+        flow_lines = ["  No producer→consumer flows detected"]
+
+    # ── Regional distribution ─────────────────────────────────────────────
+    region_app_count = Counter()
+    for qm in qm_list:
+        r = qm.get("region", "UNKNOWN")
+        n_apps = len(qm_app_sets.get(qm["qm_id"], set()))
+        region_app_count[r] += n_apps
+    region_lines = [f"  {r}: {c} app connections" for r, c in region_app_count.most_common()]
+    if not region_lines:
+        region_lines = ["  No regional data"]
+
+    # ── Queue type counts ─────────────────────────────────────────────────
+    q_types = Counter(q.get("queue_type", "UNKNOWN") for q in queue_list)
 
     # ── Violations ────────────────────────────────────────────────────────
     v_lines = []
     if violations:
         multi_qm = violations.get("multi_qm_apps", [])
         if multi_qm:
-            for v in multi_qm:
-                v_lines.append(
-                    f"  - MULTI_QM_APP: {v['app']} connects to {len(v['qms'])} QMs: {v['qms']}"
-                )
+            v_lines.append(
+                f"  MULTI_QM_APPS: {len(multi_qm)} apps on multiple QMs "
+                f"(worst: {multi_qm[0]['app']} on {len(multi_qm[0]['qms'])} QMs)"
+            )
         orphans = violations.get("orphan_qms", [])
         if orphans:
-            v_lines.append(f"  - ORPHAN_QMS: {orphans}")
+            v_lines.append(f"  ORPHAN_QMS: {len(orphans)} — {orphans[:5]}")
+        shared = violations.get("shared_qms", {})
+        if shared:
+            worst_shared = max(shared.items(), key=lambda x: x[1])
+            v_lines.append(
+                f"  SHARED_QMS: {len(shared)} QMs host multiple apps "
+                f"(worst: {worst_shared[0]} with {worst_shared[1]} apps)"
+            )
         stopped = violations.get("stopped_channels", [])
         if stopped:
-            v_lines.append(f"  - STOPPED_CHANNELS: {stopped}")
+            v_lines.append(f"  STOPPED_CHANNELS: {len(stopped)}")
     if not v_lines:
         v_lines = ["  None detected"]
 
-    # ── Human feedback (for reject-and-redo loops) ────────────────────────
+    # ── Human feedback ────────────────────────────────────────────────────
     feedback = state.get("human_feedback", "")
     feedback_section = ""
     if feedback:
@@ -227,19 +295,29 @@ def build_architect_prompt(state: dict) -> str:
 
     return USER_PROMPT_TEMPLATE.format(
         num_qms=len(qm_list),
-        qm_summary="\n".join(qm_lines) if qm_lines else "  (none)",
-        num_apps=len(app_groups),
-        app_summary="\n".join(app_lines) if app_lines else "  (none)",
-        num_channels=len(channels),
-        channel_summary="\n".join(ch_lines) if ch_lines else "  (none)",
-        num_queues=len(queues),
-        queue_summary="\n".join(q_lines) if q_lines else "  (none)",
+        num_apps=len(app_qm_map),
+        num_queues=len(queue_list),
+        num_local=q_types.get("LOCAL", 0),
+        num_remote=q_types.get("REMOTE", 0),
+        num_alias=q_types.get("ALIAS", 0),
+        num_channels=len(channel_list),
+        num_flows=total_flows,
+        num_flow_pairs=len(flow_pairs),
+        coupling_summary="\n".join(coupling_lines),
+        qm_load_summary="\n".join(qm_load_lines),
+        flow_summary="\n".join(flow_lines),
+        region_summary="\n".join(region_lines),
         violations_list="\n".join(v_lines),
         as_is_score=metrics.get("total_score", "N/A"),
-        cc_score=metrics.get("channel_count", "N/A"),
-        ci_score=metrics.get("coupling_index", "N/A"),
-        rd_score=metrics.get("routing_depth", "N/A"),
-        fo_score=metrics.get("fan_out_score", "N/A"),
-        oo_score=metrics.get("orphan_objects", "N/A"),
+        cc_raw=metrics.get("channel_count", "N/A"),
+        cc_score=factor_scores.get("cc_weighted", "N/A"),
+        ci_raw=metrics.get("coupling_index", "N/A"),
+        ci_score=factor_scores.get("ci_weighted", "N/A"),
+        rd_raw=metrics.get("routing_depth", "N/A"),
+        rd_score=factor_scores.get("rd_weighted", "N/A"),
+        fo_raw=metrics.get("fan_out_score", "N/A"),
+        fo_score=factor_scores.get("fo_weighted", "N/A"),
+        oo_raw=metrics.get("orphan_objects", "N/A"),
+        oo_score=factor_scores.get("oo_weighted", "N/A"),
         human_feedback_section=feedback_section,
     )
