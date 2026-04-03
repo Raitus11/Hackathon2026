@@ -1,6 +1,6 @@
 """
 main.py
-FastAPI server — MQ-TITAN pipeline with human review gate.
+FastAPI server — IntelliAI pipeline with human review gate.
 
 Flow:
   POST /api/upload (single .xlsx/.csv file — PRIMARY mode)
@@ -27,7 +27,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, List
 
-from backend.orchestration.workflow import mq_titan_workflow, mq_titan_revise_workflow
+from backend.orchestration.workflow import intelli_ai_workflow, intelli_ai_revise_workflow
 from backend.agents.agents import provisioner_agent, migration_planner_agent, doc_expert_agent
 from backend.graph.mq_graph import graph_to_dict, sanitise
 from backend.llm.llm_client import call_llm_chat
@@ -36,7 +36,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="MQ-TITAN API",
+    title="IntelliAI API",
     description="MQ Topology Intelligence & Transformation Agent Network",
     version="3.0.0",
 )
@@ -111,6 +111,12 @@ def _build_response(session_id: str, result: dict) -> dict:
         "topology_diff":         result.get("topology_diff"),
         "as_is_subgraphs":      result.get("as_is_subgraphs", []),
         "target_subgraphs":     result.get("target_subgraphs", []),
+        "as_is_communities":    result.get("as_is_communities", {}),
+        "target_communities":   result.get("target_communities", {}),
+        "as_is_centrality":     result.get("as_is_centrality", {}),
+        "target_centrality":    result.get("target_centrality", {}),
+        "as_is_entropy":        result.get("as_is_entropy", {}),
+        "target_entropy":       result.get("target_entropy", {}),
     })
 
 
@@ -129,7 +135,7 @@ def _run_pipeline(session_id: str, csv_paths: dict) -> dict:
     }
 
     # Limit recursion: 7 linear agents + 3 retry cycles × 3 agents + review + outputs = ~25 max
-    result = mq_titan_workflow.invoke(
+    result = intelli_ai_workflow.invoke(
         initial_state,
         config={"recursion_limit": 50},
     )
@@ -153,7 +159,7 @@ def _calc_reduction(result: dict) -> dict:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "MQ-TITAN", "version": "3.0.0"}
+    return {"status": "ok", "service": "IntelliAI", "version": "3.0.0"}
 
 
 @app.post("/api/upload")
@@ -244,6 +250,15 @@ def get_pending_review(session_id: str):
         "architect_method":      result.get("architect_method"),
         "as_is_graph":           graph_to_dict(result["as_is_graph"])     if result.get("as_is_graph")     else {},
         "target_graph":          graph_to_dict(result["optimised_graph"]) if result.get("optimised_graph") else {},
+        "as_is_subgraphs":      result.get("as_is_subgraphs", []),
+        "target_subgraphs":     result.get("target_subgraphs", []),
+        "as_is_centrality":     result.get("as_is_centrality", {}),
+        "target_centrality":    result.get("target_centrality", {}),
+        "as_is_entropy":        result.get("as_is_entropy", {}),
+        "target_entropy":       result.get("target_entropy", {}),
+        "as_is_communities":    result.get("as_is_communities", {}),
+        "target_communities":   result.get("target_communities", {}),
+        "topology_diff":        result.get("topology_diff", {}),
     })
 
 
@@ -287,7 +302,7 @@ def submit_review(session_id: str, decision: ReviewDecision):
         else:
             # Revise: run architect → optimizer → tester → human_review via LangGraph
             # Skips supervisor/sanitiser/researcher/analyst (data unchanged)
-            result = mq_titan_revise_workflow.invoke(
+            result = intelli_ai_revise_workflow.invoke(
                 result,
                 config={"recursion_limit": 50},
             )
@@ -329,7 +344,7 @@ def download_target_csv(session_id: str, csv_name: str):
 
 # ── Chat with Architect AI ───────────────────────────────────────────────────
 
-CHAT_SYSTEM_PROMPT = """You are the MQ-TITAN Architect AI. You designed the proposed target state for an IBM MQ topology.
+CHAT_SYSTEM_PROMPT = """You are the IntelliAI Architect AI. You designed the proposed target state for an IBM MQ topology.
 The human reviewer is asking you questions about your design decisions before approving or requesting changes.
 
 Answer concisely and specifically. Reference actual QM names, app IDs, and channel names from the topology.

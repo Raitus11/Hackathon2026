@@ -146,5 +146,10 @@ def build_revise_workflow() -> StateGraph:
 
 
 # Compile both workflows at import time
-mq_titan_workflow = build_workflow()
-mq_titan_revise_workflow = build_revise_workflow()
+# Exported names match main.py imports
+intelli_ai_workflow = build_workflow()
+intelli_ai_revise_workflow = build_revise_workflow()
+
+# Legacy aliases (backward compatibility)
+mq_titan_workflow = intelli_ai_workflow
+mq_titan_revise_workflow = intelli_ai_revise_workflow
