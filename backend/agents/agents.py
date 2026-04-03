@@ -1494,12 +1494,10 @@ def tester_agent(state: dict) -> dict:
             })
 
     # ── V-008: No isolated QMs with apps ─────────────────────────────────
-    # A QM with apps but zero channels MAY be legitimate if that app only
-    # communicates locally (no cross-QM producer-consumer flows).
-    # We flag as WARNING (not CRITICAL) because the 1:1 constraint can
-    # create QMs for apps that are pure-local or only talk to co-located
-    # queues. The architect/optimizer already derive channels from actual
-    # flows — if no channel exists, it means no cross-QM flow was found.
+    # Every QM that has apps AND other QMs also have apps MUST have at least
+    # one channel (inbound or outbound) connecting it to the rest of the topology.
+    # A QM with apps but zero channels is disconnected — its apps can't
+    # communicate with anything outside that QM.
     if len(qms_with_apps) > 1:
         for qm in qm_nodes:
             if qm not in qms_with_apps:
@@ -1517,8 +1515,8 @@ def tester_agent(state: dict) -> dict:
                 violations.append({
                     "rule": "ISOLATED_QM",
                     "entity": qm,
-                    "detail": f"QM {qm} has apps {apps_on_qm} but zero channels — app may only communicate locally (no cross-QM flows found in source data)",
-                    "severity": "WARNING",
+                    "detail": f"QM {qm} has apps {apps_on_qm} but zero channels — apps are completely disconnected from the topology",
+                    "severity": "CRITICAL",
                 })
 
     passed = not any(v["severity"] == "CRITICAL" for v in violations)
@@ -2994,54 +2992,150 @@ def _generate_insights_md(state: dict) -> str:
 
 ## Strategic Modernization Recommendation
 
-### Should You Migrate to Kafka or a Modern Pub-Sub System?
-
-Based on this topology analysis, here is a data-driven framework for evaluating IBM MQ vs. modern alternatives:
-
-**Stay on IBM MQ (simplified target state is correct) when:**
-- Guaranteed delivery and transactional message semantics are required
-- Applications are tightly coupled to MQ APIs (JMS/MQI)
-- Regulatory requirements mandate persistent, auditable message storage
-- Message fan-out is low (1:1 or 1:few producer-consumer relationships)
-
-**Migrate to Apache Kafka or a pub-sub model when:**
-- **High fan-out patterns**: If a single producer publishes to >10 consumers, MQ point-to-point channels create O(N) connections per producer. Kafka's topic model serves all consumers from a single stream.
-- **Event streaming vs. command messaging**: If messages represent events (things that happened) rather than commands (requests for action), Kafka's log-based retention is architecturally superior.
-- **Real-time analytics**: If consumers include analytics, dashboards, or ML pipelines, Kafka Connect + ksqlDB eliminate intermediate ETL layers.
-- **High throughput**: Kafka throughput is orders of magnitude higher than MQ for streaming workloads.
-
-**Recommended hybrid migration path:**
-
-  Phase 1 (Now):   Implement simplified MQ target state (this deliverable)
-  Phase 2 (6-18m): Introduce Kafka as event backbone for high fan-out flows
-  Phase 3 (18m+):  Migrate event-driven workloads to Kafka; retain MQ for
-                   transactional, guaranteed-delivery command flows
+### Data-Driven Analysis: Should Specific Workloads Migrate to Kafka or Pub-Sub?
 
 """
-    # Data-driven Kafka signals from actual metrics
+    # ── Mine actual flow data for substantive claims ──────────────────────
+    raw_data = state.get("raw_data", {})
+    raw_apps = raw_data.get("applications", [])
+
+    # Build actual producer→consumer flow map from source data
+    queue_prod = {}  # {queue_name: set of producer app_ids}
+    queue_cons = {}  # {queue_name: set of consumer app_ids}
+    app_directions = {}  # {app_id: set of directions}
+    for row in raw_apps:
+        aid = row.get("app_id", "")
+        qname = row.get("queue_name", "")
+        direction = row.get("direction", "").upper()
+        if not qname or not aid:
+            continue
+        app_directions.setdefault(aid, set()).add(direction)
+        if direction in ("PUT", "PRODUCER"):
+            queue_prod.setdefault(qname, set()).add(aid)
+        elif direction in ("GET", "CONSUMER"):
+            queue_cons.setdefault(qname, set()).add(aid)
+
+    # Compute per-producer fan-out: how many distinct consumers does each producer reach?
+    producer_fanout = {}  # {producer_app: set of consumer_apps}
+    for qname in set(queue_prod.keys()) & set(queue_cons.keys()):
+        for prod in queue_prod[qname]:
+            for cons in queue_cons[qname]:
+                if prod != cons:
+                    producer_fanout.setdefault(prod, set()).add(cons)
+
+    # Compute per-queue fan-out: how many consumers per queue?
+    queue_fanout = {}
+    for qname, consumers in queue_cons.items():
+        producers = queue_prod.get(qname, set())
+        if producers:
+            queue_fanout[qname] = {"producers": len(producers), "consumers": len(consumers)}
+
+    # Identify high-fan-out queues (1 producer → many consumers)
+    high_fanout_queues = sorted(
+        [(q, d) for q, d in queue_fanout.items() if d["consumers"] > 3],
+        key=lambda x: -x[1]["consumers"]
+    )
+
+    # Identify high-fan-out producers
+    high_fanout_producers = sorted(
+        [(app, len(cons)) for app, cons in producer_fanout.items() if len(cons) > 5],
+        key=lambda x: -x[1]
+    )
+
+    # Count apps by role
+    pure_producers = set(a for a, dirs in app_directions.items() if dirs == {"PUT"} or dirs == {"PRODUCER"})
+    pure_consumers = set(a for a, dirs in app_directions.items() if dirs == {"GET"} or dirs == {"CONSUMER"})
+    bidirectional = set(app_directions.keys()) - pure_producers - pure_consumers
+
+    total_apps = len(app_directions)
+    total_queues_with_flows = len(set(queue_prod.keys()) & set(queue_cons.keys()))
+    total_flows = sum(len(cons) for cons in producer_fanout.values())
+
+    # Compute what % of flows are high-fan-out (>3 consumers)
+    high_fo_flows = sum(
+        d["producers"] * d["consumers"]
+        for _, d in queue_fanout.items()
+        if d["consumers"] > 3
+    )
+    high_fo_pct = round(high_fo_flows / total_flows * 100, 1) if total_flows > 0 else 0
+
     target_ch = target_metrics.get("channel_count", 0)
     as_is_ch = as_is_metrics.get("channel_count", 0)
     fo = as_is_metrics.get("fan_out_score", 0)
     ci = as_is_metrics.get("coupling_index", 1.0)
 
-    insights += "**Data-driven signals from this topology:**\n"
-    if fo > 5:
-        insights += f"- WARNING: Fan-out score of {fo} in source topology -- high fan-out is a strong Kafka migration signal.\n"
-    else:
-        insights += f"- OK: Fan-out score of {fo} is moderate -- MQ target state is appropriate for current workloads.\n"
+    insights += f"#### Flow Pattern Analysis (from {len(raw_apps)} source data rows)\n\n"
+    insights += f"| Metric | Value |\n|--------|-------|\n"
+    insights += f"| Total apps with identifiable flows | {total_apps} |\n"
+    insights += f"| Pure producers (PUT only) | {len(pure_producers)} ({round(len(pure_producers)/max(total_apps,1)*100)}%) |\n"
+    insights += f"| Pure consumers (GET only) | {len(pure_consumers)} ({round(len(pure_consumers)/max(total_apps,1)*100)}%) |\n"
+    insights += f"| Bidirectional apps (PUT + GET) | {len(bidirectional)} ({round(len(bidirectional)/max(total_apps,1)*100)}%) |\n"
+    insights += f"| Queues with active producer→consumer flows | {total_queues_with_flows} |\n"
+    insights += f"| Total producer→consumer flow pairs | {total_flows} |\n"
+    insights += f"| Flows involving high fan-out queues (>3 consumers) | {high_fo_flows} ({high_fo_pct}%) |\n\n"
 
-    if as_is_ch > 50:
-        insights += f"- WARNING: Source had {as_is_ch} channels -- Kafka topic consolidation would reduce broadcast channel overhead significantly.\n"
+    # High fan-out queues — the concrete Kafka candidates
+    if high_fanout_queues:
+        insights += f"#### High Fan-Out Queues — Kafka Migration Candidates\n\n"
+        insights += f"These {len(high_fanout_queues)} queues have 1-few producers broadcasting to many consumers. "
+        insights += f"In MQ, each consumer requires a dedicated REMOTE queue + XMITQ + channel on the producer's QM. "
+        insights += f"In Kafka, all consumers read from a single topic partition — eliminating the O(N) routing overhead.\n\n"
+        insights += f"| Queue | Producers | Consumers | MQ Objects Required | Kafka Equivalent |\n"
+        insights += f"|-------|-----------|-----------|--------------------|-----------------|\n"
+        for qname, d in high_fanout_queues[:10]:
+            mq_objects = d["producers"] * d["consumers"]  # REMOTE queues needed
+            insights += f"| `{qname[:40]}` | {d['producers']} | {d['consumers']} | {mq_objects} REMOTE Qs | 1 topic |\n"
+        if len(high_fanout_queues) > 10:
+            insights += f"| ... | | | | ({len(high_fanout_queues) - 10} more queues) |\n"
+        insights += f"\n"
     else:
-        insights += f"- OK: {target_ch} channels in target state is manageable within MQ. Kafka migration is optional.\n"
+        insights += f"#### Fan-Out Analysis\n\nNo queues with >3 consumers detected. "
+        insights += f"The topology is predominantly point-to-point, which is MQ's strength.\n\n"
 
-    if ci > 2.0:
-        insights += f"- WARNING: Coupling index of {round(ci,2)} indicates apps sharing many QMs -- this anti-pattern maps well to Kafka consumer groups.\n"
+    # High fan-out producers
+    if high_fanout_producers:
+        insights += f"#### High Fan-Out Producers — Apps Driving Routing Complexity\n\n"
+        insights += f"These producers each reach >5 distinct consumers across the topology. "
+        insights += f"Their QMs bear the heaviest REMOTE queue and XMITQ burden after 1:1 assignment.\n\n"
+        for app, count in high_fanout_producers[:8]:
+            insights += f"- `{app}` → **{count} consumers** (requires {count} REMOTE queues on its QM)\n"
+        if len(high_fanout_producers) > 8:
+            insights += f"- ... and {len(high_fanout_producers) - 8} more high-fan-out producers\n"
+        insights += f"\n"
+
+    # Concrete recommendation based on actual data
+    insights += f"#### Recommendation\n\n"
+
+    if high_fo_pct > 30 and len(high_fanout_queues) > 5:
+        insights += f"**STRONG SIGNAL for Kafka/pub-sub migration for specific workloads.**\n\n"
+        insights += f"- {high_fo_pct}% of message flows involve high-fan-out queues (>3 consumers per queue)\n"
+        insights += f"- {len(high_fanout_queues)} queues are broadcast-pattern candidates\n"
+        insights += f"- These queues alone generate ~{sum(d['producers']*d['consumers'] for _,d in high_fanout_queues)} REMOTE queue objects in the target state\n"
+        insights += f"- Migrating these to Kafka topics would eliminate this routing overhead entirely\n\n"
+        insights += f"**Recommended approach**: Implement the MQ target state first (this deliverable), then introduce Kafka as an event backbone for the {len(high_fanout_queues)} high-fan-out queues identified above. "
+        insights += f"Retain MQ for point-to-point, transactional, guaranteed-delivery flows.\n\n"
+    elif high_fo_pct > 10 or len(high_fanout_queues) > 2:
+        insights += f"**MODERATE SIGNAL — some workloads could benefit from pub-sub.**\n\n"
+        insights += f"- {high_fo_pct}% of flows involve high-fan-out patterns\n"
+        insights += f"- {len(high_fanout_queues)} queues show broadcast characteristics\n"
+        insights += f"- The MQ target state is the correct immediate action\n"
+        insights += f"- Consider Kafka for the top {min(len(high_fanout_queues), 5)} high-fan-out queues in a future phase\n\n"
     else:
-        insights += f"- OK: Coupling index of {round(ci,2)} is within acceptable bounds for MQ after simplification.\n"
+        insights += f"**NO SIGNAL for Kafka migration at this time.**\n\n"
+        insights += f"- Only {high_fo_pct}% of flows involve high-fan-out patterns\n"
+        insights += f"- The topology is predominantly point-to-point ({total_flows} flow pairs across {total_queues_with_flows} queues)\n"
+        insights += f"- MQ is the correct architecture for this workload profile\n"
+        insights += f"- The simplified target state eliminates {round(as_is_metrics.get('total_score',0) - target_metrics.get('total_score',0), 1)} points of complexity while preserving all message flows\n\n"
 
-    insights += """
-**Bottom line**: The simplified MQ target state in this deliverable is the correct immediate action. It eliminates unnecessary complexity, enforces clear ownership, and makes the environment automation-ready. For workloads exhibiting high fan-out or event-streaming patterns (visible in the subgraph analysis above), a phased Kafka introduction is the recommended medium-term strategic investment.
+    insights += f"""
+### Complexity Metrics Supporting This Recommendation
+
+| Metric | As-Is | Target | Change |
+|--------|-------|--------|--------|
+| Channel Count | {as_is_ch} | {target_ch} | {as_is_ch - target_ch:+d} |
+| Coupling Index | {ci} | {target_metrics.get('coupling_index', 'N/A')} | {'Improved' if ci > 1.0 else 'Same'} |
+| Fan-Out Score | {fo} | {target_metrics.get('fan_out_score', 'N/A')} | {fo - target_metrics.get('fan_out_score', fo):+.0f} |
+| Max REMOTE Qs per QM | {max((d['producers']*d['consumers'] for _,d in queue_fanout.items()), default=0)} | — | Driven by fan-out |
 
 ---
 *Generated by IntelliAI -- IBM MQ Hackathon 2026*

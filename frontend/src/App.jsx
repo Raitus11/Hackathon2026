@@ -239,16 +239,19 @@ function EmptyState({ icon = "◇", message }) {
   );
 }
 
+
 function CollapsibleSection({ title, icon, color = T.cyan, count, subtitle, defaultOpen = false, delay = 0, children }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
     <Card style={{ marginBottom: 12 }} glow={open ? color : undefined} delay={delay}>
-      <div onClick={() => setOpen(!open)} style={{
-        padding: "14px 16px", cursor: "pointer",
-        display: "flex", alignItems: "center", gap: 12,
-        background: open ? `${color}08` : "transparent",
-        transition: "background 0.2s",
-      }}
+      <div
+        onClick={() => setOpen(!open)}
+        style={{
+          padding: "14px 16px", cursor: "pointer",
+          display: "flex", alignItems: "center", gap: 12,
+          background: open ? `${color}08` : "transparent",
+          transition: "background 0.2s",
+        }}
         onMouseEnter={e => { if (!open) e.currentTarget.style.background = `${T.bg3}40`; }}
         onMouseLeave={e => { if (!open) e.currentTarget.style.background = open ? `${color}08` : "transparent"; }}
       >
@@ -256,7 +259,7 @@ function CollapsibleSection({ title, icon, color = T.cyan, count, subtitle, defa
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <span style={{ fontSize: 13, fontWeight: 600, color: T.t1 }}>{title}</span>
-            {count != null && <Badge color={color} style={{ fontSize: 9 }}>{count}</Badge>}
+            {count != null && <Badge color={color} style={{ fontSize: 9 }}>{count} {count === 1 ? "file" : "files"}</Badge>}
           </div>
           {subtitle && <div style={{ fontSize: 11, color: T.t3, marginTop: 2 }}>{subtitle}</div>}
         </div>
@@ -367,8 +370,8 @@ function TopologyGraph({ graphData, title, height = 360, badge, showQueues = fal
     });
 
     // ── Choose layout strategy ─────────────────────────────────────────
-    // Small filtered subgraph (≤15 QMs) → flow layout showing message paths
-    // Full target graph → radial concentric rings
+    // Filtered subgraph (app trace active) → flow layout (detailed MQ objects)
+    // Full (unfiltered) target graph → radial concentric rings
     // AS-IS → dense force directed
     const qmCount = nodes.filter(n => n.type === "qm").length;
     const isFiltered = /—|FILTERED/i.test(title || "");
@@ -448,8 +451,7 @@ function drawAsIsForce(g, nodes, edges, w, h, svg, zoom, title, showQueues) {
     .stop();
 
   // Run simulation synchronously for instant render
-  // Reduce iterations for very large graphs to prevent UI freeze
-  const iterations = nodeCount > 600 ? 80 : nodeCount > 400 ? 100 : nodeCount > 200 ? 150 : 250;
+  const iterations = nodeCount > 200 ? 150 : 250;
   for (let i = 0; i < iterations; i++) sim.tick();
 
   // ── Draw edges ─────────────────────────────────────────────────────
@@ -803,10 +805,12 @@ function drawTargetFlow(g, nodes, edges, w, h, svg, zoom, title, showQueues) {
   });
 
   // ── Layout: vertical columns per QM ────────────────────────────────
-  // Each QM gets a column: [App] → [QM] → [queues below]
-  // Channels connect QMs horizontally
-  const colWidth = Math.max(120, Math.min(200, (w - 60) / Math.max(qmNodes.length, 1)));
-  const startX = 40;
+  const qmCount = qmNodes.length;
+  const isLargeFlow = qmCount > 15;
+  const colWidth = isLargeFlow
+    ? Math.max(80, Math.min(140, (w - 40) / Math.max(qmCount, 1)))
+    : Math.max(120, Math.min(200, (w - 60) / Math.max(qmCount, 1)));
+  const startX = isLargeFlow ? 20 : 40;
   const qmY = h * 0.35;
   const appY = h * 0.12;
 
@@ -1836,36 +1840,45 @@ export default function App() {
                         {result.topology_diff.qms_removed?.length > 0 && (
                           <div>
                             <div style={{ fontSize: 10, fontWeight: 600, color: T.red, fontFamily: T.fontMono, marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.06em" }}>QMs Removed</div>
-                            {result.topology_diff.qms_removed.map(qm => (
+                            {result.topology_diff.qms_removed.slice(0, 8).map(qm => (
                               <div key={qm} style={{ fontSize: 12, color: T.t2, padding: "3px 0", fontFamily: T.fontMono }}>{qm}</div>
                             ))}
+                            {result.topology_diff.qms_removed.length > 8 && (
+                              <div style={{ fontSize: 11, color: T.t4, fontStyle: "italic", paddingTop: 4 }}>+{result.topology_diff.qms_removed.length - 8} more</div>
+                            )}
                           </div>
                         )}
                         {result.topology_diff.apps_reassigned?.length > 0 && (
                           <div>
                             <div style={{ fontSize: 10, fontWeight: 600, color: T.amber, fontFamily: T.fontMono, marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.06em" }}>Apps Reassigned</div>
-                            {result.topology_diff.apps_reassigned.map((a, i) => (
+                            {result.topology_diff.apps_reassigned.slice(0, 8).map((a, i) => (
                               <div key={i} style={{ fontSize: 11, color: T.t2, padding: "3px 0", fontFamily: T.fontMono }}>
                                 {a.app_id}: <span style={{ color: T.red }}>{a.old_qm}</span> → <span style={{ color: T.green }}>{a.new_qm}</span>
                               </div>
                             ))}
+                            {result.topology_diff.apps_reassigned.length > 8 && (
+                              <div style={{ fontSize: 11, color: T.t4, fontStyle: "italic", paddingTop: 4 }}>+{result.topology_diff.apps_reassigned.length - 8} more</div>
+                            )}
                           </div>
                         )}
                         {result.topology_diff.channels_added?.length > 0 && (
                           <div>
                             <div style={{ fontSize: 10, fontWeight: 600, color: T.green, fontFamily: T.fontMono, marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.06em" }}>Channels Added</div>
-                            {result.topology_diff.channels_added.map((ch, i) => (
+                            {result.topology_diff.channels_added.slice(0, 8).map((ch, i) => (
                               <div key={i} style={{ fontSize: 11, color: T.t2, padding: "3px 0", fontFamily: T.fontMono }}>
                                 {ch[0]} → {ch[1]}
                               </div>
                             ))}
+                            {result.topology_diff.channels_added.length > 8 && (
+                              <div style={{ fontSize: 11, color: T.t4, fontStyle: "italic", paddingTop: 4 }}>+{result.topology_diff.channels_added.length - 8} more</div>
+                            )}
                           </div>
                         )}
                       </div>
                     </Card>
                   )}
 
-                  {/* Phase timeline */}
+                  {/* Phase summary cards */}
                   <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: 20 }}>
                     {["CREATE", "REROUTE", "DRAIN", "CLEANUP"].map((phase, i) => {
                       const steps = result.migration_plan.phases?.[phase] || [];
@@ -1883,20 +1896,44 @@ export default function App() {
                     })}
                   </div>
 
-                  {/* Steps list */}
-                  <Card delay={0.3}>
-                    <CardHeader right={
-                      <DownloadButton label="Download Plan" onClick={() => {
-                        const text = result.migration_plan.steps?.map(s =>
-                          `Step ${s.step_number} [${s.phase}] — ${s.description}\nTarget: ${s.target_qm}\nForward MQSC:\n${s.mqsc_forward || "N/A"}\nRollback MQSC:\n${s.mqsc_rollback || "N/A"}\nVerification:\n${s.verification || "N/A"}\n${"─".repeat(60)}`
-                        ).join("\n\n") || "No steps";
-                        downloadFile(text, "migration_plan.txt");
-                      }} />
-                    }>Migration Steps</CardHeader>
-                    {result.migration_plan.steps?.map((step, i) => (
-                      <MigrationStep key={i} step={step} delay={0.03 * i} />
-                    ))}
-                  </Card>
+                  {/* Download button */}
+                  <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 16 }}>
+                    <DownloadButton label="Download Full Plan" onClick={() => {
+                      const text = result.migration_plan.steps?.map(s =>
+                        `Step ${s.step_number} [${s.phase}] — ${s.description}\nTarget: ${s.target_qm}\nForward MQSC:\n${s.mqsc_forward || "N/A"}\nRollback MQSC:\n${s.mqsc_rollback || "N/A"}\nVerification:\n${s.verification || "N/A"}\n${"─".repeat(60)}`
+                      ).join("\n\n") || "No steps";
+                      downloadFile(text, "migration_plan.txt");
+                    }} />
+                  </div>
+
+                  {/* Steps grouped by phase in collapsible panels */}
+                  {["CREATE", "REROUTE", "DRAIN", "CLEANUP"].map((phase, pi) => {
+                    const steps = result.migration_plan.phases?.[phase] || [];
+                    if (steps.length === 0) return null;
+                    const ps = PHASE_STYLES[phase];
+                    const phaseDesc = {
+                      CREATE: "Provision new queue managers, channels, and routing infrastructure",
+                      REROUTE: "Migrate applications to their new dedicated queue managers",
+                      DRAIN: "Wait for in-flight messages to complete on old transmission queues",
+                      CLEANUP: "Decommission old channels, queues, and orphan queue managers",
+                    };
+                    return (
+                      <CollapsibleSection
+                        key={phase}
+                        title={`Phase ${pi + 1}: ${phase}`}
+                        icon={ps.icon}
+                        color={ps.color}
+                        count={steps.length}
+                        subtitle={phaseDesc[phase]}
+                        defaultOpen={pi === 0}
+                        delay={0.15 * pi}
+                      >
+                        {steps.map((step, i) => (
+                          <MigrationStep key={i} step={step} delay={0.02 * i} />
+                        ))}
+                      </CollapsibleSection>
+                    );
+                  })}
                 </>
               ) : (
                 <EmptyState icon="⇄" message={
@@ -1950,35 +1987,185 @@ export default function App() {
             <div style={{ animation: "fadeUp 0.4s ease-out" }}>
               <div style={{ marginBottom: 20 }}>
                 <h2 style={{ fontSize: 16, fontWeight: 600, fontFamily: T.fontDisplay, color: T.t1, marginBottom: 4 }}>
-                  Target State CSVs
+                  Deliverables & Downloads
                 </h2>
-                <p style={{ fontSize: 12, color: T.t3 }}>Same format as input — ready to feed into any provisioning tool or re-analyse.</p>
+                <p style={{ fontSize: 12, color: T.t3 }}>All generated files grouped by category. Click a section to expand.</p>
               </div>
+
               {result.target_csvs && Object.keys(result.target_csvs).length > 0
-                ? Object.entries(result.target_csvs).map(([name, content], idx) => {
-                    const rows = content.trim().split("\n").length - 1;
+                ? (() => {
+                    const csvs = result.target_csvs;
+
+                    // ── KEY DELIVERABLES — highlighted hero cards ──────────────
+                    const keyFiles = [
+                      {
+                        key: "MQ_Raw_Data_Target",
+                        title: "MQ_Raw_Data_Target.csv",
+                        subtitle: "Same 29 columns as input — re-upload to verify score drops",
+                        desc: "The primary deliverable. Identical structure to the uploaded CSV but reflecting the optimised 1:1 target state. Feed it back into IntelliAI or any provisioning tool.",
+                        icon: "⊞",
+                        color: T.cyan,
+                        ext: ".csv",
+                        mime: "text/csv",
+                        badge: "PRIMARY OUTPUT",
+                      },
+                      {
+                        key: "target-topology",
+                        title: "target-topology.json",
+                        subtitle: "Structured JSON — machine-readable target state",
+                        desc: "Full target topology with queue managers, channels, applications, and queue objects. Schema designed for automation-first provisioning.",
+                        icon: "◇",
+                        color: T.green,
+                        ext: ".json",
+                        mime: "application/json",
+                        badge: "JSON TOPOLOGY",
+                      },
+                      {
+                        key: "insights",
+                        title: "insights.md",
+                        subtitle: "Strategic recommendation — MQ vs Kafka migration framework",
+                        desc: "Non-obvious findings from both source and target topologies. Includes data-driven Kafka migration signals based on actual fan-out, coupling, and channel metrics.",
+                        icon: "◈",
+                        color: T.amber,
+                        ext: ".md",
+                        mime: "text/markdown",
+                        badge: "STRATEGIC INSIGHTS",
+                      },
+                    ];
+
+                    // ── Group remaining files ─────────────────────────────────
+                    const heroKeys = new Set(keyFiles.map(f => f.key));
+                    const entries = Object.entries(csvs).filter(([name]) => !heroKeys.has(name));
+                    const groups = {
+                      "Other Target Data": { icon: "◇", color: T.cyan, files: [] },
+                      "Analysis & Documentation": { icon: "◈", color: T.green, files: [] },
+                      "MQSC Scripts": { icon: "▸", color: T.amber, files: [] },
+                    };
+                    entries.forEach(([name, content]) => {
+                      if (name.startsWith("mqsc_")) {
+                        groups["MQSC Scripts"].files.push([name, content]);
+                      } else if (["target_queue_managers", "target_channels", "target_queues", "target_applications"].includes(name)) {
+                        groups["Other Target Data"].files.push([name, content]);
+                      } else {
+                        groups["Analysis & Documentation"].files.push([name, content]);
+                      }
+                    });
+
                     return (
-                      <Card key={name} delay={0.1 * idx} style={{ marginBottom: 12 }}>
-                        <CardHeader right={
-                          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                            <Badge color={T.t3}>{rows} rows</Badge>
-                            <DownloadButton label="Download" onClick={() => downloadFile(content, name + ".csv", "text/csv")} />
-                          </div>
-                        }>
-                          <span style={{ fontFamily: T.fontMono }}>{name}.csv</span>
-                        </CardHeader>
-                        <pre style={{
-                          padding: "12px 16px", margin: 0,
-                          fontSize: 10, fontFamily: T.fontMono,
-                          color: T.t3, lineHeight: 1.6,
-                          overflowX: "auto", maxHeight: 140,
-                        }}>
-{content.trim().split("\n").slice(0, 6).join("\n")}
-{content.trim().split("\n").length > 6 ? `\n... (${content.trim().split("\n").length - 6} more rows)` : ""}
-                        </pre>
-                      </Card>
+                      <>
+                        {/* ── HERO CARDS for 3 key deliverables ── */}
+                        <SectionTitle delay={0}>Key Deliverables</SectionTitle>
+                        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 14, marginBottom: 28 }}>
+                          {keyFiles.map((f, i) => {
+                            const content = csvs[f.key];
+                            if (!content) return (
+                              <Card key={f.key} delay={0.1 * i} style={{ opacity: 0.5 }}>
+                                <div style={{ padding: "20px 16px", textAlign: "center" }}>
+                                  <div style={{ fontSize: 24, color: T.t4, marginBottom: 8 }}>{f.icon}</div>
+                                  <div style={{ fontSize: 12, fontWeight: 600, color: T.t4 }}>{f.title}</div>
+                                  <div style={{ fontSize: 10, color: T.t4, marginTop: 4 }}>Not yet generated — approve design first</div>
+                                </div>
+                              </Card>
+                            );
+                            const lines = content.trim().split("\n");
+                            const isJson = content.trim().startsWith("{") || content.trim().startsWith("[");
+                            const rowCount = isJson ? null : lines.length - 1;
+                            return (
+                              <Card key={f.key} glow={f.color} delay={0.1 * i}>
+                                <div style={{
+                                  padding: "4px 16px 4px",
+                                  background: `${f.color}08`,
+                                  borderBottom: `1px solid ${f.color}20`,
+                                  display: "flex", alignItems: "center", justifyContent: "space-between",
+                                }}>
+                                  <Badge color={f.color} style={{ fontSize: 8, fontWeight: 700 }}>{f.badge}</Badge>
+                                  <span style={{ fontSize: 9, color: T.t4, fontFamily: T.fontMono }}>{f.ext}</span>
+                                </div>
+                                <div style={{ padding: "16px" }}>
+                                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                                    <span style={{ fontSize: 18, color: f.color }}>{f.icon}</span>
+                                    <div>
+                                      <div style={{ fontSize: 13, fontWeight: 600, fontFamily: T.fontMono, color: T.t1 }}>{f.title}</div>
+                                      <div style={{ fontSize: 10, color: T.t3, marginTop: 2 }}>{f.subtitle}</div>
+                                    </div>
+                                  </div>
+                                  <p style={{ fontSize: 11, color: T.t3, lineHeight: 1.6, margin: "10px 0 14px" }}>{f.desc}</p>
+                                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                                    <div style={{ display: "flex", gap: 6 }}>
+                                      {rowCount != null && <Badge color={T.t3} style={{ fontSize: 9 }}>{rowCount} rows</Badge>}
+                                      <Badge color={T.t3} style={{ fontSize: 9 }}>{(content.length / 1024).toFixed(1)} KB</Badge>
+                                    </div>
+                                    <DownloadButton label="Download" onClick={() => downloadFile(content, f.title, f.mime)} />
+                                  </div>
+                                </div>
+                                {/* Preview */}
+                                <div style={{ borderTop: `1px solid ${T.border0}` }}>
+                                  <pre style={{
+                                    padding: "10px 16px", margin: 0,
+                                    fontSize: 9, fontFamily: T.fontMono,
+                                    color: T.t4, lineHeight: 1.5,
+                                    overflowX: "auto", maxHeight: 80,
+                                  }}>
+{lines.slice(0, 4).join("\n")}
+{lines.length > 4 ? "\n…" : ""}
+                                  </pre>
+                                </div>
+                              </Card>
+                            );
+                          })}
+                        </div>
+
+                        {/* ── GROUPED SECTIONS for remaining files ── */}
+                        <SectionTitle delay={0.3}>All Files</SectionTitle>
+                        {Object.entries(groups).map(([groupName, group], gi) => {
+                          if (group.files.length === 0) return null;
+                          return (
+                            <CollapsibleSection
+                              key={groupName}
+                              title={groupName}
+                              icon={group.icon}
+                              color={group.color}
+                              count={group.files.length}
+                              defaultOpen={gi === 0}
+                              delay={0.35 + 0.1 * gi}
+                            >
+                              {group.files.map(([name, content], idx) => {
+                                const isJson = content.trim().startsWith("{") || content.trim().startsWith("[");
+                                const ext = isJson ? ".json" : name.startsWith("mqsc_") ? ".mqsc" : ".csv";
+                                const mime = isJson ? "application/json" : "text/csv";
+                                const lines = content.trim().split("\n");
+                                const rowCount = isJson ? null : lines.length - 1;
+                                const displayName = name.startsWith("mqsc_") ? name.replace("mqsc_", "") + " (MQSC)" : name;
+                                return (
+                                  <div key={name} style={{
+                                    padding: "12px 16px",
+                                    borderBottom: idx < group.files.length - 1 ? `1px solid ${T.border0}` : "none",
+                                    display: "flex", alignItems: "center", justifyContent: "space-between",
+                                    gap: 12,
+                                  }}>
+                                    <div style={{ flex: 1, minWidth: 0 }}>
+                                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                                        <span style={{ fontSize: 12, fontFamily: T.fontMono, color: T.t1, fontWeight: 500 }}>
+                                          {displayName}{ext}
+                                        </span>
+                                        {rowCount != null && <Badge color={T.t3} style={{ fontSize: 9 }}>{rowCount} rows</Badge>}
+                                        {isJson && <Badge color={T.cyan} style={{ fontSize: 9 }}>JSON</Badge>}
+                                        {name.startsWith("mqsc_") && <Badge color={T.amber} style={{ fontSize: 9 }}>MQSC</Badge>}
+                                      </div>
+                                      <div style={{ fontSize: 10, color: T.t4, fontFamily: T.fontMono, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                        {lines[0]?.slice(0, 80)}{lines[0]?.length > 80 ? "…" : ""}
+                                      </div>
+                                    </div>
+                                    <DownloadButton label="Download" onClick={() => downloadFile(content, displayName.replace(" (MQSC)", "") + ext, mime)} />
+                                  </div>
+                                );
+                              })}
+                            </CollapsibleSection>
+                          );
+                        })}
+                      </>
                     );
-                  })
+                  })()
                 : <EmptyState icon="⊞" message={
                     result.awaiting_human_review
                       ? "Approve the design in the Review tab first. Target CSVs are generated after approval."
@@ -2171,8 +2358,8 @@ function ReviewChatPanel({ result, architectMethod, reviewLoading, onApprove, on
 
       {/* TOPOLOGY — Always visible */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-        <TopologyGraph graphData={result.as_is_graph} title="As-Is Topology" height={280} />
-        <TopologyGraph graphData={result.target_graph} title="Proposed Target" height={280}
+        <TopologyGraph graphData={result.as_is_graph} title="As-Is Topology" height={360} />
+        <TopologyGraph graphData={result.target_graph} title="Proposed Target" height={360}
           badge={<Badge color={T.green} style={{ fontSize: 8 }}>NEW</Badge>} />
       </div>
 
@@ -2653,18 +2840,15 @@ function UploadTab({ runDemo, handleUpload }) {
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   REPORT VIEWER — Sections the markdown report into collapsible chunks
-   Prevents browser freeze on large reports (hundreds of violation lines)
+   REPORT VIEWER — Splits report into collapsible sections to prevent freeze
    ═══════════════════════════════════════════════════════════════════════════ */
 
 function ReportViewer({ report, downloadFile }) {
-  // Split report into sections by ## headings
   const sections = useMemo(() => {
     if (!report) return [];
     const lines = report.split("\n");
     const result = [];
     let current = { title: "Executive Summary", lines: [] };
-
     lines.forEach(line => {
       if (line.startsWith("## ") && current.lines.length > 0) {
         result.push(current);
@@ -2680,89 +2864,51 @@ function ReportViewer({ report, downloadFile }) {
   return (
     <>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
-        <h2 style={{ fontSize: 16, fontWeight: 600, fontFamily: T.fontDisplay, color: T.t1 }}>
-          Final Analysis Report
-        </h2>
-        <div style={{ display: "flex", gap: 8 }}>
-          <Badge color={T.t3} style={{ fontSize: 9 }}>{sections.length} sections</Badge>
-          <DownloadButton label="Download Full Report" onClick={() => {
-            downloadFile(report, "mq_titan_report.md");
-          }} />
-        </div>
+        <h2 style={{ fontSize: 16, fontWeight: 600, fontFamily: T.fontDisplay, color: T.t1 }}>Final Analysis Report</h2>
+        <DownloadButton label="Download Full Report" onClick={() => downloadFile(report, "mq_titan_report.md")} />
       </div>
-      {sections.map((section, i) => {
-        const text = section.lines.join("\n");
-        const lineCount = section.lines.length;
-        const isLarge = lineCount > 50;
-        // Violations and Agent Trace sections start collapsed
-        const startsCollapsed = /violation|trace|migration commands/i.test(section.title);
-        return (
-          <ReportSection
-            key={i}
-            title={section.title}
-            content={text}
-            lineCount={lineCount}
-            defaultOpen={!startsCollapsed}
-            delay={0.05 * i}
-            isLarge={isLarge}
-          />
-        );
-      })}
+      {sections.map((section, i) => (
+        <ReportSection key={i} title={section.title} lines={section.lines}
+          defaultOpen={!/violation|trace|migration commands/i.test(section.title)}
+          delay={0.04 * i} />
+      ))}
     </>
   );
 }
 
-function ReportSection({ title, content, lineCount, defaultOpen = true, delay = 0, isLarge }) {
+function ReportSection({ title, lines, defaultOpen = true, delay = 0 }) {
   const [open, setOpen] = useState(defaultOpen);
-  const [showAll, setShowAll] = useState(!isLarge);
-  const MAX_PREVIEW_LINES = 60;
-
-  const displayContent = useMemo(() => {
-    if (showAll) return content;
-    const lines = content.split("\n");
-    if (lines.length <= MAX_PREVIEW_LINES) return content;
-    return lines.slice(0, MAX_PREVIEW_LINES).join("\n") + `\n\n... (${lines.length - MAX_PREVIEW_LINES} more lines)`;
-  }, [content, showAll]);
+  const [showAll, setShowAll] = useState(lines.length <= 60);
+  const display = showAll ? lines.join("\n") : lines.slice(0, 60).join("\n") + `\n\n... (${lines.length - 60} more lines)`;
 
   return (
     <Card style={{ marginBottom: 10 }} delay={delay}>
-      <div
-        onClick={() => setOpen(!open)}
-        style={{
-          padding: "12px 16px", cursor: "pointer",
-          display: "flex", alignItems: "center", gap: 10,
-          background: open ? `${T.bg3}40` : "transparent",
-          transition: "background 0.15s",
-        }}
+      <div onClick={() => setOpen(!open)} style={{
+        padding: "12px 16px", cursor: "pointer",
+        display: "flex", alignItems: "center", gap: 10,
+        background: open ? `${T.bg3}40` : "transparent",
+      }}
         onMouseEnter={e => { if (!open) e.currentTarget.style.background = `${T.bg3}20`; }}
         onMouseLeave={e => { if (!open) e.currentTarget.style.background = open ? `${T.bg3}40` : "transparent"; }}
       >
         <span style={{ fontSize: 13, fontWeight: 600, color: T.t1, flex: 1 }}>{title}</span>
-        <Badge color={T.t3} style={{ fontSize: 9 }}>{lineCount} lines</Badge>
-        <span style={{
-          fontSize: 10, color: T.t4,
-          transform: open ? "rotate(180deg)" : "rotate(0deg)",
-          transition: "transform 0.2s",
-        }}>▼</span>
+        <Badge color={T.t3} style={{ fontSize: 9 }}>{lines.length} lines</Badge>
+        <span style={{ fontSize: 10, color: T.t4, transform: open ? "rotate(180deg)" : "rotate(0deg)", transition: "transform 0.2s" }}>▼</span>
       </div>
       {open && (
-        <div style={{ borderTop: `1px solid ${T.border0}`, animation: "fadeIn 0.15s" }}>
+        <div style={{ borderTop: `1px solid ${T.border0}` }}>
           <pre style={{
-            padding: "16px 20px", margin: 0,
-            fontSize: 12, lineHeight: 1.7,
-            fontFamily: T.fontSans, color: T.t2,
-            overflowX: "auto",
+            padding: "16px 20px", margin: 0, fontSize: 12, lineHeight: 1.7,
+            fontFamily: T.fontSans, color: T.t2, overflowX: "auto",
             whiteSpace: "pre-wrap", wordBreak: "break-word",
-          }}>
-            {displayContent}
-          </pre>
-          {isLarge && !showAll && (
+          }}>{display}</pre>
+          {!showAll && (
             <div style={{ padding: "8px 16px 12px", borderTop: `1px solid ${T.border0}` }}>
-              <button onClick={(e) => { e.stopPropagation(); setShowAll(true); }} style={{
+              <button onClick={e => { e.stopPropagation(); setShowAll(true); }} style={{
                 padding: "6px 14px", borderRadius: T.r1, fontSize: 11,
                 background: T.cyanBg, border: `1px solid ${T.cyanBorder}`,
                 color: T.cyan, cursor: "pointer", fontFamily: T.fontMono,
-              }}>Show all {lineCount} lines</button>
+              }}>Show all {lines.length} lines</button>
             </div>
           )}
         </div>

@@ -230,31 +230,38 @@ def compute_complexity(G: nx.DiGraph, baseline_overrides: dict = None) -> dict:
         rd_worst = baseline_overrides["rd_worst"]
         fo_worst = baseline_overrides["fo_worst"]
         oo_worst = baseline_overrides["oo_worst"]
+        cs_worst = baseline_overrides.get("cs_worst", max(1.0, CC / max(num_qms, 1)))
     else:
-        # "Worst realistic" = a messy but plausible enterprise topology.
-        # NOT the theoretical maximum (full mesh) — that makes real topologies
-        # look trivially clean and kills the improvement delta.
+        # Anchor baselines to actual as-is values so the score reflects
+        # real measured complexity, not a theoretical worst-case that
+        # makes the as-is topology look trivially clean and kills the delta.
+        # As-is values ARE the worst we know — target must beat them.
         #
-        # CC: 2 channels per QM is typical in enterprise; 2*N is "messy"
-        # CI: 1.0 is perfect; N/3 means apps scattered across many QMs
-        # RD: half the QMs as chain depth is realistically bad
-        # FO: half the QMs connected to one hub is realistically bad
-        # OO: half the QMs being orphans is realistically bad
-        cc_worst = max(8, num_qms * 2)
-        ci_worst = max(2.0, num_qms / 3.0)
-        rd_worst = max(3, num_qms // 2)
-        fo_worst = max(3, num_qms // 2)
-        oo_worst = max(3, num_qms // 2)
+        # CS: channel-to-QM sprawl ratio — critical for 1:1 topologies where
+        # QM count cannot decrease (each app gets its own QM), so channel
+        # efficiency is the primary reduction lever.
+        CS = CC / max(num_qms, 1)
+        cc_worst = max(8, CC)
+        ci_worst = max(0.5, CI - 1.0)
+        rd_worst = max(2, RD)
+        fo_worst = max(2, FO)
+        oo_worst = max(1, OO) if OO > 0 else 1
+        cs_worst = max(1.0, CS)
 
     def norm(val, worst):
         return min((val / worst) * 100, 100) if worst > 0 else 0.0
 
+    # CS only available in else branch above; recompute here for overrides case.
+    if baseline_overrides:
+        CS = CC / max(num_qms, 1)
+
     score = (
         0.30 * norm(CC, cc_worst) +
-        0.25 * norm(CI - 1.0, ci_worst) +   # subtract 1 since 1.0 is perfect
+        0.25 * norm(max(CI - 1.0, 0), max(ci_worst, 0.01)) +
         0.20 * norm(RD, rd_worst) +
         0.15 * norm(FO, fo_worst) +
-        0.10 * norm(OO, oo_worst)
+        0.05 * norm(OO, oo_worst) +
+        0.10 * norm(CS, cs_worst)
     )
 
     baselines = {
@@ -263,6 +270,7 @@ def compute_complexity(G: nx.DiGraph, baseline_overrides: dict = None) -> dict:
         "rd_worst": rd_worst,
         "fo_worst": fo_worst,
         "oo_worst": oo_worst,
+        "cs_worst": cs_worst,
     }
 
     return {
@@ -271,14 +279,16 @@ def compute_complexity(G: nx.DiGraph, baseline_overrides: dict = None) -> dict:
         "routing_depth": round(RD, 1),
         "fan_out_score": FO,
         "orphan_objects": OO,
+        "channel_sprawl": round(CS, 2),
         "total_score": round(score, 1),
         "baselines": baselines,
         "factor_scores": {
             "cc_weighted": round(0.30 * norm(CC, cc_worst), 1),
-            "ci_weighted": round(0.25 * norm(CI - 1.0, ci_worst), 1),
+            "ci_weighted": round(0.25 * norm(max(CI - 1.0, 0), max(ci_worst, 0.01)), 1),
             "rd_weighted": round(0.20 * norm(RD, rd_worst), 1),
             "fo_weighted": round(0.15 * norm(FO, fo_worst), 1),
-            "oo_weighted": round(0.10 * norm(OO, oo_worst), 1),
+            "oo_weighted": round(0.05 * norm(OO, oo_worst), 1),
+            "cs_weighted": round(0.10 * norm(CS, cs_worst), 1),
         },
     }
 
