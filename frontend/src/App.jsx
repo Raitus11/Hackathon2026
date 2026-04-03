@@ -255,9 +255,36 @@ const NODE_COLORS = {
   queue: T.amber,
 };
 
-function TopologyGraph({ graphData, title, height = 360, badge, showQueues = false }) {
+/* ═══════════════════════════════════════════════════════════════════════════
+   TopologyGraph — DROP-IN REPLACEMENT
+   ═══════════════════════════════════════════════════════════════════════════
+   
+   INSTALLATION:
+   1. Open your App.jsx
+   2. Find the existing TopologyGraph function (search for "function TopologyGraph")
+   3. Replace the ENTIRE function (from "function TopologyGraph" to its closing "}")
+      with the new function below
+   4. That's it. No other changes needed. Same props, same API.
+   
+   WHAT CHANGED:
+   - AS-IS graphs use a dense force layout (tuned for 150+ nodes)
+   - TARGET graphs use a radial concentric ring layout showing 1:1 QM-per-app
+   - Layout mode auto-detected from the `title` prop (or explicit `isTarget` prop)
+   - Queue nodes supported when showQueues=true
+   - Zoom-to-fit after simulation settles
+   - Legend updates to reflect dedicated vs shared QMs
+   
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+// ── Paste this function to REPLACE the existing TopologyGraph ─────────────
+
+function TopologyGraph({ graphData, title, height = 360, badge, showQueues = false, isTarget }) {
   const svgRef = useRef(null);
   const containerRef = useRef(null);
+
+  // Auto-detect if this is a target graph from title if isTarget not explicitly set
+  const targetMode = isTarget !== undefined ? isTarget
+    : /target|proposed|optimis|new/i.test(title || "");
 
   useEffect(() => {
     if (!graphData?.nodes?.length || !svgRef.current) return;
@@ -267,68 +294,34 @@ function TopologyGraph({ graphData, title, height = 360, badge, showQueues = fal
     const w = containerRef.current?.clientWidth || 600;
     const h = height;
 
-    // Filter nodes based on showQueues flag
+    // ── Filter nodes/edges based on showQueues ─────────────────────────
     const nodes = graphData.nodes
       .filter(d => showQueues ? true : (d.type === "qm" || d.type === "app"))
       .map(d => ({ ...d }));
     const nodeIds = new Set(nodes.map(n => n.id));
     const edges = graphData.edges
       .filter(d => {
-        if (!nodeIds.has(d.source) && !nodeIds.has(d.source?.id)) return false;
-        if (!nodeIds.has(d.target) && !nodeIds.has(d.target?.id)) return false;
+        const src = typeof d.source === "object" ? d.source.id : d.source;
+        const tgt = typeof d.target === "object" ? d.target.id : d.target;
+        if (!nodeIds.has(src) || !nodeIds.has(tgt)) return false;
         if (showQueues) return true;
         return d.rel === "channel" || d.rel === "connects_to";
       })
       .map(d => ({ ...d }));
 
-    // Scale forces to panel size so the graph fills the available space
-    const nodeCount = nodes.length;
-    const chargeStrength = nodeCount > 400 ? -40 : nodeCount > 200 ? -80 : nodeCount > 80 ? -200 : -350;
-    const linkDist = nodeCount > 400 ? 10 : nodeCount > 200 ? 15 : nodeCount > 80 ? 30 : 35;
-    const chDist = nodeCount > 400 ? 25 : nodeCount > 200 ? 35 : nodeCount > 80 ? 70 : 100;
-    const ownsDist = 18;  // queues sit close to their QM
-
-    const sim = d3.forceSimulation(nodes)
-      .force("link", d3.forceLink(edges).id(d => d.id)
-        .distance(d => d.rel === "connects_to" ? linkDist : d.rel === "owns" ? ownsDist : chDist)
-        .strength(d => d.rel === "connects_to" ? 1.5 : d.rel === "owns" ? 2.0 : 0.3))
-      .force("charge", d3.forceManyBody().strength(chargeStrength))
-      .force("center", d3.forceCenter(w / 2, h / 2))
-      .force("collide", d3.forceCollide(nodeCount > 400 ? 6 : nodeCount > 200 ? 10 : 25));
-
     const g = svg.append("g");
     const zoom = d3.zoom().scaleExtent([0.1, 5]).on("zoom", e => g.attr("transform", e.transform));
     svg.call(zoom);
 
-    // Auto zoom-to-fit after simulation settles
-    sim.on("end", () => {
-      const allX = nodes.map(n => n.x).filter(v => isFinite(v));
-      const allY = nodes.map(n => n.y).filter(v => isFinite(v));
-      if (!allX.length) return;
-      const xMin = Math.min(...allX), xMax = Math.max(...allX);
-      const yMin = Math.min(...allY), yMax = Math.max(...allY);
-      const gw = xMax - xMin || 1, gh = yMax - yMin || 1;
-      const pad = 40;
-      const scale = Math.min((w - pad * 2) / gw, (h - pad * 2) / gh, 2);
-      const tx = (w - gw * scale) / 2 - xMin * scale;
-      const ty = (h - gh * scale) / 2 - yMin * scale;
-      svg.transition().duration(600).call(
-        zoom.transform,
-        d3.zoomIdentity.translate(tx, ty).scale(scale)
-      );
-    });
-
-    // Glow filters
+    // ── Shared: Defs (arrow markers, glow filters) ─────────────────────
     const defs = svg.append("defs");
-    ["qm", "app"].forEach(type => {
-      const filter = defs.append("filter").attr("id", `glow-${type}`);
-      filter.append("feGaussianBlur").attr("stdDeviation", 4).attr("result", "blur");
+    ["qm", "app", "queue"].forEach(type => {
+      const filter = defs.append("filter").attr("id", `glow-${type}-${title}`);
+      filter.append("feGaussianBlur").attr("stdDeviation", 3).attr("result", "blur");
       filter.append("feMerge").selectAll("feMergeNode")
         .data(["blur", "SourceGraphic"]).join("feMergeNode")
         .attr("in", d => d);
     });
-
-    // Arrow markers
     ["channel", "connects_to", "owns"].forEach(rel => {
       defs.append("marker")
         .attr("id", `arrow-${rel}-${title}`)
@@ -342,75 +335,35 @@ function TopologyGraph({ graphData, title, height = 360, badge, showQueues = fal
         .attr("opacity", 0.6);
     });
 
-    // Edges
-    g.selectAll("line.edge")
-      .data(edges.filter(e => e.rel === "channel" || e.rel === "connects_to" || e.rel === "owns"))
-      .join("line").attr("class", "edge")
-      .attr("stroke", d => d.rel === "channel" ? `${T.cyan}50` : d.rel === "owns" ? `${T.amber}30` : `${T.green}60`)
-      .attr("stroke-width", d => d.rel === "channel" ? 1.5 : d.rel === "owns" ? 0.6 : 0.9)
-      .attr("stroke-dasharray", d => d.rel === "connects_to" ? "3 3" : d.rel === "owns" ? "2 2" : null)
-      .attr("marker-end", d => d.rel === "owns" ? null : `url(#arrow-${d.rel}-${title})`);
+    // ── Choose layout strategy ─────────────────────────────────────────
+    // Small filtered subgraph (≤15 QMs) → flow layout showing message paths
+    // Full target graph → radial concentric rings
+    // AS-IS → dense force directed
+    const qmCount = nodes.filter(n => n.type === "qm").length;
+    if (targetMode && qmCount <= 15 && qmCount > 0) {
+      drawTargetFlow(g, nodes, edges, w, h, svg, zoom, title, showQueues);
+    } else if (targetMode) {
+      drawTargetRadial(g, nodes, edges, w, h, svg, zoom, title, showQueues);
+    } else {
+      drawAsIsForce(g, nodes, edges, w, h, svg, zoom, title, showQueues);
+    }
 
-    // Nodes — render all types present in filtered data
-    const node = g.selectAll("g.node")
-      .data(nodes)
-      .join("g").attr("class", "node")
-      .style("cursor", "grab")
-      .call(d3.drag()
-        .on("start", (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
-        .on("drag", (e, d) => { d.fx = e.x; d.fy = e.y; })
-        .on("end", (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; })
-      );
+  }, [graphData, height, title, showQueues, targetMode]);
 
-    const nodeRadius = d => d.type === "qm" ? 18 : d.type === "app" ? 12 : 7;
-
-    // Glow circle (behind)
-    node.append("circle")
-      .attr("r", d => nodeRadius(d) + 4)
-      .attr("fill", d => `${NODE_COLORS[d.type] || T.amber}15`)
-      .attr("stroke", "none");
-
-    // Main circle
-    node.append("circle")
-      .attr("r", nodeRadius)
-      .attr("fill", T.bg1)
-      .attr("stroke", d => NODE_COLORS[d.type] || T.amber)
-      .attr("stroke-width", d => d.type === "queue" ? 1 : 2);
-
-    // Icon text
-    node.append("text")
-      .text(d => d.type === "qm" ? "◆" : d.type === "app" ? "●" : d.queue_type === "XMITQ" || d.usage === "XMITQ" ? "⇄" : d.queue_type === "REMOTE" ? "↗" : "▪")
-      .attr("text-anchor", "middle").attr("dy", "0.35em")
-      .attr("fill", d => NODE_COLORS[d.type] || T.amber)
-      .attr("font-size", d => d.type === "qm" ? "10px" : d.type === "app" ? "8px" : "6px");
-
-    // Label — only show for QM and app nodes (queues are too small)
-    node.filter(d => d.type !== "queue").append("text")
-      .text(d => (d.name || d.id).replace("QM_", "").replace("APP_", "").slice(0, 16))
-      .attr("text-anchor", "middle").attr("dy", d => d.type === "qm" ? "2.8em" : "2.4em")
-      .attr("fill", T.t3)
-      .attr("font-size", "9px").attr("font-family", T.fontMono);
-
-    node.append("title").text(d => {
-      let tip = `${d.id}\nType: ${d.type}`;
-      if (d.region) tip += `\nRegion: ${d.region}`;
-      if (d.queue_type) tip += `\nQueue Type: ${d.queue_type}`;
-      if (d.usage && d.usage !== "NORMAL") tip += `\nUsage: ${d.usage}`;
-      if (d.remote_qm) tip += `\nRemote QM: ${d.remote_qm}`;
-      return tip;
-    });
-
-    const link = g.selectAll("line.edge");
-    sim.on("tick", () => {
-      link.attr("x1", d => d.source.x).attr("y1", d => d.source.y)
-           .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
-      node.attr("transform", d => `translate(${d.x},${d.y})`);
-    });
-  }, [graphData, height, title, showQueues]);
-
-  const legendItems = [["Queue Manager", T.cyan, "◆"], ["Application", T.green, "●"]];
+  // ── Legend entries ────────────────────────────────────────────────────
+  const legendItems = targetMode
+    ? [
+        ["Queue Manager", T.cyan, "◆", "(dedicated 1:1)"],
+        ["Application", T.green, "●", ""],
+      ]
+    : [
+        ["Queue Manager", T.cyan, "◆", "(shared)"],
+        ["Application", T.green, "●", ""],
+      ];
   if (showQueues) {
-    legendItems.push(["Local Queue", T.amber, "▪"], ["Remote Queue", T.amber, "↗"], ["XMITQ", T.amber, "⇄"]);
+    legendItems.push(["Local Q", T.amber, "▪", ""]);
+    legendItems.push(["Remote Q", T.amber, "↗", ""]);
+    legendItems.push(["XMITQ", T.purple, "⇄", ""]);
   }
 
   return (
@@ -423,16 +376,679 @@ function TopologyGraph({ graphData, title, height = 360, badge, showQueues = fal
         {badge}
       </div>
       <svg ref={svgRef} width="100%" height={height} style={{ display: "block" }} />
-      <div style={{ padding: "8px 14px", display: "flex", gap: 16, borderTop: `1px solid ${T.border0}`, flexWrap: "wrap" }}>
-        {legendItems.map(([l, c, i]) => (
-          <span key={l} style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 10, color: T.t3 }}>
-            <span style={{ color: c, fontSize: 10 }}>{i}</span> {l}
+      <div style={{ padding: "8px 14px", display: "flex", gap: 16, borderTop: `1px solid ${T.border0}` }}>
+        {legendItems.map(([label, color, icon, sub]) => (
+          <span key={label} style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 10, color: T.t3 }}>
+            <span style={{ color, fontSize: 10 }}>{icon}</span> {label}
+            {sub && <span style={{ fontSize: 9, color: T.t4 }}>{sub}</span>}
           </span>
         ))}
       </div>
     </div>
   );
 }
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   AS-IS LAYOUT — Dense Force Directed
+   Shows the tangled mess of shared QMs. Nodes cluster naturally around
+   heavily-shared QMs, visually communicating the complexity problem.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function drawAsIsForce(g, nodes, edges, w, h, svg, zoom, title, showQueues) {
+  const nodeCount = nodes.length;
+
+  // Scale forces aggressively for large graphs
+  const chargeStrength = nodeCount > 400 ? -40 : nodeCount > 200 ? -60 : nodeCount > 80 ? -120 : -250;
+  const linkDist = nodeCount > 400 ? 10 : nodeCount > 200 ? 15 : nodeCount > 80 ? 30 : 40;
+  const chDist = nodeCount > 400 ? 25 : nodeCount > 200 ? 40 : nodeCount > 80 ? 70 : 100;
+  const ownsDist = 12;
+  const collideRadius = nodeCount > 400 ? 5 : nodeCount > 200 ? 8 : nodeCount > 80 ? 15 : 22;
+
+  const sim = d3.forceSimulation(nodes)
+    .force("link", d3.forceLink(edges).id(d => d.id)
+      .distance(d => d.rel === "connects_to" ? linkDist : d.rel === "owns" ? ownsDist : chDist)
+      .strength(d => d.rel === "connects_to" ? 1.2 : d.rel === "owns" ? 2.0 : 0.2))
+    .force("charge", d3.forceManyBody().strength(chargeStrength))
+    .force("center", d3.forceCenter(w / 2, h / 2))
+    .force("collide", d3.forceCollide(collideRadius))
+    .stop();
+
+  // Run simulation synchronously for instant render
+  const iterations = nodeCount > 200 ? 150 : 250;
+  for (let i = 0; i < iterations; i++) sim.tick();
+
+  // ── Draw edges ─────────────────────────────────────────────────────
+  const visibleEdges = edges.filter(e => {
+    if (showQueues) return true;
+    return e.rel === "channel" || e.rel === "connects_to";
+  });
+
+  g.selectAll("line.edge").data(visibleEdges).join("line")
+    .attr("class", "edge")
+    .attr("x1", d => d.source.x).attr("y1", d => d.source.y)
+    .attr("x2", d => d.target.x).attr("y2", d => d.target.y)
+    .attr("stroke", d => {
+      if (d.rel === "channel") return `${T.cyan}35`;
+      if (d.rel === "owns") return `${T.amber}25`;
+      return `${T.green}20`;
+    })
+    .attr("stroke-width", d => d.rel === "channel" ? 1 : d.rel === "owns" ? 0.5 : 0.4)
+    .attr("stroke-dasharray", d => d.rel === "connects_to" ? "2 2" : null);
+
+  // ── Draw nodes ─────────────────────────────────────────────────────
+  const qmNodes = nodes.filter(n => n.type === "qm");
+  const appNodes = nodes.filter(n => n.type === "app");
+  const queueNodes = nodes.filter(n => n.type === "queue");
+
+  // Apps first (behind), then QMs on top
+  // App dots — small, muted
+  g.selectAll("circle.app-node").data(appNodes).join("circle")
+    .attr("class", "app-node")
+    .attr("cx", d => d.x).attr("cy", d => d.y)
+    .attr("r", nodeCount > 200 ? 2.5 : 4)
+    .attr("fill", `${T.green}60`)
+    .attr("stroke", `${T.green}30`)
+    .attr("stroke-width", 0.5);
+
+  // Queue dots if shown
+  if (showQueues && queueNodes.length) {
+    g.selectAll("circle.queue-node").data(queueNodes).join("circle")
+      .attr("class", "queue-node")
+      .attr("cx", d => d.x).attr("cy", d => d.y)
+      .attr("r", nodeCount > 200 ? 1.5 : 2.5)
+      .attr("fill", `${T.amber}50`)
+      .attr("stroke", "none");
+  }
+
+  // QM nodes — larger, prominent, with glow
+  g.selectAll("circle.qm-glow").data(qmNodes).join("circle")
+    .attr("class", "qm-glow")
+    .attr("cx", d => d.x).attr("cy", d => d.y)
+    .attr("r", nodeCount > 200 ? 8 : 14)
+    .attr("fill", `${T.cyan}12`)
+    .attr("stroke", "none");
+
+  g.selectAll("circle.qm-node").data(qmNodes).join("circle")
+    .attr("class", "qm-node")
+    .attr("cx", d => d.x).attr("cy", d => d.y)
+    .attr("r", nodeCount > 200 ? 5 : 10)
+    .attr("fill", T.bg1)
+    .attr("stroke", T.cyan)
+    .attr("stroke-width", nodeCount > 200 ? 1 : 1.5);
+
+  g.selectAll("text.qm-icon").data(qmNodes).join("text")
+    .attr("class", "qm-icon")
+    .attr("x", d => d.x).attr("y", d => d.y)
+    .attr("text-anchor", "middle").attr("dominant-baseline", "central")
+    .attr("fill", T.cyan)
+    .attr("font-size", nodeCount > 200 ? "5px" : "8px")
+    .text("◆");
+
+  // Labels for QMs only (if not too crowded)
+  if (nodeCount < 120) {
+    g.selectAll("text.qm-label").data(qmNodes).join("text")
+      .attr("class", "qm-label")
+      .attr("x", d => d.x).attr("y", d => d.y + (nodeCount > 80 ? 14 : 18))
+      .attr("text-anchor", "middle")
+      .attr("fill", T.t4)
+      .attr("font-size", "7px").attr("font-family", T.fontMono)
+      .text(d => (d.name || d.id).replace("QM_", "").slice(0, 10));
+  }
+
+  // ── Zoom to fit ────────────────────────────────────────────────────
+  zoomToFit(svg, zoom, nodes, w, h);
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   TARGET LAYOUT — Radial Concentric Rings
+   Each QM+App pair sits on concentric rings emanating from the center.
+   Clean, ordered, instantly communicating "1 QM per app" architecture.
+   Inter-QM channels drawn as subtle curved connections.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function drawTargetRadial(g, nodes, edges, w, h, svg, zoom, title, showQueues) {
+  const cx = w / 2;
+  const cy = h / 2;
+
+  // Separate node types
+  const qmNodes = nodes.filter(n => n.type === "qm");
+  const appNodes = nodes.filter(n => n.type === "app");
+  const queueNodes = nodes.filter(n => n.type === "queue");
+
+  // Build app→QM mapping from connects_to edges
+  const appToQm = {};
+  const qmToApps = {};
+  const edgeId = e => typeof e.source === "object" ? e.source.id : e.source;
+  const edgeTgt = e => typeof e.target === "object" ? e.target.id : e.target;
+
+  edges.forEach(e => {
+    if (e.rel === "connects_to") {
+      const src = edgeId(e);
+      const tgt = edgeTgt(e);
+      const appNode = nodes.find(n => n.id === src && n.type === "app");
+      const qmNode = nodes.find(n => n.id === tgt && n.type === "qm");
+      if (appNode && qmNode) {
+        appToQm[src] = tgt;
+        if (!qmToApps[tgt]) qmToApps[tgt] = [];
+        qmToApps[tgt].push(src);
+      }
+    }
+  });
+
+  // Build QM→queues mapping from owns edges (for showQueues mode)
+  const qmToQueues = {};
+  if (showQueues) {
+    edges.forEach(e => {
+      if (e.rel === "owns") {
+        const src = edgeId(e);
+        const tgt = edgeTgt(e);
+        const queueNode = nodes.find(n => n.id === tgt && n.type === "queue");
+        if (queueNode) {
+          if (!qmToQueues[src]) qmToQueues[src] = [];
+          qmToQueues[src].push(queueNode);
+        }
+      }
+    });
+  }
+
+  // Build ordered list of QM-App pairs for ring placement
+  // Also catch orphan apps (not connected to any QM)
+  const pairs = [];
+  const placedApps = new Set();
+
+  qmNodes.forEach(qm => {
+    const apps = qmToApps[qm.id] || [];
+    if (apps.length > 0) {
+      apps.forEach(appId => {
+        pairs.push({ qm: qm, appId: appId, app: nodes.find(n => n.id === appId) });
+        placedApps.add(appId);
+      });
+    } else {
+      pairs.push({ qm: qm, appId: null, app: null });
+    }
+  });
+
+  // Catch orphan apps (apps with no connects_to edge)
+  appNodes.forEach(app => {
+    if (!placedApps.has(app.id)) {
+      pairs.push({ qm: null, appId: app.id, app: app });
+    }
+  });
+
+  // Arrange pairs in concentric rings — dynamic spacing based on count
+  const positions = [];
+  let placed = 0;
+  let ringIdx = 0;
+  const totalPairs = pairs.length;
+  // Adaptive sizing: more pairs = tighter packing
+  const baseRadius = totalPairs > 120 ? Math.min(w, h) * 0.12 : Math.min(w, h) * 0.16;
+  const ringSpacing = totalPairs > 120 ? Math.min(w, h) * 0.065 : Math.min(w, h) * 0.09;
+  const minGap = totalPairs > 120 ? 14 : 20;
+
+  while (placed < totalPairs) {
+    const radius = baseRadius + ringIdx * ringSpacing;
+    const circumference = 2 * Math.PI * radius;
+    const maxInRing = Math.max(4, Math.floor(circumference / minGap));
+    const count = Math.min(maxInRing, totalPairs - placed);
+
+    for (let i = 0; i < count; i++) {
+      const angle = (2 * Math.PI * i / count) - Math.PI / 2;
+      const idx = placed + i;
+      const pair = pairs[idx];
+      const qmX = cx + Math.cos(angle) * radius;
+      const qmY = cy + Math.sin(angle) * radius;
+      const appDist = showQueues ? 16 : 12;
+      const appX = cx + Math.cos(angle) * (radius + appDist);
+      const appY = cy + Math.sin(angle) * (radius + appDist);
+
+      positions.push({
+        ...pair,
+        qmX, qmY, appX, appY, angle, radius, idx
+      });
+    }
+    placed += count;
+    ringIdx++;
+  }
+
+  // Build position lookup by QM id (for channel drawing)
+  const qmPositions = {};
+  positions.forEach(p => {
+    if (p.qm) qmPositions[p.qm.id] = { x: p.qmX, y: p.qmY };
+  });
+
+  // ── Ring guides (very subtle) ──────────────────────────────────────
+  const rings = new Set(positions.map(p => p.radius));
+  rings.forEach(r => {
+    g.append("circle")
+      .attr("cx", cx).attr("cy", cy).attr("r", r)
+      .attr("fill", "none")
+      .attr("stroke", `${T.border0}80`)
+      .attr("stroke-width", 0.5)
+      .attr("stroke-dasharray", "2 4");
+  });
+
+  // ── Inter-QM channels (curved connections) ─────────────────────────
+  const channelEdges = edges.filter(e => e.rel === "channel");
+  channelEdges.forEach(e => {
+    const src = edgeId(e);
+    const tgt = edgeTgt(e);
+    const from = qmPositions[src];
+    const to = qmPositions[tgt];
+    if (from && to) {
+      const midX = (from.x + to.x) / 2;
+      const midY = (from.y + to.y) / 2;
+      const pullFactor = 0.3;
+      const ctrlX = midX + (cx - midX) * pullFactor;
+      const ctrlY = midY + (cy - midY) * pullFactor;
+
+      g.append("path")
+        .attr("d", `M${from.x},${from.y} Q${ctrlX},${ctrlY} ${to.x},${to.y}`)
+        .attr("fill", "none")
+        .attr("stroke", `${T.cyan}25`)
+        .attr("stroke-width", 0.6);
+    }
+  });
+
+  // ── QM-App pair connections (short radial lines) ───────────────────
+  positions.forEach(pos => {
+    if (pos.app && pos.qm) {
+      g.append("line")
+        .attr("x1", pos.qmX).attr("y1", pos.qmY)
+        .attr("x2", pos.appX).attr("y2", pos.appY)
+        .attr("stroke", `${T.green}50`)
+        .attr("stroke-width", 0.8);
+    }
+  });
+
+  // ── App dots (outer ring of each pair) ─────────────────────────────
+  positions.forEach(pos => {
+    if (pos.app) {
+      const isOrphan = !pos.qm;
+      g.append("circle")
+        .attr("cx", pos.appX).attr("cy", pos.appY)
+        .attr("r", isOrphan ? 3 : 2.5)
+        .attr("fill", isOrphan ? T.red : T.green)
+        .attr("opacity", isOrphan ? 0.5 : 0.7);
+    }
+  });
+
+  // ── QM dots (inner ring of each pair) ──────────────────────────────
+  positions.forEach(pos => {
+    if (!pos.qm) return;
+    // Glow
+    g.append("circle")
+      .attr("cx", pos.qmX).attr("cy", pos.qmY)
+      .attr("r", 6)
+      .attr("fill", `${T.cyan}10`)
+      .attr("stroke", "none");
+    // Main dot
+    g.append("circle")
+      .attr("cx", pos.qmX).attr("cy", pos.qmY)
+      .attr("r", 3.5)
+      .attr("fill", T.bg1)
+      .attr("stroke", T.cyan)
+      .attr("stroke-width", 1);
+    // Icon
+    g.append("text")
+      .attr("x", pos.qmX).attr("y", pos.qmY)
+      .attr("text-anchor", "middle").attr("dominant-baseline", "central")
+      .attr("fill", T.cyan)
+      .attr("font-size", "4px")
+      .text("◆");
+  });
+
+  // Center label removed — it obscured the channel web at scale.
+  // The "1:1 dedicated" message is communicated by the ring structure itself
+  // and the legend text "(dedicated 1:1)" below.
+
+  // ── Zoom to fit all content ────────────────────────────────────────
+  // Collect all rendered positions for zoom calculation
+  const allPoints = [];
+  positions.forEach(p => {
+    allPoints.push({ x: p.qmX, y: p.qmY });
+    if (p.app) allPoints.push({ x: p.appX, y: p.appY });
+  });
+  if (allPoints.length > 0) {
+    zoomToFit(svg, zoom, allPoints, w, h);
+  }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   TARGET FLOW LAYOUT — Filtered Single-App / Small Subgraph
+   Shows the canonical MQ message flow:
+   Producer App → QM_A → REMOTE_Q → XMITQ → Channel → QM_B → LOCAL_Q → Consumer App
+   
+   Used when ≤15 QMs are in the subgraph (i.e. app filter is active).
+   This is what judges want to see — the actual message path.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function drawTargetFlow(g, nodes, edges, w, h, svg, zoom, title, showQueues) {
+  const edgeId = e => typeof e.source === "object" ? e.source.id : e.source;
+  const edgeTgt = e => typeof e.target === "object" ? e.target.id : e.target;
+
+  // Categorize nodes
+  const qmNodes = nodes.filter(n => n.type === "qm");
+  const appNodes = nodes.filter(n => n.type === "app");
+  const queueNodes = nodes.filter(n => n.type === "queue");
+
+  // Build mappings
+  const appToQm = {};
+  const qmToApps = {};
+  edges.forEach(e => {
+    if (e.rel === "connects_to") {
+      const src = edgeId(e), tgt = edgeTgt(e);
+      if (nodes.find(n => n.id === src && n.type === "app") && nodes.find(n => n.id === tgt && n.type === "qm")) {
+        appToQm[src] = tgt;
+        if (!qmToApps[tgt]) qmToApps[tgt] = [];
+        qmToApps[tgt].push(src);
+      }
+    }
+  });
+
+  const qmToQueues = {};
+  edges.forEach(e => {
+    if (e.rel === "owns") {
+      const src = edgeId(e), tgt = edgeTgt(e);
+      const qNode = nodes.find(n => n.id === tgt && n.type === "queue");
+      if (qNode) {
+        if (!qmToQueues[src]) qmToQueues[src] = [];
+        qmToQueues[src].push(qNode);
+      }
+    }
+  });
+
+  // Build channel pairs
+  const channels = [];
+  edges.forEach(e => {
+    if (e.rel === "channel") {
+      channels.push({ from: edgeId(e), to: edgeTgt(e), data: e });
+    }
+  });
+
+  // ── Layout: vertical columns per QM ────────────────────────────────
+  // Each QM gets a column: [App] → [QM] → [queues below]
+  // Channels connect QMs horizontally
+  const colWidth = Math.max(120, Math.min(200, (w - 60) / Math.max(qmNodes.length, 1)));
+  const startX = 40;
+  const qmY = h * 0.35;
+  const appY = h * 0.12;
+
+  // Position each QM column
+  const qmPos = {};
+  qmNodes.forEach((qm, i) => {
+    const x = startX + i * colWidth + colWidth / 2;
+    qmPos[qm.id] = { x, y: qmY, idx: i };
+  });
+
+  // ── Draw channels between QMs (horizontal arrows) ──────────────────
+  channels.forEach(ch => {
+    const from = qmPos[ch.from];
+    const to = qmPos[ch.to];
+    if (!from || !to) return;
+
+    const yOff = (Math.abs(from.idx - to.idx) > 1) ? -20 : 0;
+    g.append("path")
+      .attr("d", `M${from.x},${from.y + yOff} C${(from.x + to.x) / 2},${from.y + yOff - 30} ${(from.x + to.x) / 2},${to.y + yOff - 30} ${to.x},${to.y + yOff}`)
+      .attr("fill", "none")
+      .attr("stroke", T.cyan)
+      .attr("stroke-width", 1.5)
+      .attr("stroke-opacity", 0.4)
+      .attr("marker-end", `url(#arrow-channel-${title})`);
+
+    // Channel label
+    const midX = (from.x + to.x) / 2;
+    const midY = from.y + yOff - 18;
+    const chName = ch.data.channel_name || `${ch.from}.${ch.to}`;
+    g.append("text")
+      .attr("x", midX).attr("y", midY)
+      .attr("text-anchor", "middle")
+      .attr("fill", `${T.cyan}80`)
+      .attr("font-size", "7px").attr("font-family", T.fontMono)
+      .text(chName.length > 20 ? chName.slice(0, 18) + "…" : chName);
+  });
+
+  // ── Message flow annotations (from REMOTE queue metadata) ──────────
+  // Parse REMOTE queues to discover which apps talk to which apps
+  // REMOTE queue nodes have: remote_qm, target_app, owner_app, source_queue
+  if (showQueues) {
+    const messageFlows = [];
+    queueNodes.forEach(q => {
+      if (q.queue_type === "REMOTE" && q.owner_app && q.target_app) {
+        const existing = messageFlows.find(f => f.from === q.owner_app && f.to === q.target_app);
+        if (!existing) {
+          messageFlows.push({
+            from: q.owner_app, to: q.target_app,
+            queue: q.source_queue || q.name || q.id,
+          });
+        }
+      }
+    });
+
+    // Draw flow arrows between apps if both are visible
+    const flowY = appY - 30;
+    messageFlows.forEach((flow, fi) => {
+      const fromQm = appToQm[flow.from];
+      const toQm = appToQm[flow.to];
+      if (!fromQm || !toQm || !qmPos[fromQm] || !qmPos[toQm]) return;
+      if (fromQm === toQm) return; // same QM, skip
+
+      const fromX = qmPos[fromQm].x;
+      const toX = qmPos[toQm].x;
+      const yLine = flowY - (fi % 3) * 12;
+
+      g.append("path")
+        .attr("d", `M${fromX},${yLine} L${toX},${yLine}`)
+        .attr("fill", "none")
+        .attr("stroke", `${T.green}40`)
+        .attr("stroke-width", 0.8)
+        .attr("stroke-dasharray", "4 2")
+        .attr("marker-end", `url(#arrow-connects_to-${title})`);
+
+      // Flow label
+      const qName = (flow.queue || "").replace("RQ.", "").slice(0, 18);
+      if (qName) {
+        g.append("text")
+          .attr("x", (fromX + toX) / 2).attr("y", yLine - 4)
+          .attr("text-anchor", "middle")
+          .attr("fill", `${T.green}50`)
+          .attr("font-size", "5.5px").attr("font-family", T.fontMono)
+          .text(qName);
+      }
+    });
+  }
+
+  // ── Draw QM nodes ──────────────────────────────────────────────────
+  qmNodes.forEach(qm => {
+    const pos = qmPos[qm.id];
+    if (!pos) return;
+
+    // QM box
+    const boxW = Math.min(100, colWidth - 20);
+    g.append("rect")
+      .attr("x", pos.x - boxW / 2).attr("y", pos.y - 18)
+      .attr("width", boxW).attr("height", 36)
+      .attr("rx", 6)
+      .attr("fill", T.bg2)
+      .attr("stroke", T.cyan)
+      .attr("stroke-width", 1.5);
+
+    // QM icon + label
+    g.append("text")
+      .attr("x", pos.x).attr("y", pos.y - 3)
+      .attr("text-anchor", "middle")
+      .attr("fill", T.cyan)
+      .attr("font-size", "7px")
+      .text("◆");
+    g.append("text")
+      .attr("x", pos.x).attr("y", pos.y + 10)
+      .attr("text-anchor", "middle")
+      .attr("fill", T.t2)
+      .attr("font-size", "8px").attr("font-family", T.fontMono)
+      .text((qm.name || qm.id).replace("QM_", "").slice(0, 14));
+  });
+
+  // ── Draw Apps above their QMs ──────────────────────────────────────
+  Object.entries(appToQm).forEach(([appId, qmId]) => {
+    const qPos = qmPos[qmId];
+    if (!qPos) return;
+    const appNode = nodes.find(n => n.id === appId);
+    if (!appNode) return;
+
+    const apps = qmToApps[qmId] || [];
+    const appIdx = apps.indexOf(appId);
+    const xOffset = apps.length > 1 ? (appIdx - (apps.length - 1) / 2) * 20 : 0;
+    const ax = qPos.x + xOffset;
+    const ay = appY;
+
+    // App circle
+    g.append("circle")
+      .attr("cx", ax).attr("cy", ay).attr("r", 12)
+      .attr("fill", T.bg2)
+      .attr("stroke", T.green)
+      .attr("stroke-width", 1.5);
+    g.append("text")
+      .attr("x", ax).attr("y", ay + 1)
+      .attr("text-anchor", "middle").attr("dominant-baseline", "central")
+      .attr("fill", T.green).attr("font-size", "7px")
+      .text("●");
+
+    // App label
+    g.append("text")
+      .attr("x", ax).attr("y", ay - 18)
+      .attr("text-anchor", "middle")
+      .attr("fill", T.t2)
+      .attr("font-size", "8px").attr("font-family", T.fontMono)
+      .text((appNode.name || appId).replace("Service_", "Svc_").slice(0, 14));
+
+    // Connection line app → QM (server connection)
+    g.append("line")
+      .attr("x1", ax).attr("y1", ay + 12)
+      .attr("x2", qPos.x).attr("y2", qPos.y - 18)
+      .attr("stroke", `${T.green}60`)
+      .attr("stroke-width", 1)
+      .attr("stroke-dasharray", "3 3")
+      .attr("marker-end", `url(#arrow-connects_to-${title})`);
+
+    // Label the connection
+    const connMidY = (ay + 12 + qPos.y - 18) / 2;
+    g.append("text")
+      .attr("x", (ax + qPos.x) / 2 + 8).attr("y", connMidY)
+      .attr("fill", `${T.green}50`)
+      .attr("font-size", "6px").attr("font-family", T.fontMono)
+      .text("SVRCONN");
+  });
+
+  // ── Draw Queues below their QMs (when showQueues ON) ───────────────
+  if (showQueues) {
+    const queueStartY = qmY + 40;
+    const queueRowH = 18;
+
+    qmNodes.forEach(qm => {
+      const pos = qmPos[qm.id];
+      if (!pos) return;
+      const queues = qmToQueues[qm.id] || [];
+      if (queues.length === 0) return;
+
+      // Group queues by type
+      const localQs = queues.filter(q => q.queue_type !== "REMOTE" && q.usage !== "XMITQ" && !(q.name && q.name.includes("XMITQ")));
+      const remoteQs = queues.filter(q => q.queue_type === "REMOTE");
+      const xmitQs = queues.filter(q => q.usage === "XMITQ" || q.queue_type === "XMITQ" || (q.name && q.name.includes("XMITQ")));
+
+      let rowIdx = 0;
+      const drawQueueGroup = (qList, color, typeLabel) => {
+        if (qList.length === 0) return;
+        const y = queueStartY + rowIdx * queueRowH;
+        // Type badge
+        g.append("rect")
+          .attr("x", pos.x - colWidth / 2 + 8).attr("y", y - 6)
+          .attr("width", colWidth - 16).attr("height", 14)
+          .attr("rx", 3)
+          .attr("fill", `${color}10`)
+          .attr("stroke", `${color}25`)
+          .attr("stroke-width", 0.5);
+        g.append("text")
+          .attr("x", pos.x - colWidth / 2 + 14).attr("y", y + 3)
+          .attr("fill", color)
+          .attr("font-size", "7px").attr("font-family", T.fontMono)
+          .text(`${typeLabel} (${qList.length})`);
+
+        // Show first few queue names
+        qList.slice(0, 2).forEach((q, qi) => {
+          rowIdx++;
+          const qy = queueStartY + rowIdx * queueRowH;
+          g.append("text")
+            .attr("x", pos.x - colWidth / 2 + 20).attr("y", qy + 3)
+            .attr("fill", T.t4)
+            .attr("font-size", "6px").attr("font-family", T.fontMono)
+            .text((q.name || q.id).slice(0, 22));
+        });
+        if (qList.length > 2) {
+          rowIdx++;
+          const qy = queueStartY + rowIdx * queueRowH;
+          g.append("text")
+            .attr("x", pos.x - colWidth / 2 + 20).attr("y", qy + 3)
+            .attr("fill", T.t4)
+            .attr("font-size", "6px").attr("font-family", T.fontMono).attr("font-style", "italic")
+            .text(`+${qList.length - 2} more`);
+        }
+        rowIdx++;
+      };
+
+      // Owns line from QM to queue area
+      g.append("line")
+        .attr("x1", pos.x).attr("y1", qmY + 18)
+        .attr("x2", pos.x).attr("y2", queueStartY - 6)
+        .attr("stroke", `${T.amber}30`)
+        .attr("stroke-width", 0.5)
+        .attr("stroke-dasharray", "2 2");
+
+      drawQueueGroup(localQs, T.amber, "LOCAL");
+      drawQueueGroup(remoteQs, T.amber, "REMOTE");
+      drawQueueGroup(xmitQs, T.purple, "XMITQ");
+    });
+  }
+
+  // ── Zoom to fit ────────────────────────────────────────────────────
+  const allPoints = [];
+  Object.values(qmPos).forEach(p => allPoints.push(p));
+  appNodes.forEach(a => {
+    const qmId = appToQm[a.id];
+    if (qmId && qmPos[qmId]) allPoints.push({ x: qmPos[qmId].x, y: appY });
+  });
+  // Add bottom padding for queues
+  if (showQueues && allPoints.length > 0) {
+    allPoints.push({ x: allPoints[0].x, y: h * 0.9 });
+  }
+  if (allPoints.length > 0) zoomToFit(svg, zoom, allPoints, w, h);
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SHARED UTILITY — Zoom to Fit
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function zoomToFit(svg, zoom, nodes, w, h) {
+  const xs = nodes.map(n => n.x).filter(v => isFinite(v));
+  const ys = nodes.map(n => n.y).filter(v => isFinite(v));
+  if (!xs.length) return;
+
+  const xMin = Math.min(...xs), xMax = Math.max(...xs);
+  const yMin = Math.min(...ys), yMax = Math.max(...ys);
+  const gw = xMax - xMin || 1, gh = yMax - yMin || 1;
+  const pad = 30;
+  const scale = Math.min((w - pad * 2) / gw, (h - pad * 2) / gh, 4);
+  const tx = (w - gw * scale) / 2 - xMin * scale;
+  const ty = (h - gh * scale) / 2 - yMin * scale;
+
+  svg.transition().duration(600).call(
+    zoom.transform,
+    d3.zoomIdentity.translate(tx, ty).scale(scale)
+  );
+}
+
 
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -673,10 +1289,10 @@ export default function App() {
 
   // Inject styles once
   useEffect(() => {
-    const existing = document.getElementById("mq-titan-styles");
+    const existing = document.getElementById("intelliai-styles");
     if (!existing) {
       const el = document.createElement("style");
-      el.id = "mq-titan-styles";
+      el.id = "intelliai-styles";
       el.textContent = STYLE_TAG;
       document.head.appendChild(el);
     }
@@ -788,8 +1404,8 @@ export default function App() {
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
 
-      console.log("[MQ-TITAN] Review response keys:", Object.keys(data));
-      console.log("[MQ-TITAN] Review response flags:", {
+      console.log("[IntelliAI] Review response keys:", Object.keys(data));
+      console.log("[IntelliAI] Review response flags:", {
         human_approved: data.human_approved,
         awaiting_human_review: data.awaiting_human_review,
         has_mqsc: Array.isArray(data.mqsc_scripts) && data.mqsc_scripts.length > 0,
@@ -823,7 +1439,7 @@ export default function App() {
       const res = await fetch(`${API}/api/demo`, { method: "POST" });
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
-      console.log("[MQ-TITAN] Demo response keys:", Object.keys(data));
+      console.log("[IntelliAI] Demo response keys:", Object.keys(data));
       setResult(data);
       setTab("review"); // Always go to review first — that's the pipeline flow
     } catch (e) { setError(e.message); } finally { setLoading(false); }
@@ -879,10 +1495,10 @@ export default function App() {
                 fontSize: 16, fontWeight: 700, fontFamily: T.fontDisplay, color: T.t1,
                 letterSpacing: "0.04em", margin: 0, lineHeight: 1,
               }}>
-                MQ-TITAN
+                IntelliAI
               </h1>
               <p style={{ fontSize: 9, color: T.t3, margin: 0, fontFamily: T.fontMono, letterSpacing: "0.08em", textTransform: "uppercase" }}>
-                Topology Intelligence & Transformation
+                Intelligent MQ Topology Simplification
               </p>
             </div>
           </div>
@@ -999,17 +1615,6 @@ export default function App() {
             <div style={{ animation: "fadeUp 0.4s ease-out" }}>
               {/* Controls bar */}
               <div style={{ display: "flex", gap: 12, marginBottom: 14, alignItems: "center", flexWrap: "wrap" }}>
-                <button onClick={() => setTopoShowQueues(!topoShowQueues)} style={{
-                  padding: "6px 14px", borderRadius: T.r1, fontSize: 11, fontFamily: T.fontMono,
-                  background: topoShowQueues ? T.cyanBg : T.bg2,
-                  border: `1px solid ${topoShowQueues ? T.cyan : T.border1}`,
-                  color: topoShowQueues ? T.cyan : T.t2, cursor: "pointer",
-                }}>
-                  {topoShowQueues ? "◆ Full MQ Objects" : "◇ QM + App Only"}
-                </button>
-
-                <div style={{ width: 1, height: 24, background: T.border1 }} />
-
                 <span style={{ fontSize: 10, color: T.t3, fontFamily: T.fontMono }}>TRACE APP:</span>
                 <select
                   value={topoFilterApp}
@@ -1026,11 +1631,22 @@ export default function App() {
                   ))}
                 </select>
                 {topoFilterApp && (
-                  <button onClick={() => setTopoFilterApp("")} style={{
-                    padding: "4px 10px", borderRadius: T.r1, fontSize: 10,
-                    background: T.redBg, border: `1px solid ${T.redBorder}`,
-                    color: T.red, cursor: "pointer",
-                  }}>✕ Clear</button>
+                  <>
+                    <button onClick={() => setTopoFilterApp("")} style={{
+                      padding: "4px 10px", borderRadius: T.r1, fontSize: 10,
+                      background: T.redBg, border: `1px solid ${T.redBorder}`,
+                      color: T.red, cursor: "pointer",
+                    }}>✕ Clear</button>
+                    <div style={{ width: 1, height: 24, background: T.border1 }} />
+                    <button onClick={() => setTopoShowQueues(!topoShowQueues)} style={{
+                      padding: "6px 14px", borderRadius: T.r1, fontSize: 11, fontFamily: T.fontMono,
+                      background: topoShowQueues ? T.cyanBg : T.bg2,
+                      border: `1px solid ${topoShowQueues ? T.cyan : T.border1}`,
+                      color: topoShowQueues ? T.cyan : T.t2, cursor: "pointer",
+                    }}>
+                      {topoShowQueues ? "◆ Full MQ Objects" : "◇ Show Queues"}
+                    </button>
+                  </>
                 )}
               </div>
 
@@ -1042,7 +1658,7 @@ export default function App() {
                   graphData={topoFilterApp ? filteredTargetGraph : result.target_graph}
                   title={topoFilterApp ? `Target — ${topoFilterApp}` : "Target State"}
                   height={520}
-                  showQueues={topoShowQueues}
+                  showQueues={topoFilterApp ? topoShowQueues : false}
                   badge={topoFilterApp
                     ? <Badge color={T.green} style={{ fontSize: 9 }}>FILTERED</Badge>
                     : <Badge color={T.green} style={{ fontSize: 9 }}>OPTIMISED</Badge>
@@ -1876,7 +2492,7 @@ function UploadTab({ runDemo, handleUpload }) {
           marginBottom: 10, letterSpacing: "-0.01em",
           animation: "fadeUp 0.5s ease-out 0.1s both",
         }}>
-          MQ Topology Intelligence
+          Intelligent MQ Topology
         </h2>
         <p style={{
           fontSize: 14, color: T.t3, lineHeight: 1.7, maxWidth: 460, margin: "0 auto",
