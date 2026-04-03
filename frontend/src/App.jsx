@@ -1309,6 +1309,267 @@ const TAB_CONFIG = [
    MAIN APP
    ═══════════════════════════════════════════════════════════════════════════ */
 
+// ═══════════════════════════════════════════════════════════════════════════
+// DIFF TOPOLOGY VIEW — overlay showing added/removed/unchanged elements
+// Layout: original QMs on inner ring, new QMs on outer ring
+// Z-order: unchanged (back) → added (mid) → removed (front, prominent)
+// ═══════════════════════════════════════════════════════════════════════════
+function DiffTopologyView({ asIsGraph, targetGraph, diff, height = 600 }) {
+  const svgRef = useRef(null);
+
+  useEffect(() => {
+    if (!asIsGraph || !targetGraph || !diff || !svgRef.current) return;
+
+    const svg = svgRef.current;
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    const w = svg.clientWidth || 900;
+    const h = height;
+
+    // Classify nodes
+    const asIsNodes = new Set((asIsGraph.nodes || []).filter(n => n.type === "qm").map(n => n.id));
+    const targetNodes = new Set((targetGraph.nodes || []).filter(n => n.type === "qm").map(n => n.id));
+    const removedQMs = new Set(diff.qms_removed || []);
+    const addedQMs = new Set(diff.qms_added || []);
+    const unchangedQMs = [...asIsNodes].filter(q => targetNodes.has(q) && !removedQMs.has(q) && !addedQMs.has(q));
+
+    // Classify edges
+    const addedChannels = new Set((diff.channels_added || []).map(c => `${c[0]}→${c[1]}`));
+    const removedChannels = new Set((diff.channels_removed || []).map(c => `${c[0]}→${c[1]}`));
+    const asIsEdgeKeys = new Set((asIsGraph.edges || []).filter(e => e.rel === "channel").map(e => `${e.source}→${e.target}`));
+    const targetEdgeKeys = new Set((targetGraph.edges || []).filter(e => e.rel === "channel").map(e => `${e.source}→${e.target}`));
+    const unchangedEdges = [...asIsEdgeKeys].filter(k => targetEdgeKeys.has(k) && !removedChannels.has(k) && !addedChannels.has(k));
+
+    const allQMs = [...new Set([...asIsNodes, ...targetNodes])];
+    if (allQMs.length === 0) return;
+
+    const cx = w / 2, cy = h / 2;
+    const ns = "http://www.w3.org/2000/svg";
+
+    // ── DUAL RING LAYOUT ──
+    // Inner ring: original/unchanged QMs (the as-is backbone)
+    // Outer ring: newly added QMs (the 1:1 expansions)
+    // Removed QMs placed on inner ring with X marker
+    const innerQMs = [...unchangedQMs, ...[...removedQMs]];
+    const outerQMs = [...addedQMs];
+    const innerR = Math.min(w, h) * 0.24;
+    const outerR = Math.min(w, h) * 0.42;
+    const positions = {};
+
+    innerQMs.forEach((qm, i) => {
+      const angle = (2 * Math.PI * i) / Math.max(innerQMs.length, 1) - Math.PI / 2;
+      positions[qm] = { x: cx + innerR * Math.cos(angle), y: cy + innerR * Math.sin(angle) };
+    });
+    outerQMs.forEach((qm, i) => {
+      const angle = (2 * Math.PI * i) / Math.max(outerQMs.length, 1) - Math.PI / 2;
+      positions[qm] = { x: cx + outerR * Math.cos(angle), y: cy + outerR * Math.sin(angle) };
+    });
+
+    // ── LAYER 0: Ring guides (subtle) ──
+    [innerR, outerR].forEach(r => {
+      const circle = document.createElementNS(ns, "circle");
+      circle.setAttribute("cx", cx); circle.setAttribute("cy", cy); circle.setAttribute("r", r);
+      circle.setAttribute("fill", "none"); circle.setAttribute("stroke", "#1e293b");
+      circle.setAttribute("stroke-width", "1"); circle.setAttribute("stroke-dasharray", "3,6");
+      svg.appendChild(circle);
+    });
+
+    // Ring labels
+    const labelInner = document.createElementNS(ns, "text");
+    labelInner.setAttribute("x", cx); labelInner.setAttribute("y", cy - innerR - 8);
+    labelInner.setAttribute("text-anchor", "middle"); labelInner.setAttribute("font-size", "9");
+    labelInner.setAttribute("font-family", "DM Sans, sans-serif"); labelInner.setAttribute("fill", "#475569");
+    labelInner.textContent = `ORIGINAL QMs (${innerQMs.length})`;
+    svg.appendChild(labelInner);
+
+    const labelOuter = document.createElementNS(ns, "text");
+    labelOuter.setAttribute("x", cx); labelOuter.setAttribute("y", cy - outerR - 8);
+    labelOuter.setAttribute("text-anchor", "middle"); labelOuter.setAttribute("font-size", "9");
+    labelOuter.setAttribute("font-family", "DM Sans, sans-serif"); labelOuter.setAttribute("fill", "#22c55e60");
+    labelOuter.textContent = `NEW DEDICATED QMs (${outerQMs.length})`;
+    svg.appendChild(labelOuter);
+
+    // Helper to draw a line
+    function drawLine(src, tgt, color, width, opacity, dash) {
+      if (!positions[src] || !positions[tgt]) return null;
+      const line = document.createElementNS(ns, "line");
+      line.setAttribute("x1", positions[src].x); line.setAttribute("y1", positions[src].y);
+      line.setAttribute("x2", positions[tgt].x); line.setAttribute("y2", positions[tgt].y);
+      line.setAttribute("stroke", color); line.setAttribute("stroke-width", width);
+      line.setAttribute("opacity", opacity);
+      if (dash) line.setAttribute("stroke-dasharray", dash);
+      return line;
+    }
+
+    // ── LAYER 1: Unchanged edges (very faint, background) ──
+    unchangedEdges.forEach(key => {
+      const [src, tgt] = key.split("→");
+      const line = drawLine(src, tgt, "#334155", "0.5", "0.2", null);
+      if (line) svg.appendChild(line);
+    });
+
+    // ── LAYER 2: Added edges (green, moderate) ──
+    addedChannels.forEach(key => {
+      const [src, tgt] = key.split("→");
+      const line = drawLine(src, tgt, "#22c55e", "1.2", "0.35", null);
+      if (line) svg.appendChild(line);
+    });
+
+    // ── LAYER 3: Removed edges (red, prominent, ON TOP) ──
+    removedChannels.forEach(key => {
+      const [src, tgt] = key.split("→");
+      const line = drawLine(src, tgt, "#ef4444", "1.5", "0.7", "4,3");
+      if (line) svg.appendChild(line);
+    });
+
+    // ── LAYER 4: Nodes (always on top of edges) ──
+    const nodeSize = allQMs.length > 80 ? 5 : allQMs.length > 40 ? 7 : 10;
+    const fontSize = allQMs.length > 80 ? 5 : allQMs.length > 40 ? 6.5 : 8;
+    const showLabels = allQMs.length <= 100;
+
+    // Unchanged nodes
+    unchangedQMs.forEach(qm => {
+      const pos = positions[qm]; if (!pos) return;
+      const c = document.createElementNS(ns, "circle");
+      c.setAttribute("cx", pos.x); c.setAttribute("cy", pos.y);
+      c.setAttribute("r", nodeSize * 0.8); c.setAttribute("fill", "#475569"); c.setAttribute("opacity", "0.6");
+      svg.appendChild(c);
+      if (showLabels) {
+        const t = document.createElementNS(ns, "text");
+        t.setAttribute("x", pos.x); t.setAttribute("y", pos.y + nodeSize + 8);
+        t.setAttribute("text-anchor", "middle"); t.setAttribute("font-size", fontSize);
+        t.setAttribute("font-family", "JetBrains Mono, monospace"); t.setAttribute("fill", "#64748b");
+        t.textContent = qm.length > 10 ? qm.slice(0, 9) + "…" : qm;
+        svg.appendChild(t);
+      }
+    });
+
+    // Added nodes (green, outer ring)
+    outerQMs.forEach(qm => {
+      const pos = positions[qm]; if (!pos) return;
+      const c = document.createElementNS(ns, "circle");
+      c.setAttribute("cx", pos.x); c.setAttribute("cy", pos.y);
+      c.setAttribute("r", nodeSize); c.setAttribute("fill", "#22c55e"); c.setAttribute("opacity", "0.8");
+      svg.appendChild(c);
+      if (showLabels) {
+        const t = document.createElementNS(ns, "text");
+        t.setAttribute("x", pos.x); t.setAttribute("y", pos.y + nodeSize + 8);
+        t.setAttribute("text-anchor", "middle"); t.setAttribute("font-size", fontSize);
+        t.setAttribute("font-family", "JetBrains Mono, monospace"); t.setAttribute("fill", "#22c55e");
+        t.textContent = qm.length > 10 ? qm.slice(0, 9) + "…" : qm;
+        svg.appendChild(t);
+      }
+    });
+
+    // Removed nodes (red X marker, very prominent)
+    [...removedQMs].forEach(qm => {
+      const pos = positions[qm]; if (!pos) return;
+      const s = nodeSize * 1.2;
+      // Red circle with X
+      const c = document.createElementNS(ns, "circle");
+      c.setAttribute("cx", pos.x); c.setAttribute("cy", pos.y);
+      c.setAttribute("r", s); c.setAttribute("fill", "#ef444430");
+      c.setAttribute("stroke", "#ef4444"); c.setAttribute("stroke-width", "2");
+      svg.appendChild(c);
+      // X cross
+      const x1 = document.createElementNS(ns, "line");
+      x1.setAttribute("x1", pos.x - s * 0.5); x1.setAttribute("y1", pos.y - s * 0.5);
+      x1.setAttribute("x2", pos.x + s * 0.5); x1.setAttribute("y2", pos.y + s * 0.5);
+      x1.setAttribute("stroke", "#ef4444"); x1.setAttribute("stroke-width", "2");
+      svg.appendChild(x1);
+      const x2 = document.createElementNS(ns, "line");
+      x2.setAttribute("x1", pos.x + s * 0.5); x2.setAttribute("y1", pos.y - s * 0.5);
+      x2.setAttribute("x2", pos.x - s * 0.5); x2.setAttribute("y2", pos.y + s * 0.5);
+      x2.setAttribute("stroke", "#ef4444"); x2.setAttribute("stroke-width", "2");
+      svg.appendChild(x2);
+      if (showLabels) {
+        const t = document.createElementNS(ns, "text");
+        t.setAttribute("x", pos.x); t.setAttribute("y", pos.y + s + 10);
+        t.setAttribute("text-anchor", "middle"); t.setAttribute("font-size", fontSize);
+        t.setAttribute("font-family", "JetBrains Mono, monospace"); t.setAttribute("fill", "#ef4444");
+        t.textContent = qm;
+        svg.appendChild(t);
+      }
+    });
+
+    // ── LAYER 5: Legend ──
+    const legendBg = document.createElementNS(ns, "rect");
+    legendBg.setAttribute("x", 10); legendBg.setAttribute("y", 10);
+    legendBg.setAttribute("width", 175); legendBg.setAttribute("height", 105);
+    legendBg.setAttribute("rx", 6); legendBg.setAttribute("fill", "#0f172aDD");
+    legendBg.setAttribute("stroke", "#1e293b");
+    svg.appendChild(legendBg);
+
+    const legend = [
+      { color: "#ef4444", dash: "4,3", width: 2.5, label: `Removed (${removedChannels.size} ch, ${removedQMs.size} QMs)` },
+      { color: "#22c55e", dash: null, width: 2, label: `Added (${addedChannels.size} ch, ${addedQMs.size} QMs)` },
+      { color: "#475569", dash: null, width: 1, label: `Unchanged (${unchangedEdges.length} ch)` },
+    ];
+    legend.forEach((item, i) => {
+      const y = 30 + i * 24;
+      const line = document.createElementNS(ns, "line");
+      line.setAttribute("x1", 20); line.setAttribute("y1", y);
+      line.setAttribute("x2", 44); line.setAttribute("y2", y);
+      line.setAttribute("stroke", item.color); line.setAttribute("stroke-width", item.width);
+      if (item.dash) line.setAttribute("stroke-dasharray", item.dash);
+      svg.appendChild(line);
+
+      const text = document.createElementNS(ns, "text");
+      text.setAttribute("x", 50); text.setAttribute("y", y + 4);
+      text.setAttribute("font-size", "10"); text.setAttribute("font-family", "DM Sans, sans-serif");
+      text.setAttribute("fill", item.color);
+      text.textContent = item.label;
+      svg.appendChild(text);
+    });
+
+    // Net reduction callout (bottom right)
+    const netCh = removedChannels.size - addedChannels.size;
+    if (netCh > 0) {
+      const callout = document.createElementNS(ns, "text");
+      callout.setAttribute("x", w - 20); callout.setAttribute("y", h - 20);
+      callout.setAttribute("text-anchor", "end"); callout.setAttribute("font-size", "14");
+      callout.setAttribute("font-family", "JetBrains Mono, monospace");
+      callout.setAttribute("font-weight", "700"); callout.setAttribute("fill", "#22c55e");
+      callout.textContent = `NET: -${netCh} channels`;
+      svg.appendChild(callout);
+    }
+
+  }, [asIsGraph, targetGraph, diff, height]);
+
+  const diffStats = diff || {};
+  const netChannels = (diffStats.channels_removed?.length || 0) - (diffStats.channels_added?.length || 0);
+  return (
+    <div style={{
+      background: T.bg1, border: `1px solid ${T.border1}`, borderRadius: T.r2,
+      marginBottom: 16, overflow: "hidden",
+    }}>
+      <div style={{
+        padding: "10px 16px", borderBottom: `1px solid ${T.border1}`,
+        display: "flex", alignItems: "center", justifyContent: "space-between",
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={{ fontSize: 14 }}>◈</span>
+          <span style={{ fontFamily: T.fontMono, fontSize: 12, fontWeight: 600, color: T.t1 }}>
+            Topology Diff — As-Is vs Target
+          </span>
+          {netChannels > 0 && (
+            <Badge color="#22c55e" style={{ fontSize: 10, fontWeight: 700 }}>
+              NET: -{netChannels} channels simplified
+            </Badge>
+          )}
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <Badge color="#22c55e" style={{ fontSize: 9 }}>+{(diffStats.qms_added?.length || 0)} QMs</Badge>
+          <Badge color="#ef4444" style={{ fontSize: 9 }}>-{(diffStats.qms_removed?.length || 0)} QMs</Badge>
+          <Badge color="#22c55e" style={{ fontSize: 9 }}>+{(diffStats.channels_added?.length || 0)} ch</Badge>
+          <Badge color="#ef4444" style={{ fontSize: 9 }}>-{(diffStats.channels_removed?.length || 0)} ch</Badge>
+          <Badge color={T.amber} style={{ fontSize: 9 }}>{(diffStats.apps_reassigned?.length || 0)} moved</Badge>
+        </div>
+      </div>
+      <svg ref={svgRef} width="100%" height={height} style={{ display: "block" }} />
+    </div>
+  );
+}
+
 export default function App() {
   const [tab, setTab] = useState("upload");
   const [loading, setLoading] = useState(false);
@@ -1318,6 +1579,7 @@ export default function App() {
   const [reviewLoading, setReviewLoading] = useState(false);
   const [topoShowQueues, setTopoShowQueues] = useState(false);
   const [topoFilterApp, setTopoFilterApp] = useState("");
+  const [topoViewMode, setTopoViewMode] = useState("split"); // "split" | "diff"
 
   // ── LOCAL approval tracking ──
   // The backend pipeline re-runs from start on resume (Known Limitation #1).
@@ -1688,21 +1950,40 @@ export default function App() {
                 )}
               </div>
 
-              {/* Main graphs — side by side */}
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 16 }}>
-                <TopologyGraph graphData={result.as_is_graph} title="As-Is Topology" height={520}
-                  badge={<Badge color={T.t3} style={{ fontSize: 9 }}>CURRENT</Badge>} />
-                <TopologyGraph
-                  graphData={topoFilterApp ? filteredTargetGraph : result.target_graph}
-                  title={topoFilterApp ? `Target — ${topoFilterApp}` : "Target State"}
-                  height={520}
-                  showQueues={topoFilterApp ? topoShowQueues : false}
-                  badge={topoFilterApp
-                    ? <Badge color={T.green} style={{ fontSize: 9 }}>FILTERED</Badge>
-                    : <Badge color={T.green} style={{ fontSize: 9 }}>OPTIMISED</Badge>
-                  }
-                />
+              {/* Main graphs — mode toggle */}
+              <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+                {["split", "diff"].map(mode => (
+                  <button key={mode} onClick={() => setTopoViewMode(mode)} style={{
+                    padding: "6px 16px", borderRadius: T.r1, fontSize: 11, fontWeight: 600,
+                    fontFamily: T.fontMono, cursor: "pointer",
+                    background: topoViewMode === mode ? (mode === "diff" ? `${T.amber}18` : `${T.cyan}18`) : T.bg2,
+                    border: `1px solid ${topoViewMode === mode ? (mode === "diff" ? T.amber : T.cyan) : T.border1}`,
+                    color: topoViewMode === mode ? (mode === "diff" ? T.amber : T.cyan) : T.t3,
+                  }}>
+                    {mode === "split" ? "◫ Side-by-Side" : "◈ Diff Overlay"}
+                  </button>
+                ))}
               </div>
+
+              {topoViewMode === "split" ? (
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 16 }}>
+                  <TopologyGraph graphData={result.as_is_graph} title="As-Is Topology" height={520}
+                    badge={<Badge color={T.t3} style={{ fontSize: 9 }}>CURRENT</Badge>} />
+                  <TopologyGraph
+                    graphData={topoFilterApp ? filteredTargetGraph : result.target_graph}
+                    title={topoFilterApp ? `Target — ${topoFilterApp}` : "Target State"}
+                    height={520}
+                    showQueues={topoFilterApp ? topoShowQueues : false}
+                    badge={topoFilterApp
+                      ? <Badge color={T.green} style={{ fontSize: 9 }}>FILTERED</Badge>
+                      : <Badge color={T.green} style={{ fontSize: 9 }}>OPTIMISED</Badge>
+                    }
+                  />
+                </div>
+              ) : (
+                /* ── DIFF OVERLAY VIEW ── */
+                <DiffTopologyView asIsGraph={result.as_is_graph} targetGraph={result.target_graph} diff={result.topology_diff} height={600} />
+              )}
 
               {/* Summary bar */}
               <Card glow={result.validation_passed ? T.green : T.red} delay={0.1}>
@@ -1958,7 +2239,7 @@ export default function App() {
                       <p style={{ fontSize: 12, color: T.t3 }}>Per-QM runmqsc commands for the target state. Ready to execute.</p>
                     </div>
                     <DownloadButton label="Download All" onClick={() => {
-                      downloadFile(result.mqsc_scripts?.join("\n") || "", "mq_titan_target.mqsc");
+                      downloadFile(result.mqsc_scripts?.join("\n") || "", "intelli_ai_target.mqsc");
                     }} />
                   </div>
                   <Card>
@@ -2865,7 +3146,7 @@ function ReportViewer({ report, downloadFile }) {
     <>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
         <h2 style={{ fontSize: 16, fontWeight: 600, fontFamily: T.fontDisplay, color: T.t1 }}>Final Analysis Report</h2>
-        <DownloadButton label="Download Full Report" onClick={() => downloadFile(report, "mq_titan_report.md")} />
+        <DownloadButton label="Download Full Report" onClick={() => downloadFile(report, "intelli_ai_report.md")} />
       </div>
       {sections.map((section, i) => (
         <ReportSection key={i} title={section.title} lines={section.lines}
