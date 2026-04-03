@@ -196,17 +196,18 @@ def compute_complexity(G: nx.DiGraph, baseline_overrides: dict = None) -> dict:
     # Baselines scale with input size so the score is meaningful
     # regardless of whether the topology has 5 QMs or 50.
     #
-    # WEIGHT RATIONALE:
-    #   CC (30%): Channel count is the single biggest driver of operational
-    #             complexity — each channel is a failure point to monitor.
+    # WEIGHT RATIONALE (6 factors, sum = 1.00):
+    #   CC (25%): Channel count drives operational complexity — each channel
+    #             is a failure point to monitor.
     #   CI (25%): Coupling index measures how tangled apps are with QMs.
     #             High coupling = hard to change anything without side effects.
     #   RD (20%): Routing depth = how many hops a message takes. More hops =
     #             more latency, more failure modes, harder to debug.
     #   FO (15%): Fan-out = max channels from one QM. High fan-out means one
     #             QM is a bottleneck / single point of failure.
-    #   OO (10%): Orphan objects = waste. Important but less impactful than
-    #             the structural factors above.
+    #   OO  (5%): Orphan objects = waste. Least impactful structural factor.
+    #   CS (10%): Channel sprawl = channels per QM ratio. In 1:1 topologies
+    #             QM count is fixed, so channel efficiency is the key lever.
     #
     # BASELINE RATIONALE:
     #   CC worst: 2 channels per QM is typical enterprise; 2*N is "messy but real"
@@ -256,7 +257,7 @@ def compute_complexity(G: nx.DiGraph, baseline_overrides: dict = None) -> dict:
         CS = CC / max(num_qms, 1)
 
     score = (
-        0.30 * norm(CC, cc_worst) +
+        0.25 * norm(CC, cc_worst) +
         0.25 * norm(max(CI - 1.0, 0), max(ci_worst, 0.01)) +
         0.20 * norm(RD, rd_worst) +
         0.15 * norm(FO, fo_worst) +
@@ -283,7 +284,7 @@ def compute_complexity(G: nx.DiGraph, baseline_overrides: dict = None) -> dict:
         "total_score": round(score, 1),
         "baselines": baselines,
         "factor_scores": {
-            "cc_weighted": round(0.30 * norm(CC, cc_worst), 1),
+            "cc_weighted": round(0.25 * norm(CC, cc_worst), 1),
             "ci_weighted": round(0.25 * norm(max(CI - 1.0, 0), max(ci_worst, 0.01)), 1),
             "rd_weighted": round(0.20 * norm(RD, rd_worst), 1),
             "fo_weighted": round(0.15 * norm(FO, fo_worst), 1),
