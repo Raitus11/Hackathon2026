@@ -78,6 +78,7 @@ class MQTitanState(TypedDict):
 
     # ── Doc Expert output ──────────────────────────────
     final_report: Optional[str]
+    deliverable_docs: Optional[dict]     # complexity-algorithm.md, insights.md, etc.
 
     # ── Error tracking ─────────────────────────────────
     error: Optional[str]

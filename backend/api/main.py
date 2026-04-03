@@ -77,6 +77,13 @@ def _build_response(session_id: str, result: dict) -> dict:
     as_is_graph_data  = graph_to_dict(result["as_is_graph"])     if result.get("as_is_graph")     else {}
     target_graph_data = graph_to_dict(result["optimised_graph"]) if result.get("optimised_graph") else {}
 
+    # Merge deliverable_docs into target_csvs so they're downloadable from the CSVs tab
+    target_csvs = result.get("target_csvs", {}) or {}
+    deliverable_docs = result.get("deliverable_docs", {}) or {}
+    for key, content in deliverable_docs.items():
+        if content:
+            target_csvs[key] = content
+
     return sanitise({
         "session_id":            session_id,
         "as_is_graph":           as_is_graph_data,
@@ -90,7 +97,7 @@ def _build_response(session_id: str, result: dict) -> dict:
         "mqsc_scripts":          result.get("mqsc_scripts", []),
         "final_report":          result.get("final_report"),
         "agent_trace":           result.get("messages", []),
-        "target_csvs":           result.get("target_csvs", {}),
+        "target_csvs":           target_csvs,
         "data_quality":          result.get("data_quality_report", {}),
         "awaiting_human_review": (
             result.get("awaiting_human_review", False)
@@ -102,6 +109,8 @@ def _build_response(session_id: str, result: dict) -> dict:
         "architect_method":      result.get("architect_method"),
         "migration_plan":        result.get("migration_plan"),
         "topology_diff":         result.get("topology_diff"),
+        "as_is_subgraphs":      result.get("as_is_subgraphs", []),
+        "target_subgraphs":     result.get("target_subgraphs", []),
     })
 
 

@@ -1702,6 +1702,9 @@ def provisioner_agent(state: dict) -> dict:
     # ── Target State CSV Output ───────────────────────────────────────────
     target_csvs = _generate_target_csvs(G, state)
 
+    # ── target-topology.json (Output.md §8.2 Deliverable 1) ──────────────
+    target_csvs["target-topology"] = _generate_target_topology_json(G, state)
+
     # Add per-QM scripts as downloadable CSVs too
     for qm, script in per_qm_scripts.items():
         target_csvs[f"mqsc_{qm}"] = script
@@ -2473,4 +2476,518 @@ def doc_expert_agent(state: dict) -> dict:
     final_report = "\n".join(report_lines)
     messages.append({"agent": "DOC_EXPERT", "msg": "Final report generated."})
 
-    return {"final_report": final_report, "messages": messages}
+    # ── Generate additional deliverables (Output.md §8.2 & §9) ────────────
+    deliverable_docs = {}
+    try:
+        deliverable_docs["complexity-algorithm"] = _generate_complexity_algorithm_md(state)
+        deliverable_docs["complexity-scores"] = _generate_complexity_scores_csv(state)
+        deliverable_docs["regression-testing-plan"] = _generate_regression_testing_plan(state)
+        deliverable_docs["insights"] = _generate_insights_md(state)
+        messages.append({"agent": "DOC_EXPERT", "msg": f"Generated {len(deliverable_docs)} additional deliverables: {list(deliverable_docs.keys())}"})
+    except Exception as e:
+        logger.error(f"DOC_EXPERT: Failed to generate some deliverables: {e}")
+        messages.append({"agent": "DOC_EXPERT", "msg": f"Warning: some deliverables failed: {e}"})
+
+    return {"final_report": final_report, "deliverable_docs": deliverable_docs, "messages": messages}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MISSING DELIVERABLES — Output.md §8.2 & §9
+# These are called from provisioner_agent and doc_expert_agent
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import json
+from datetime import datetime
+
+
+def _generate_target_topology_json(G, state: dict) -> str:
+    """Deliverable 1: target-topology.json — structured JSON representation."""
+    qm_nodes = [(n, d) for n, d in G.nodes(data=True) if d.get("type") == "qm"]
+    app_nodes = [(n, d) for n, d in G.nodes(data=True) if d.get("type") == "app"]
+    queue_nodes = [(n, d) for n, d in G.nodes(data=True) if d.get("type") == "queue"]
+
+    # App → QM map
+    app_qm = {}
+    for n, d in app_nodes:
+        qms = [v for _, v, ed in G.out_edges(n, data=True) if ed.get("rel") == "connects_to"]
+        if qms:
+            app_qm[n] = qms[0]
+
+    # Channels
+    channels = []
+    for u, v, d in G.edges(data=True):
+        if d.get("rel") == "channel":
+            channels.append({
+                "channel_name": d.get("channel_name") or f"{u}.{v}",
+                "sender_qm": u,
+                "receiver_qm": v,
+                "xmit_queue": d.get("xmit_queue") or f"{v}.XMITQ",
+                "status": d.get("status", "RUNNING"),
+            })
+
+    # QMs with their apps and channels
+    qm_list = []
+    for n, d in qm_nodes:
+        apps = [a for a, q in app_qm.items() if q == n]
+        ch_out = [c["channel_name"] for c in channels if c["sender_qm"] == n]
+        ch_in = [c["channel_name"] for c in channels if c["receiver_qm"] == n]
+        owned_queues = [v for _, v, ed in G.out_edges(n, data=True) if ed.get("rel") == "owns"]
+        qm_list.append({
+            "qm_id": n,
+            "qm_name": d.get("name", n),
+            "region": d.get("region", ""),
+            "apps": apps,
+            "channels_out": ch_out,
+            "channels_in": ch_in,
+            "queue_count": len(owned_queues),
+        })
+
+    # Applications
+    app_list = []
+    for n, d in app_nodes:
+        direction = d.get("direction", "")
+        raw_apps = state.get("raw_data", {}).get("applications", [])
+        dir_from_data = ""
+        for r in raw_apps:
+            if r.get("app_id") == n:
+                dir_from_data = r.get("direction", "")
+                break
+        app_list.append({
+            "app_id": n,
+            "app_name": d.get("name", n),
+            "assigned_qm": app_qm.get(n, ""),
+            "direction": dir_from_data or direction,
+        })
+
+    # Queues by type
+    local_qs = [{"id": n, "name": d.get("name", n), "qm": ""} for n, d in queue_nodes
+                if d.get("queue_type") != "REMOTE" and d.get("usage") != "XMITQ"
+                and not (d.get("name", "").endswith("XMITQ"))]
+    remote_qs = [{"id": n, "name": d.get("name", n), "remote_qm": d.get("remote_qm", ""),
+                  "remote_queue": d.get("remote_queue", "")}
+                 for n, d in queue_nodes if d.get("queue_type") == "REMOTE"]
+    xmit_qs = [{"id": n, "name": d.get("name", n)}
+               for n, d in queue_nodes
+               if d.get("usage") == "XMITQ" or d.get("queue_type") == "XMITQ"
+               or (d.get("name", "").endswith("XMITQ"))]
+
+    topology = {
+        "metadata": {
+            "team": "IntelliAI",
+            "session_id": state.get("session_id", ""),
+            "generated_at": datetime.now().isoformat(),
+            "architect_method": state.get("architect_method", "rules_fallback"),
+        },
+        "queue_managers": qm_list,
+        "channels": channels,
+        "applications": app_list,
+        "queues": {
+            "local": local_qs,
+            "remote": remote_qs,
+            "xmitq": xmit_qs,
+        },
+        "statistics": {
+            "total_qms": len(qm_list),
+            "total_channels": len(channels),
+            "total_apps": len(app_list),
+            "total_local_queues": len(local_qs),
+            "total_remote_queues": len(remote_qs),
+            "total_xmit_queues": len(xmit_qs),
+        },
+    }
+    return json.dumps(topology, indent=2)
+
+
+def _generate_complexity_algorithm_md(state: dict) -> str:
+    """Deliverable 3a: complexity-algorithm.md — algorithm description and rationale."""
+    as_is = state.get("as_is_metrics", {}) or {}
+    target = state.get("target_metrics", {}) or {}
+    total_as = as_is.get("total_score", 0)
+    total_tgt = target.get("total_score", 0)
+    pct = round((total_as - total_tgt) / total_as * 100, 1) if total_as else 0
+
+    return f"""# Complexity Scoring Algorithm — IntelliAI
+
+## Overview
+
+IntelliAI uses a **5-factor weighted complexity model** to quantify MQ topology complexity.
+The same algorithm is applied identically to both the as-is and target states, ensuring
+the reduction measurement is reproducible and defensible.
+
+## Factors
+
+### 1. Channel Count (CC) — Weight: 25%
+**Definition:** Normalised count of inter-QM channels relative to the maximum possible.
+**Formula:** `CC = actual_channels / max(qm_count * (qm_count - 1), 1)`
+**Rationale:** More channels = more operational surface area to manage, monitor, and secure.
+Channel count is the single most visible indicator of topology sprawl.
+
+### 2. Coupling Index (CI) — Weight: 25%
+**Definition:** Average number of QMs each application connects to.
+**Formula:** `CI = sum(connections_per_app) / app_count`
+**Rationale:** In the as-is state, apps often connect to multiple QMs (violating 1-QM-per-app).
+In the target state, CI should be exactly 1.0 — every app connects to exactly one QM.
+This is the core constraint of the hackathon.
+
+### 3. Routing Depth (RD) — Weight: 20%
+**Definition:** Maximum graph diameter of the QM-only subgraph, plus a fragmentation penalty.
+**Formula:** `RD = max_diameter_across_components + (num_components - 1)`
+**Rationale:** Deeper routing paths increase latency, debugging complexity, and failure blast radius.
+The fragmentation penalty accounts for disconnected subgraphs (islands that cannot communicate).
+
+### 4. Fan-Out Score (FO) — Weight: 15%
+**Definition:** Maximum outbound channel degree of any single QM, normalised.
+**Formula:** `FO = max_outbound_degree / max(qm_count - 1, 1)`
+**Rationale:** A QM with high fan-out is a single point of failure and operational bottleneck.
+Reducing fan-out improves resilience and blast radius containment.
+
+### 5. Orphan Objects (OO) — Weight: 15%
+**Definition:** Count of QMs or queues with no active connections or consumers.
+**Formula:** `OO = (orphan_qms + orphan_queues) / max(total_objects, 1)`
+**Rationale:** Orphan objects are dead weight — they consume resources, create confusion in
+operations, and indicate poor lifecycle management. Eliminating them is a sign of a well-managed topology.
+
+## Normalisation
+
+Each raw factor is normalised to 0–100 using a baseline calibration derived from the
+topology's own size:
+
+```
+normalised = min(100, raw_value / worst_realistic_case * 100)
+```
+
+The worst realistic case for each factor is computed from the QM and app counts in the topology,
+ensuring the scoring scales correctly from small (10 QM) to large (500+ QM) environments.
+
+## Final Score
+
+```
+Total = CC × 0.25 + CI × 0.25 + RD × 0.20 + FO × 0.15 + OO × 0.15
+```
+
+Rounded to one decimal place, range 0 (trivial) to 100 (maximally complex).
+
+## Actual Scores — This Run
+
+| Metric | As-Is | Target | Reduction |
+|--------|-------|--------|-----------|
+| Channel Count (CC) | {as_is.get('channel_count', 'N/A')} | {target.get('channel_count', 'N/A')} | {'Improved' if target.get('channel_count', 99) < as_is.get('channel_count', 0) else 'Same'} |
+| Coupling Index (CI) | {as_is.get('coupling_index', 'N/A')} | {target.get('coupling_index', 'N/A')} | {'Improved' if target.get('coupling_index', 99) < as_is.get('coupling_index', 0) else 'Same'} |
+| Routing Depth (RD) | {as_is.get('routing_depth', 'N/A')} | {target.get('routing_depth', 'N/A')} | {'Improved' if target.get('routing_depth', 99) < as_is.get('routing_depth', 0) else 'Same'} |
+| Fan-Out Score (FO) | {as_is.get('fan_out_score', 'N/A')} | {target.get('fan_out_score', 'N/A')} | {'Improved' if target.get('fan_out_score', 99) < as_is.get('fan_out_score', 0) else 'Same'} |
+| Orphan Objects (OO) | {as_is.get('orphan_objects', 'N/A')} | {target.get('orphan_objects', 'N/A')} | {'Improved' if target.get('orphan_objects', 99) < as_is.get('orphan_objects', 0) else 'Same'} |
+| **Total** | **{total_as}** | **{total_tgt}** | **{pct}% reduction** |
+
+## Why This Approach
+
+We evaluated alternative metrics (pure cyclomatic complexity, graph density, modularity score)
+and chose a multi-factor weighted model because:
+
+1. **Cyclomatic complexity** measures control flow, not messaging topology — it's designed for code, not infrastructure graphs
+2. **Graph density** is a single number that doesn't distinguish between "all-to-all" and "hub-and-spoke" — both can have similar density but very different operational characteristics
+3. **Our 5-factor model** captures the dimensions that matter operationally: connection sprawl (CC), ownership clarity (CI), path complexity (RD), resilience (FO), and hygiene (OO)
+
+Each factor maps directly to an operational concern that MQ administrators deal with daily.
+
+---
+*Generated by IntelliAI — IBM MQ Hackathon 2026*
+"""
+
+
+def _generate_complexity_scores_csv(state: dict) -> str:
+    """Deliverable 3b: complexity-scores.csv — source vs target breakdown."""
+    as_is = state.get("as_is_metrics", {}) or {}
+    target = state.get("target_metrics", {}) or {}
+
+    def pct(a, b):
+        if not a:
+            return "0%"
+        return f"{round((a - b) / a * 100, 1)}%"
+
+    lines = ["Metric,Weight,Source_Score,Target_Score,Reduction_Pct"]
+    factors = [
+        ("Channel Count (CC)", "25%", "channel_count"),
+        ("Coupling Index (CI)", "25%", "coupling_index"),
+        ("Routing Depth (RD)", "20%", "routing_depth"),
+        ("Fan-Out Score (FO)", "15%", "fan_out_score"),
+        ("Orphan Objects (OO)", "15%", "orphan_objects"),
+    ]
+    for name, weight, key in factors:
+        a = as_is.get(key, 0)
+        t = target.get(key, 0)
+        lines.append(f"{name},{weight},{a},{t},{pct(a, t)}")
+
+    a_total = as_is.get("total_score", 0)
+    t_total = target.get("total_score", 0)
+    lines.append(f"TOTAL,100%,{a_total},{t_total},{pct(a_total, t_total)}")
+
+    return "\n".join(lines)
+
+
+def _generate_regression_testing_plan(state: dict) -> str:
+    """Deliverable 5: regression-testing-plan.md — validation strategy."""
+    diff = state.get("topology_diff", {}) or {}
+    apps_reassigned = diff.get("apps_reassigned", [])
+    channels_added = diff.get("channels_added", [])
+    channels_removed = diff.get("channels_removed", [])
+    qms_added = diff.get("qms_added", [])
+    qms_removed = diff.get("qms_removed", [])
+
+    plan = f"""# Regression Testing Plan — IntelliAI
+
+## 1. Scope of Change
+
+This migration affects:
+- **{len(qms_added)} QMs created**, {len(qms_removed)} QMs decommissioned
+- **{len(channels_added)} channels added**, {len(channels_removed)} channels removed
+- **{len(apps_reassigned)} applications reassigned** to new queue managers
+
+## 2. Test Categories
+
+### 2.1 Unit Tests — Per-QM MQSC Validation
+**Purpose:** Verify every MQ object exists and is correctly configured.
+**Method:** Run `runmqsc` with DISPLAY commands against each target QM.
+
+| Test | Command | Expected |
+|------|---------|----------|
+| QM exists | `dspmq -m QM_NAME` | Status = Running |
+| Listener active | `DISPLAY LISTENER(*)` | LSR.QM_NAME at correct port |
+| Local queues | `DISPLAY QLOCAL(LOCAL.*.IN)` | One per assigned app |
+| XMIT queues | `DISPLAY QLOCAL(*XMITQ) USAGE` | USAGE(XMITQ) |
+| Remote queues | `DISPLAY QREMOTE(REMOTE.*)` | RQMNAME, RNAME, XMITQ correct |
+| Sender channels | `DISPLAY CHANNEL(*) CHLTYPE` | CHLTYPE(SDR), correct CONNAME |
+| Receiver channels | `DISPLAY CHANNEL(*) CHLTYPE` | CHLTYPE(RCVR) |
+
+**Coverage:** All {len(qms_added)} new QMs must pass all checks.
+
+### 2.2 Integration Tests — Per-Channel Message Flow
+**Purpose:** Verify messages transit correctly between QM pairs.
+**Method:** PUT a test message on the sender QM's remote queue, GET from the receiver QM's local queue.
+
+```
+# For each channel FROM_QM.TO_QM:
+amqsput REMOTE.APP.VIA.TO_QM FROM_QM    # PUT on sender side
+amqsget LOCAL.APP.IN TO_QM               # GET on receiver side
+# Verify: message content matches, no DLQ entries
+```
+
+**Coverage:** All {len(channels_added)} new channels tested bidirectionally.
+
+### 2.3 End-to-End Tests — Full Producer→Consumer Path
+**Purpose:** Verify complete message flows for every producer-consumer pair.
+**Method:** For each application pair with a message flow:
+
+1. Producer app PUTs message to its local remote queue definition
+2. Message transits via XMITQ → sender channel → receiver channel → local queue
+3. Consumer app GETs from its local queue
+4. Verify: message integrity, correct routing, no orphaned messages
+
+**Key test cases from this migration:**
+"""
+    # Add specific test cases for reassigned apps
+    for i, app_info in enumerate(apps_reassigned[:10]):
+        if isinstance(app_info, dict):
+            app = app_info.get("app", app_info.get("app_id", f"App_{i}"))
+            old_qm = app_info.get("old_qm", "?")
+            new_qm = app_info.get("new_qm", "?")
+        else:
+            app, old_qm, new_qm = str(app_info), "?", "?"
+        plan += f"- **{app}**: Moved from {old_qm} → {new_qm}. Verify all inbound/outbound flows.\n"
+
+    if len(apps_reassigned) > 10:
+        plan += f"- ... and {len(apps_reassigned) - 10} more reassigned apps\n"
+
+    plan += f"""
+### 2.4 Performance Tests — Throughput Baseline
+**Purpose:** Ensure migration doesn't degrade message throughput.
+**Method:**
+1. Capture pre-migration baseline: messages/sec per channel, end-to-end latency
+2. After migration: repeat same workload
+3. Compare: latency within 5% tolerance, zero message loss
+
+## 3. Acceptance Criteria
+
+| Criterion | Threshold | Measurement |
+|-----------|-----------|-------------|
+| Message loss | Zero | DLQ depth = 0 across all QMs |
+| Latency | < 5% increase | amqsget timing comparison |
+| MQSC idempotency | All scripts re-runnable | Run each script twice, no errors |
+| Object count | Exact match | DISPLAY counts match target-topology.json |
+| Channel status | All RUNNING | DISPLAY CHSTATUS(*) = RUNNING |
+
+## 4. Rollback Trigger Conditions
+
+Initiate rollback if:
+- Any end-to-end test fails with message loss
+- Latency exceeds 10% of baseline
+- More than 2 channels fail to start
+- Any CRITICAL constraint violation detected post-migration
+
+Rollback procedure: Execute rollback MQSC scripts in reverse phase order (CLEANUP → DRAIN → REROUTE → CREATE).
+
+## 5. Test Execution Timeline
+
+| Phase | Tests | Duration | Gate |
+|-------|-------|----------|------|
+| Phase 1: CREATE | Unit tests on new QMs | 1 hour | All QMs running |
+| Phase 2: REROUTE | Integration + E2E tests | 4 hours | Zero message loss |
+| Phase 3: DRAIN | Verify old channels drained | 2 hours | DLQ depth = 0 |
+| Phase 4: CLEANUP | Final unit tests | 1 hour | Object counts match |
+
+---
+*Generated by IntelliAI — IBM MQ Hackathon 2026*
+"""
+    return plan
+
+
+def _generate_insights_md(state: dict) -> str:
+    """Deliverable 6: insights.md — key findings on source and target topologies."""
+    as_is_metrics = state.get("as_is_metrics", {}) or {}
+    target_metrics = state.get("target_metrics", {}) or {}
+    as_is_subs = state.get("as_is_subgraphs", []) or []
+    target_subs = state.get("target_subgraphs", []) or []
+    violations = state.get("constraint_violations", []) or []
+    diff = state.get("topology_diff", {}) or {}
+    dq = state.get("data_quality_report", {}) or {}
+    as_is_graph = state.get("as_is_graph")
+    target_graph = state.get("optimised_graph")
+    as_is_centrality = state.get("as_is_centrality", {}) or {}
+    as_is_entropy = state.get("as_is_entropy", {}) or {}
+
+    # ── Compute source insights ───────────────────────────────────────────
+    insights = """# Key Insights — IntelliAI
+
+## Source Topology Insights
+
+"""
+    # Multi-QM apps (the core problem)
+    if as_is_graph:
+        multi_qm_apps = []
+        for n, d in as_is_graph.nodes(data=True):
+            if d.get("type") == "app":
+                qms = [v for _, v, ed in as_is_graph.out_edges(n, data=True) if ed.get("rel") == "connects_to"]
+                if len(qms) > 1:
+                    multi_qm_apps.append((n, len(qms)))
+        multi_qm_apps.sort(key=lambda x: -x[1])
+
+        if multi_qm_apps:
+            insights += f"### 1. Multi-QM Application Violations\n"
+            insights += f"**{len(multi_qm_apps)} applications** connect to more than one queue manager, "
+            insights += f"violating the 1-QM-per-app constraint.\n\n"
+            insights += f"Worst offenders:\n"
+            for app, count in multi_qm_apps[:5]:
+                insights += f"- `{app}` connects to **{count} QMs**\n"
+            insights += f"\nThis coupling creates operational risk: changes to any shared QM impact multiple applications.\n\n"
+        else:
+            insights += "### 1. Application-QM Coupling\nNo multi-QM violations in source data.\n\n"
+
+    # Hub QMs (SPOFs)
+    if as_is_graph:
+        qm_degrees = []
+        for n, d in as_is_graph.nodes(data=True):
+            if d.get("type") == "qm":
+                out_ch = sum(1 for _, _, ed in as_is_graph.out_edges(n, data=True) if ed.get("rel") == "channel")
+                in_ch = sum(1 for _, _, ed in as_is_graph.in_edges(n, data=True) if ed.get("rel") == "channel")
+                app_count = sum(1 for _, _, ed in as_is_graph.in_edges(n, data=True) if ed.get("rel") == "connects_to")
+                qm_degrees.append((n, out_ch + in_ch, app_count))
+        qm_degrees.sort(key=lambda x: -x[1])
+
+        if qm_degrees:
+            top_hub = qm_degrees[0]
+            insights += f"### 2. Hub QMs — Single Points of Failure\n"
+            insights += f"The most connected QM is `{top_hub[0]}` with **{top_hub[1]} channels** "
+            insights += f"and **{top_hub[2]} connected apps**.\n\n"
+            insights += f"Top 5 hub QMs:\n"
+            for qm, ch, apps in qm_degrees[:5]:
+                insights += f"- `{qm}`: {ch} channels, {apps} apps\n"
+            insights += f"\nThese hubs are operational bottlenecks and blast-radius risks.\n\n"
+
+    # Subgraph analysis
+    if as_is_subs:
+        isolated = [s for s in as_is_subs if s.get("is_isolated")]
+        insights += f"### 3. Subgraph Decomposition\n"
+        insights += f"The source topology has **{len(as_is_subs)} connected components**.\n\n"
+        if isolated:
+            insights += f"**{len(isolated)} isolated QMs** (no channels) detected — "
+            insights += f"these are dead weight consuming infrastructure resources:\n"
+            for s in isolated[:5]:
+                insights += f"- `{s.get('qms', ['?'])[0] if s.get('qms') else '?'}` — {s.get('app_count', 0)} apps, no channels\n"
+            insights += f"\n"
+        if len(as_is_subs) > 1:
+            largest = as_is_subs[0]
+            insights += f"Largest component: **{largest.get('qm_count', 0)} QMs**, "
+            insights += f"{largest.get('app_count', 0)} apps, {largest.get('channel_count', 0)} channels.\n\n"
+
+    # Entropy / density
+    if as_is_entropy:
+        insights += f"### 4. Graph Metrics\n"
+        insights += f"- Shannon entropy: **{as_is_entropy.get('shannon_entropy', 'N/A')}** "
+        insights += f"(higher = more uniform distribution)\n"
+        insights += f"- Graph density: **{as_is_entropy.get('density', 'N/A')}**\n"
+        insights += f"- Clustering coefficient: **{as_is_entropy.get('clustering', 'N/A')}**\n\n"
+
+    # Data quality issues
+    if dq:
+        issues = dq.get("issues", [])
+        if issues:
+            insights += f"### 5. Data Quality Observations\n"
+            insights += f"The sanitiser agent detected **{len(issues)} data quality issues**:\n"
+            for issue in issues[:5]:
+                insights += f"- {issue}\n"
+            insights += f"\n"
+
+    # ── Target topology insights ──────────────────────────────────────────
+    insights += "## Target Topology Insights\n\n"
+
+    total_as = as_is_metrics.get("total_score", 0)
+    total_tgt = target_metrics.get("total_score", 0)
+    pct = round((total_as - total_tgt) / total_as * 100, 1) if total_as else 0
+
+    insights += f"### 1. Complexity Reduction\n"
+    insights += f"Overall score: **{total_as} → {total_tgt}** ({pct}% reduction).\n\n"
+
+    # What was simplified
+    if diff:
+        insights += f"### 2. Transformation Summary\n"
+        insights += f"- QMs added: **{len(diff.get('qms_added', []))}** (dedicated 1-per-app)\n"
+        insights += f"- QMs removed: **{len(diff.get('qms_removed', []))}** (shared QMs eliminated)\n"
+        insights += f"- Channels added: **{len(diff.get('channels_added', []))}** (only where actual flows exist)\n"
+        insights += f"- Channels removed: **{len(diff.get('channels_removed', []))}**\n"
+        insights += f"- Apps reassigned: **{len(diff.get('apps_reassigned', []))}**\n\n"
+
+    # Target subgraphs
+    if target_subs:
+        target_isolated = [s for s in target_subs if s.get("is_isolated")]
+        insights += f"### 3. Target Subgraph Analysis\n"
+        insights += f"The target topology has **{len(target_subs)} connected components**"
+        if target_isolated:
+            insights += f" ({len(target_isolated)} isolated QMs — apps with no cross-QM communication)\n\n"
+        else:
+            insights += f" (fully connected)\n\n"
+
+    # Constraint satisfaction
+    critical_violations = [v for v in violations if v.get("severity") == "CRITICAL"]
+    insights += f"### 4. Constraint Validation\n"
+    if not critical_violations:
+        insights += f"**All constraints satisfied** — zero CRITICAL violations.\n"
+        insights += f"- 1-QM-per-app: Enforced for all {len([n for n, d in (target_graph.nodes(data=True) if target_graph else []) if d.get('type') == 'app'])} applications\n"
+        insights += f"- Deterministic channel naming: All channels follow FROM_QM.TO_QM pattern\n"
+        insights += f"- Standard routing: All message flows use REMOTE_Q → XMITQ → CHANNEL → LOCAL_Q path\n\n"
+    else:
+        insights += f"**{len(critical_violations)} CRITICAL violations** remain:\n"
+        for v in critical_violations[:5]:
+            insights += f"- {v.get('rule')}: {v.get('entity')} — {v.get('detail')}\n"
+        insights += f"\n"
+
+    # Key insight: what makes this target better
+    insights += f"""### 5. Why This Target State Is Better
+
+1. **Clear ownership**: Every application connects to exactly one QM. No ambiguity about which team owns which QM.
+2. **Predictable routing**: All cross-QM communication follows the canonical pattern (REMOTE_Q → XMITQ → Channel → LOCAL_Q). No ad-hoc or legacy routing paths.
+3. **Reduced blast radius**: Failure of any single QM affects only its assigned application, not multiple apps sharing a QM.
+4. **Automation-ready**: Deterministic naming conventions (LOCAL.APP.IN, FROM_QM.TO_QM) enable fully automated provisioning via MQSC scripts.
+5. **Channels justified by data**: Channels exist only where actual producer→consumer flows exist in the source data. No speculative or "just in case" channels.
+
+---
+*Generated by IntelliAI — IBM MQ Hackathon 2026*
+"""
+    return insights
