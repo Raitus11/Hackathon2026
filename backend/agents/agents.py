@@ -257,7 +257,7 @@ def researcher_agent(state: dict) -> dict:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AGENT 3: ANALYST
-# Computes 5-factor complexity score on the as-is graph.
+# Computes 6-factor complexity score on the as-is graph.
 # ─────────────────────────────────────────────────────────────────────────────
 def analyst_agent(state: dict) -> dict:
     logger.info("ANALYST: Computing as-is complexity metrics")
@@ -282,7 +282,8 @@ def analyst_agent(state: dict) -> dict:
         f"Coupling: {metrics['coupling_index']} | "
         f"Depth: {metrics['routing_depth']} | "
         f"Fan-out: {metrics['fan_out_score']} | "
-        f"Orphans: {metrics['orphan_objects']}"
+        f"Orphans: {metrics['orphan_objects']} | "
+        f"Ch/QM Sprawl: {metrics.get('channel_sprawl', 'N/A')}"
     )
     messages.append({"agent": "ANALYST", "msg": msg})
 
@@ -2389,6 +2390,7 @@ def doc_expert_agent(state: dict) -> dict:
         f"| Routing Depth | {as_is.get('routing_depth')} | {target.get('routing_depth')} | {'Reduced' if target.get('routing_depth',99) < as_is.get('routing_depth',0) else 'Same'} |",
         f"| Fan-Out Score | {as_is.get('fan_out_score')} | {target.get('fan_out_score')} | {'Reduced' if target.get('fan_out_score',99) < as_is.get('fan_out_score',0) else 'Same'} |",
         f"| Orphan Objects | {as_is.get('orphan_objects')} | {target.get('orphan_objects')} | {'Eliminated' if target.get('orphan_objects',1) < as_is.get('orphan_objects',0) else 'Same'} |",
+        f"| Channel Sprawl | {as_is.get('channel_sprawl', 'N/A')} | {target.get('channel_sprawl', 'N/A')} | {'Improved' if (target.get('channel_sprawl',99) or 99) < (as_is.get('channel_sprawl',0) or 0) else 'Same'} |",
         f"| **Total Score** | **{as_is.get('total_score')}** | **{target.get('total_score')}** | **{pct}% reduction** |",
         "",
         "## Constraint Validation",
@@ -2609,24 +2611,22 @@ def _generate_complexity_algorithm_md(state: dict) -> str:
 
 ## Overview
 
-IntelliAI uses a **5-factor weighted complexity model** to quantify MQ topology complexity.
+IntelliAI uses a **6-factor weighted complexity model** to quantify MQ topology complexity.
 The same algorithm is applied identically to both the as-is and target states, ensuring
 the reduction measurement is reproducible and defensible.
 
 ## Factors
 
 ### 1. Channel Count (CC) — Weight: 25%
-**Definition:** Normalised count of inter-QM channels relative to the maximum possible.
-**Formula:** `CC = actual_channels / max(qm_count * (qm_count - 1), 1)`
+**Definition:** Total number of inter-QM sender channels.
 **Rationale:** More channels = more operational surface area to manage, monitor, and secure.
 Channel count is the single most visible indicator of topology sprawl.
 
 ### 2. Coupling Index (CI) — Weight: 25%
 **Definition:** Average number of QMs each application connects to.
-**Formula:** `CI = sum(connections_per_app) / app_count`
-**Rationale:** In the as-is state, apps often connect to multiple QMs (violating 1-QM-per-app).
-In the target state, CI should be exactly 1.0 — every app connects to exactly one QM.
-This is the core constraint of the hackathon.
+**Ideal value:** 1.0 (every app connects to exactly one QM — the core hackathon constraint).
+**Rationale:** In the as-is state, apps often connect to multiple QMs. High coupling = hard to
+change anything without side effects.
 
 ### 3. Routing Depth (RD) — Weight: 20%
 **Definition:** Maximum graph diameter of the QM-only subgraph, plus a fragmentation penalty.
@@ -2635,16 +2635,21 @@ This is the core constraint of the hackathon.
 The fragmentation penalty accounts for disconnected subgraphs (islands that cannot communicate).
 
 ### 4. Fan-Out Score (FO) — Weight: 15%
-**Definition:** Maximum outbound channel degree of any single QM, normalised.
-**Formula:** `FO = max_outbound_degree / max(qm_count - 1, 1)`
+**Definition:** Maximum outbound channel degree of any single QM.
 **Rationale:** A QM with high fan-out is a single point of failure and operational bottleneck.
 Reducing fan-out improves resilience and blast radius containment.
 
-### 5. Orphan Objects (OO) — Weight: 15%
-**Definition:** Count of QMs or queues with no active connections or consumers.
-**Formula:** `OO = (orphan_qms + orphan_queues) / max(total_objects, 1)`
-**Rationale:** Orphan objects are dead weight — they consume resources, create confusion in
-operations, and indicate poor lifecycle management. Eliminating them is a sign of a well-managed topology.
+### 5. Orphan Objects (OO) — Weight: 5%
+**Definition:** Count of QMs with no app connections plus stopped channels.
+**Rationale:** Orphan objects are dead weight — they consume resources and create confusion.
+Weighted lowest because orphans are a hygiene issue, not a structural risk.
+
+### 6. Channel Sprawl (CS) — Weight: 10%
+**Definition:** Ratio of channels to queue managers (channels per QM).
+**Formula:** `CS = channel_count / qm_count`
+**Rationale:** In 1:1 topologies, QM count is fixed (one per app), so channel efficiency is
+the primary lever for complexity reduction. CS captures whether channels are concentrated
+or spread proportionally. High CS means each QM carries heavy routing overhead.
 
 ## Normalisation
 
@@ -2658,13 +2663,19 @@ normalised = min(100, raw_value / worst_realistic_case * 100)
 The worst realistic case for each factor is computed from the QM and app counts in the topology,
 ensuring the scoring scales correctly from small (10 QM) to large (500+ QM) environments.
 
+**Critical design decision:** The SAME baselines from the as-is graph are reused when scoring
+the target graph (`baseline_overrides`). This ensures improvements are measured fairly against
+the actual starting point, not a theoretical worst case.
+
 ## Final Score
 
 ```
-Total = CC × 0.25 + CI × 0.25 + RD × 0.20 + FO × 0.15 + OO × 0.15
+Total = CC × 0.25 + CI × 0.25 + RD × 0.20 + FO × 0.15 + OO × 0.05 + CS × 0.10
 ```
 
-Rounded to one decimal place, range 0 (trivial) to 100 (maximally complex).
+Weights sum to 1.00. Score range: 0 (trivial) to 100 (maximally complex).
+Channel-related factors (CC + CS) collectively account for 35% — reflecting that channel
+management is the dominant operational cost in enterprise MQ environments.
 
 ## Actual Scores — This Run
 
@@ -2675,6 +2686,7 @@ Rounded to one decimal place, range 0 (trivial) to 100 (maximally complex).
 | Routing Depth (RD) | {as_is.get('routing_depth', 'N/A')} | {target.get('routing_depth', 'N/A')} | {'Improved' if target.get('routing_depth', 99) < as_is.get('routing_depth', 0) else 'Same'} |
 | Fan-Out Score (FO) | {as_is.get('fan_out_score', 'N/A')} | {target.get('fan_out_score', 'N/A')} | {'Improved' if target.get('fan_out_score', 99) < as_is.get('fan_out_score', 0) else 'Same'} |
 | Orphan Objects (OO) | {as_is.get('orphan_objects', 'N/A')} | {target.get('orphan_objects', 'N/A')} | {'Improved' if target.get('orphan_objects', 99) < as_is.get('orphan_objects', 0) else 'Same'} |
+| Channel Sprawl (CS) | {as_is.get('channel_sprawl', 'N/A')} | {target.get('channel_sprawl', 'N/A')} | {'Improved' if (target.get('channel_sprawl', 99) or 99) < (as_is.get('channel_sprawl', 0) or 0) else 'Same'} |
 | **Total** | **{total_as}** | **{total_tgt}** | **{pct}% reduction** |
 
 ## Why This Approach
@@ -2684,7 +2696,7 @@ and chose a multi-factor weighted model because:
 
 1. **Cyclomatic complexity** measures control flow, not messaging topology — it's designed for code, not infrastructure graphs
 2. **Graph density** is a single number that doesn't distinguish between "all-to-all" and "hub-and-spoke" — both can have similar density but very different operational characteristics
-3. **Our 5-factor model** captures the dimensions that matter operationally: connection sprawl (CC), ownership clarity (CI), path complexity (RD), resilience (FO), and hygiene (OO)
+3. **Our 6-factor model** captures the dimensions that matter operationally: connection sprawl (CC), ownership clarity (CI), path complexity (RD), resilience (FO), hygiene (OO), and routing efficiency (CS)
 
 Each factor maps directly to an operational concern that MQ administrators deal with daily.
 
@@ -2709,7 +2721,8 @@ def _generate_complexity_scores_csv(state: dict) -> str:
         ("Coupling Index (CI)", "25%", "coupling_index"),
         ("Routing Depth (RD)", "20%", "routing_depth"),
         ("Fan-Out Score (FO)", "15%", "fan_out_score"),
-        ("Orphan Objects (OO)", "15%", "orphan_objects"),
+        ("Orphan Objects (OO)", "5%", "orphan_objects"),
+        ("Channel Sprawl (CS)", "10%", "channel_sprawl"),
     ]
     for name, weight, key in factors:
         a = as_is.get(key, 0)
@@ -2992,7 +3005,11 @@ def _generate_insights_md(state: dict) -> str:
 
 ## Strategic Modernization Recommendation
 
-### Data-Driven Analysis: Should Specific Workloads Migrate to Kafka or Pub-Sub?
+### Data-Driven Analysis: Which Workloads Belong on Which Messaging Pattern?
+
+The following analysis evaluates five messaging paradigms against the **actual flow patterns**
+detected in the source data. Each recommendation is tied to a specific signal in the topology,
+not a generic technology preference.
 
 """
     # ── Mine actual flow data for substantive claims ──────────────────────
@@ -3047,6 +3064,29 @@ def _generate_insights_md(state: dict) -> str:
     pure_consumers = set(a for a, dirs in app_directions.items() if dirs == {"GET"} or dirs == {"CONSUMER"})
     bidirectional = set(app_directions.keys()) - pure_producers - pure_consumers
 
+    # ── Detect request-reply pairs (bidirectional apps sharing queues) ────
+    # A request-reply pair is two apps that both PUT and GET on overlapping
+    # queues — one sends a request, the other sends a response.
+    request_reply_pairs = []
+    for app_a in bidirectional:
+        for app_b in bidirectional:
+            if app_a >= app_b:
+                continue
+            # Check if A produces to a queue B consumes AND B produces to a queue A consumes
+            a_produces = set(q for q, prods in queue_prod.items() if app_a in prods)
+            b_consumes = set(q for q, cons in queue_cons.items() if app_b in cons)
+            b_produces = set(q for q, prods in queue_prod.items() if app_b in prods)
+            a_consumes = set(q for q, cons in queue_cons.items() if app_a in cons)
+            if (a_produces & b_consumes) and (b_produces & a_consumes):
+                request_reply_pairs.append((app_a, app_b))
+
+    # ── Detect low-volume point-to-point flows (1:1 producer:consumer) ────
+    p2p_queues = sorted(
+        [(q, d) for q, d in queue_fanout.items()
+         if d["producers"] == 1 and d["consumers"] == 1],
+        key=lambda x: x[0]
+    )
+
     total_apps = len(app_directions)
     total_queues_with_flows = len(set(queue_prod.keys()) & set(queue_cons.keys()))
     total_flows = sum(len(cons) for cons in producer_fanout.values())
@@ -3059,6 +3099,10 @@ def _generate_insights_md(state: dict) -> str:
     )
     high_fo_pct = round(high_fo_flows / total_flows * 100, 1) if total_flows > 0 else 0
 
+    # Compute % of flows that are strict 1:1 point-to-point
+    p2p_flow_count = len(p2p_queues)
+    p2p_pct = round(p2p_flow_count / max(total_queues_with_flows, 1) * 100, 1)
+
     target_ch = target_metrics.get("channel_count", 0)
     as_is_ch = as_is_metrics.get("channel_count", 0)
     fo = as_is_metrics.get("fan_out_score", 0)
@@ -3070,62 +3114,175 @@ def _generate_insights_md(state: dict) -> str:
     insights += f"| Pure producers (PUT only) | {len(pure_producers)} ({round(len(pure_producers)/max(total_apps,1)*100)}%) |\n"
     insights += f"| Pure consumers (GET only) | {len(pure_consumers)} ({round(len(pure_consumers)/max(total_apps,1)*100)}%) |\n"
     insights += f"| Bidirectional apps (PUT + GET) | {len(bidirectional)} ({round(len(bidirectional)/max(total_apps,1)*100)}%) |\n"
+    insights += f"| Request-reply pairs detected | {len(request_reply_pairs)} |\n"
     insights += f"| Queues with active producer→consumer flows | {total_queues_with_flows} |\n"
+    insights += f"| Strict 1:1 point-to-point queues | {p2p_flow_count} ({p2p_pct}%) |\n"
     insights += f"| Total producer→consumer flow pairs | {total_flows} |\n"
     insights += f"| Flows involving high fan-out queues (>3 consumers) | {high_fo_flows} ({high_fo_pct}%) |\n\n"
 
-    # High fan-out queues — the concrete Kafka candidates
+    # ══════════════════════════════════════════════════════════════════════
+    # PATTERN 1: IBM MQ Event Streams / Apache Kafka — broadcast/fan-out
+    # ══════════════════════════════════════════════════════════════════════
+    insights += f"### Pattern 1: Event Streaming (IBM MQ Event Streams / Apache Kafka)\n\n"
+    insights += f"**Signal:** High fan-out queues where 1 producer broadcasts to N>3 consumers.\n"
+    insights += f"**Why:** In MQ, each consumer on a different QM requires a dedicated REMOTE queue + XMITQ + channel "
+    insights += f"on the producer's QM — O(N) object overhead. In event streaming, all consumers read from a single "
+    insights += f"topic partition independently — O(1) on the producer side.\n\n"
+
     if high_fanout_queues:
-        insights += f"#### High Fan-Out Queues — Kafka Migration Candidates\n\n"
-        insights += f"These {len(high_fanout_queues)} queues have 1-few producers broadcasting to many consumers. "
-        insights += f"In MQ, each consumer requires a dedicated REMOTE queue + XMITQ + channel on the producer's QM. "
-        insights += f"In Kafka, all consumers read from a single topic partition — eliminating the O(N) routing overhead.\n\n"
-        insights += f"| Queue | Producers | Consumers | MQ Objects Required | Kafka Equivalent |\n"
+        insights += f"**Detection result: {len(high_fanout_queues)} candidate queues identified.**\n\n"
+        insights += f"| Queue | Producers | Consumers | MQ Objects Required | Event Stream Equivalent |\n"
         insights += f"|-------|-----------|-----------|--------------------|-----------------|\n"
         for qname, d in high_fanout_queues[:10]:
-            mq_objects = d["producers"] * d["consumers"]  # REMOTE queues needed
+            mq_objects = d["producers"] * d["consumers"]
             insights += f"| `{qname[:40]}` | {d['producers']} | {d['consumers']} | {mq_objects} REMOTE Qs | 1 topic |\n"
         if len(high_fanout_queues) > 10:
             insights += f"| ... | | | | ({len(high_fanout_queues) - 10} more queues) |\n"
         insights += f"\n"
-    else:
-        insights += f"#### Fan-Out Analysis\n\nNo queues with >3 consumers detected. "
-        insights += f"The topology is predominantly point-to-point, which is MQ's strength.\n\n"
 
-    # High fan-out producers
-    if high_fanout_producers:
-        insights += f"#### High Fan-Out Producers — Apps Driving Routing Complexity\n\n"
-        insights += f"These producers each reach >5 distinct consumers across the topology. "
-        insights += f"Their QMs bear the heaviest REMOTE queue and XMITQ burden after 1:1 assignment.\n\n"
-        for app, count in high_fanout_producers[:8]:
-            insights += f"- `{app}` → **{count} consumers** (requires {count} REMOTE queues on its QM)\n"
-        if len(high_fanout_producers) > 8:
-            insights += f"- ... and {len(high_fanout_producers) - 8} more high-fan-out producers\n"
+        if high_fanout_producers:
+            insights += f"**High fan-out producers driving this pattern:**\n\n"
+            for app, count in high_fanout_producers[:8]:
+                insights += f"- `{app}` → **{count} consumers** (requires {count} REMOTE queues on its QM)\n"
+            if len(high_fanout_producers) > 8:
+                insights += f"- ... and {len(high_fanout_producers) - 8} more high-fan-out producers\n"
+            insights += f"\n"
+
+        insights += f"**IBM-native path:** IBM MQ Event Streams (part of Cloud Pak for Integration) provides "
+        insights += f"Kafka-compatible event streaming that integrates natively with existing MQ infrastructure "
+        insights += f"via the MQ-Kafka connector bridge. This avoids introducing a separate Kafka cluster while "
+        insights += f"gaining topic-based fan-out for the {len(high_fanout_queues)} broadcast queues identified above.\n\n"
+    else:
+        insights += f"**Detection result: No queues with >3 consumers detected.** "
+        insights += f"The topology is predominantly point-to-point, which is MQ's strength. "
+        insights += f"Event streaming is not indicated for this workload.\n\n"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # PATTERN 2: Synchronous APIs (gRPC / REST) — request-reply
+    # ══════════════════════════════════════════════════════════════════════
+    insights += f"### Pattern 2: Synchronous APIs (gRPC / REST) — Request-Reply Replacement\n\n"
+    insights += f"**Signal:** Bidirectional app pairs where App A produces to a queue consumed by App B, "
+    insights += f"AND App B produces to a queue consumed by App A. This is the classic request-reply "
+    insights += f"anti-pattern in MQ — using asynchronous messaging for what is semantically a synchronous call.\n\n"
+    insights += f"**Why:** Each request-reply pair in MQ requires 2 queues, 2 channels (if cross-QM), "
+    insights += f"2 XMITQs, and 4 REMOTE queue definitions. A direct gRPC or REST call requires zero "
+    insights += f"MQ objects and reduces end-to-end latency by eliminating store-and-forward hops.\n\n"
+
+    if request_reply_pairs:
+        insights += f"**Detection result: {len(request_reply_pairs)} request-reply pairs identified.**\n\n"
+        for app_a, app_b in request_reply_pairs[:10]:
+            insights += f"- `{app_a}` ↔ `{app_b}` (bidirectional message exchange)\n"
+        if len(request_reply_pairs) > 10:
+            insights += f"- ... and {len(request_reply_pairs) - 10} more pairs\n"
         insights += f"\n"
-
-    # Concrete recommendation based on actual data
-    insights += f"#### Recommendation\n\n"
-
-    if high_fo_pct > 30 and len(high_fanout_queues) > 5:
-        insights += f"**STRONG SIGNAL for Kafka/pub-sub migration for specific workloads.**\n\n"
-        insights += f"- {high_fo_pct}% of message flows involve high-fan-out queues (>3 consumers per queue)\n"
-        insights += f"- {len(high_fanout_queues)} queues are broadcast-pattern candidates\n"
-        insights += f"- These queues alone generate ~{sum(d['producers']*d['consumers'] for _,d in high_fanout_queues)} REMOTE queue objects in the target state\n"
-        insights += f"- Migrating these to Kafka topics would eliminate this routing overhead entirely\n\n"
-        insights += f"**Recommended approach**: Implement the MQ target state first (this deliverable), then introduce Kafka as an event backbone for the {len(high_fanout_queues)} high-fan-out queues identified above. "
-        insights += f"Retain MQ for point-to-point, transactional, guaranteed-delivery flows.\n\n"
-    elif high_fo_pct > 10 or len(high_fanout_queues) > 2:
-        insights += f"**MODERATE SIGNAL — some workloads could benefit from pub-sub.**\n\n"
-        insights += f"- {high_fo_pct}% of flows involve high-fan-out patterns\n"
-        insights += f"- {len(high_fanout_queues)} queues show broadcast characteristics\n"
-        insights += f"- The MQ target state is the correct immediate action\n"
-        insights += f"- Consider Kafka for the top {min(len(high_fanout_queues), 5)} high-fan-out queues in a future phase\n\n"
+        insights += f"**Recommendation:** Evaluate these {len(request_reply_pairs)} pairs for migration to "
+        insights += f"synchronous APIs. Candidates where latency < 100ms is acceptable and no guaranteed "
+        insights += f"delivery is required can be replaced with gRPC (for internal service-to-service) "
+        insights += f"or REST (for broader compatibility). This eliminates "
+        insights += f"~{len(request_reply_pairs) * 4} MQ objects from the target state.\n\n"
     else:
-        insights += f"**NO SIGNAL for Kafka migration at this time.**\n\n"
-        insights += f"- Only {high_fo_pct}% of flows involve high-fan-out patterns\n"
-        insights += f"- The topology is predominantly point-to-point ({total_flows} flow pairs across {total_queues_with_flows} queues)\n"
-        insights += f"- MQ is the correct architecture for this workload profile\n"
-        insights += f"- The simplified target state eliminates {round(as_is_metrics.get('total_score',0) - target_metrics.get('total_score',0), 1)} points of complexity while preserving all message flows\n\n"
+        insights += f"**Detection result: No request-reply pairs detected.** "
+        insights += f"All bidirectional apps ({len(bidirectional)}) use separate unrelated queues for PUT and GET, "
+        insights += f"indicating legitimate async workflows rather than disguised RPC. "
+        insights += f"Synchronous API replacement is not indicated.\n\n"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # PATTERN 3: AMQP 1.0 (lightweight messaging) — low-overhead P2P
+    # ══════════════════════════════════════════════════════════════════════
+    insights += f"### Pattern 3: AMQP 1.0 — Lightweight Point-to-Point\n\n"
+    insights += f"**Signal:** Strict 1:1 point-to-point queues (exactly 1 producer, 1 consumer) "
+    insights += f"where MQ's full transactional XA guarantees may be unnecessary overhead.\n\n"
+    insights += f"**Why:** IBM MQ natively supports AMQP 1.0 clients (since MQ v8). AMQP clients "
+    insights += f"connect directly without needing MQ-specific client libraries, reducing onboarding "
+    insights += f"friction for new applications. For simple fire-and-forget or at-least-once delivery "
+    insights += f"patterns, AMQP eliminates the need for full MQ client configuration.\n\n"
+
+    if p2p_queues:
+        insights += f"**Detection result: {len(p2p_queues)} strict 1:1 queues ({p2p_pct}% of active queues).**\n\n"
+        insights += f"These queues involve exactly one producer and one consumer. "
+        if p2p_pct > 50:
+            insights += f"The majority of the topology follows this pattern, suggesting many flows "
+            insights += f"could benefit from lighter-weight AMQP clients.\n\n"
+        else:
+            insights += f"This is a minority of flows. AMQP migration is a low-priority optimisation.\n\n"
+        insights += f"**Note:** AMQP clients can connect to the SAME queue managers in the target state — "
+        insights += f"no topology change required. This is a client-side protocol optimisation, not "
+        insights += f"an infrastructure migration.\n\n"
+    else:
+        insights += f"**Detection result: No strict 1:1 queues detected.** "
+        insights += f"All queues have multiple producers or consumers. AMQP migration is not applicable.\n\n"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # PATTERN 4: Cloud Pub/Sub bridge — hybrid cloud workloads
+    # ══════════════════════════════════════════════════════════════════════
+    insights += f"### Pattern 4: Cloud Pub/Sub Bridge (AWS SNS+SQS / Azure Service Bus)\n\n"
+    insights += f"**Signal:** Applications that are cloud-native or scheduled for cloud migration, "
+    insights += f"currently forced through on-premise MQ infrastructure.\n\n"
+    insights += f"**Why:** If consuming applications move to cloud, maintaining on-premise MQ channels "
+    insights += f"to reach them adds latency and operational overhead. Cloud-native pub/sub services "
+    insights += f"(SNS+SQS, Azure Service Bus, Google Pub/Sub) provide managed messaging with "
+    insights += f"auto-scaling and no infrastructure to operate.\n\n"
+    insights += f"**Detection result:** Cloud migration status is not present in the input dataset. "
+    insights += f"This pattern cannot be evaluated from topology data alone.\n\n"
+    insights += f"**Recommendation:** Cross-reference app IDs against the enterprise cloud migration "
+    insights += f"roadmap. Any apps in the target state that are scheduled for cloud migration within "
+    insights += f"12 months should use an MQ-to-cloud bridge (IBM MQ Internet Pass-Thru or IBM MQ "
+    insights += f"on Cloud) rather than provisioning on-premise channels that will be decommissioned.\n\n"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # PATTERN 5: Retain IBM MQ — transactional, guaranteed delivery
+    # ══════════════════════════════════════════════════════════════════════
+    retain_count = total_flows - high_fo_flows - len(request_reply_pairs)
+    retain_pct = round(retain_count / max(total_flows, 1) * 100, 1)
+
+    insights += f"### Pattern 5: Retain IBM MQ — Transactional Guaranteed Delivery\n\n"
+    insights += f"**Signal:** Point-to-point or low fan-out flows requiring exactly-once delivery, "
+    insights += f"XA transaction coordination, or regulatory audit trails.\n\n"
+    insights += f"**Why:** IBM MQ remains the gold standard for transactional messaging. Its persistent, "
+    insights += f"exactly-once delivery guarantees are unmatched by event streaming or cloud pub/sub. "
+    insights += f"Flows involving financial transactions, regulatory reporting, or cross-system "
+    insights += f"coordination should remain on MQ.\n\n"
+    insights += f"**Detection result: ~{max(retain_count, 0)} flows ({retain_pct}%) are best served by MQ.**\n\n"
+    insights += f"The simplified target state delivered by IntelliAI is the correct architecture for "
+    insights += f"these workloads. The 1:1 app-to-QM model ensures clear ownership, and flow-justified "
+    insights += f"channels minimise operational surface area.\n\n"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # SUMMARY TABLE
+    # ══════════════════════════════════════════════════════════════════════
+    insights += f"### Summary: Messaging Pattern Suitability Matrix\n\n"
+    insights += f"| Pattern | Signal Detected | Candidate Flows | Recommendation |\n"
+    insights += f"|---------|----------------|-----------------|----------------|\n"
+
+    kafka_signal = "STRONG" if (high_fo_pct > 30 and len(high_fanout_queues) > 5) else ("MODERATE" if (high_fo_pct > 10 or len(high_fanout_queues) > 2) else "NONE")
+    kafka_rec = f"Migrate {len(high_fanout_queues)} broadcast queues" if high_fanout_queues else "Not indicated"
+    insights += f"| Event Streaming (Kafka/Event Streams) | {kafka_signal} | {high_fo_flows} flows ({high_fo_pct}%) | {kafka_rec} |\n"
+
+    grpc_signal = "YES" if request_reply_pairs else "NONE"
+    grpc_rec = f"Evaluate {len(request_reply_pairs)} pairs for API replacement" if request_reply_pairs else "Not indicated"
+    insights += f"| Synchronous APIs (gRPC/REST) | {grpc_signal} | {len(request_reply_pairs)} pairs | {grpc_rec} |\n"
+
+    amqp_signal = "MODERATE" if p2p_pct > 50 else ("LOW" if p2p_queues else "NONE")
+    amqp_rec = f"Client-side optimisation for {len(p2p_queues)} queues" if p2p_queues else "Not indicated"
+    insights += f"| AMQP 1.0 (lightweight P2P) | {amqp_signal} | {len(p2p_queues)} queues ({p2p_pct}%) | {amqp_rec} |\n"
+
+    insights += f"| Cloud Pub/Sub Bridge | UNKNOWN | — | Cross-reference cloud migration roadmap |\n"
+    insights += f"| **Retain IBM MQ** | **PRIMARY** | **~{max(retain_count, 0)} flows ({retain_pct}%)** | **Target state delivered** |\n\n"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # PHASED ROADMAP
+    # ══════════════════════════════════════════════════════════════════════
+    insights += f"### Recommended Phased Roadmap\n\n"
+    insights += f"| Phase | Action | Prerequisite |\n"
+    insights += f"|-------|--------|--------------|\n"
+    insights += f"| Phase 1 (Immediate) | Deploy MQ target state — 1:1 app-to-QM, flow-justified channels | This deliverable |\n"
+    if high_fanout_queues:
+        insights += f"| Phase 2 (3-6 months) | Introduce IBM Event Streams for {len(high_fanout_queues)} high fan-out queues | MQ-Kafka connector bridge |\n"
+    if request_reply_pairs:
+        insights += f"| Phase 3 (6-9 months) | Replace {len(request_reply_pairs)} request-reply pairs with gRPC/REST | Service mesh, API gateway |\n"
+    if p2p_queues and p2p_pct > 30:
+        insights += f"| Phase 4 (9-12 months) | Migrate lightweight 1:1 flows to AMQP 1.0 clients | MQ AMQP channel config |\n"
+    insights += f"| Ongoing | Evaluate cloud-bound apps for pub/sub bridge | Cloud migration roadmap |\n\n"
 
     insights += f"""
 ### Complexity Metrics Supporting This Recommendation
@@ -3135,6 +3292,7 @@ def _generate_insights_md(state: dict) -> str:
 | Channel Count | {as_is_ch} | {target_ch} | {as_is_ch - target_ch:+d} |
 | Coupling Index | {ci} | {target_metrics.get('coupling_index', 'N/A')} | {'Improved' if ci > 1.0 else 'Same'} |
 | Fan-Out Score | {fo} | {target_metrics.get('fan_out_score', 'N/A')} | {fo - target_metrics.get('fan_out_score', fo):+.0f} |
+| Channel Sprawl | {as_is_metrics.get('channel_sprawl', 'N/A')} | {target_metrics.get('channel_sprawl', 'N/A')} | {'Improved' if (target_metrics.get('channel_sprawl', 99) or 99) < (as_is_metrics.get('channel_sprawl', 0) or 0) else 'Same'} |
 | Max REMOTE Qs per QM | {max((d['producers']*d['consumers'] for _,d in queue_fanout.items()), default=0)} | — | Driven by fan-out |
 
 ---

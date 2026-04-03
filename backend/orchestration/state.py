@@ -7,6 +7,7 @@ class ComplexityMetrics(TypedDict):
     routing_depth: float
     fan_out_score: float
     orphan_objects: float
+    channel_sprawl: float
     total_score: float
 
 
@@ -25,7 +26,7 @@ class ADR(TypedDict):
     consequences: str
 
 
-class MQTitanState(TypedDict):
+class IntelliAIState(TypedDict):
     # ── Input ──────────────────────────────────────────
     session_id: str
     csv_paths: dict

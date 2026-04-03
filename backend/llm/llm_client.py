@@ -1,10 +1,11 @@
 """
 llm_client.py
-Groq LLM client wrapper with retry logic, rate-limit handling, and structured output parsing.
+LLM client wrapper with retry logic, rate-limit handling, and structured output parsing.
 Used by the Architect agent for AI-driven topology design.
 
-Model: llama-3.3-70b-versatile on Groq free tier
-Limits: ~30 req/min, 14,400 req/day (more than enough for hackathon)
+Production: Tachyon (Wells Fargo internal) with Gemini 2.0 Flash / 2.5 Pro
+Fallback: Groq free tier (llama-3.3-70b-versatile) for development
+Limits: ~30 req/min on Groq, Tachyon limits per USE_CASE_ID
 """
 import os
 import json

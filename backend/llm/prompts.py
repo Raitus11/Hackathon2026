@@ -144,11 +144,12 @@ USER_PROMPT_TEMPLATE = """Analyse this IBM MQ topology and design a 1:1 app-to-Q
 {violations_list}
 
 ## COMPLEXITY SCORE: {as_is_score}/100
-- Channel Count (CC): {cc_raw} channels (weighted: {cc_score}/30)
+- Channel Count (CC): {cc_raw} channels (weighted: {cc_score}/25)
 - Coupling Index (CI): {ci_raw} QMs/app (weighted: {ci_score}/25) — target is 1.0
 - Routing Depth (RD): {rd_raw} hops (weighted: {rd_score}/20)
 - Fan-Out (FO): {fo_raw} max outbound (weighted: {fo_score}/15)
-- Orphan Objects (OO): {oo_raw} (weighted: {oo_score}/10)
+- Orphan Objects (OO): {oo_raw} (weighted: {oo_score}/5)
+- Channel Sprawl (CS): {cs_raw} ch/QM (weighted: {cs_score}/10)
 
 {human_feedback_section}
 
@@ -319,5 +320,7 @@ def build_architect_prompt(state: dict) -> str:
         fo_score=factor_scores.get("fo_weighted", "N/A"),
         oo_raw=metrics.get("orphan_objects", "N/A"),
         oo_score=factor_scores.get("oo_weighted", "N/A"),
+        cs_raw=metrics.get("channel_sprawl", "N/A"),
+        cs_score=factor_scores.get("cs_weighted", "N/A"),
         human_feedback_section=feedback_section,
     )

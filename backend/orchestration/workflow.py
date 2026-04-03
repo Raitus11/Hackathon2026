@@ -20,7 +20,7 @@ The REVISE workflow is a separate compiled graph that starts at architect
 """
 import logging
 from langgraph.graph import StateGraph, END
-from backend.orchestration.state import MQTitanState
+from backend.orchestration.state import IntelliAIState
 from backend.agents.agents import (
     supervisor_agent,
     sanitiser_agent,
@@ -67,7 +67,7 @@ def human_review_gate(state: dict) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # ROUTING: after tester
 # ─────────────────────────────────────────────────────────────────────────────
-def route_after_tester(state: MQTitanState) -> str:
+def route_after_tester(state: IntelliAIState) -> str:
     passed = state.get("validation_passed")
     count = state.get("redesign_count", 0)
     logger.info(f"ROUTE: after tester — passed={passed}, redesign_count={count}")
@@ -89,7 +89,7 @@ def route_after_tester(state: MQTitanState) -> str:
 #   ↳ human_review → END
 # ─────────────────────────────────────────────────────────────────────────────
 def build_workflow() -> StateGraph:
-    wf = StateGraph(MQTitanState)
+    wf = StateGraph(IntelliAIState)
 
     wf.add_node("supervisor",    supervisor_agent)
     wf.add_node("sanitiser",     sanitiser_agent)
@@ -124,7 +124,7 @@ def build_workflow() -> StateGraph:
 # Skips supervisor/sanitiser/researcher/analyst since data is unchanged.
 # ─────────────────────────────────────────────────────────────────────────────
 def build_revise_workflow() -> StateGraph:
-    wf = StateGraph(MQTitanState)
+    wf = StateGraph(IntelliAIState)
 
     wf.add_node("architect",     architect_agent)
     wf.add_node("optimizer",     optimizer_agent)
@@ -150,6 +150,4 @@ def build_revise_workflow() -> StateGraph:
 intelli_ai_workflow = build_workflow()
 intelli_ai_revise_workflow = build_revise_workflow()
 
-# Legacy aliases (backward compatibility)
-mq_titan_workflow = intelli_ai_workflow
-mq_titan_revise_workflow = intelli_ai_revise_workflow
+

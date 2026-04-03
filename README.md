@@ -1,7 +1,7 @@
-# MQ-TITAN
+# IntelliAI
 ## MQ Topology Intelligence & Transformation Agent Network
 
-IBM MQ Hackathon 2026 — 10-agent LangGraph pipeline with Groq LLM for transforming legacy MQ topologies.
+IBM MQ Hackathon 2026 — 10-agent LangGraph pipeline with LLM-powered architecture for transforming legacy MQ topologies.
 
 ---
 
@@ -19,7 +19,7 @@ IBM MQ Hackathon 2026 — 10-agent LangGraph pipeline with Groq LLM for transfor
 
 ## Key Differentiators
 
-- **LLM-Powered Architecture** — Groq (Llama 3.3 70B) reasons about topology and generates ADRs referencing actual entity names. Falls back to deterministic rules if no API key.
+- **LLM-Powered Architecture** — Tachyon (Gemini 2.0 Flash / 2.5 Pro) in production, Groq (Llama 3.3 70B) as dev fallback. Reasons about topology and generates ADRs referencing actual entity names. Falls back to deterministic rules if no LLM available.
 - **Valid MQSC Output** — Per-QM scripts with QLOCAL, QREMOTE, XMITQ, LISTENER, SDR/RCVR channels, correct ordering. Runnable via `runmqsc QM_NAME < file.mqsc`.
 - **Migration Plan with Rollback** — 4-phase ordered steps (CREATE → REROUTE → DRAIN → CLEANUP) with forward MQSC, rollback MQSC, dependency tracking, and verification commands.
 - **Human-in-the-Loop** — Pipeline pauses for human review. Approve to provision, revise with feedback the LLM acts on, or abort with a cancellation report.
@@ -29,16 +29,16 @@ IBM MQ Hackathon 2026 — 10-agent LangGraph pipeline with Groq LLM for transfor
 ## Project Structure
 
 ```
-mq-titan/
+intelli-ai/
 ├── backend/
 │   ├── agents/agents.py          # All 10 agents
 │   ├── llm/
-│   │   ├── llm_client.py         # Groq API wrapper with retry/fallback
+│   │   ├── llm_client.py         # LLM API wrapper with retry/fallback
 │   │   └── prompts.py            # Architect system + user prompt templates
 │   ├── graph/mq_graph.py         # NetworkX graph builder + complexity metrics
 │   ├── tools/csv_ingest.py       # 6-step CSV cleanup pipeline
 │   ├── orchestration/
-│   │   ├── state.py              # MQTitanState TypedDict
+│   │   ├── state.py              # IntelliAIState TypedDict
 │   │   └── workflow.py           # LangGraph StateGraph (10 nodes)
 │   └── api/main.py               # FastAPI server
 ├── frontend/
@@ -55,7 +55,7 @@ mq-titan/
 
 ### Backend
 ```bash
-cd mq-titan
+cd intelli-ai
 pip install -r requirements.txt
 uvicorn backend.api.main:app --reload --port 8000
 ```
@@ -71,11 +71,12 @@ npm run dev       # runs on http://localhost:3000
 ```bash
 pip install groq python-dotenv
 cp .env.example .env
-# Edit .env and add your Groq API key:
+# Edit .env and add your Groq API key (dev fallback):
 # GROQ_API_KEY=gsk_your_key_here
+# For production, configure Tachyon credentials in src/.env
 ```
 
-Get a free API key at [console.groq.com](https://console.groq.com) — no credit card required.
+Get a free API key at [console.groq.com](https://console.groq.com) — no credit card required. (Dev fallback only; production uses Tachyon.)
 
 ---
 
@@ -142,8 +143,8 @@ channel_id, channel_name, channel_type (SENDER|RECEIVER), from_qm, to_qm, xmit_q
 | 1 | **Supervisor** | Session init, input validation |
 | 2 | **Sanitiser** | CSV cleanup, dedup, referential integrity |
 | 3 | **Researcher** | Graph construction, violation detection |
-| 4 | **Analyst** | 5-factor complexity scoring |
-| 5 | **Architect** | LLM-powered target state design + ADRs (Groq) |
+| 4 | **Analyst** | 6-factor complexity scoring |
+| 5 | **Architect** | LLM-powered target state design + ADRs (Tachyon/Gemini) |
 | 6 | **Optimizer** | Reachability pruning + MST channel reduction |
 | 7 | **Tester** | 8 constraint checks, redesign loop trigger |
 | 8 | **Provisioner** | Per-QM MQSC scripts + target state CSVs |
@@ -184,16 +185,17 @@ Supervisor → Sanitiser → Researcher → Analyst → Architect → Optimizer 
 ## Complexity Metric
 
 ```
-Score = 0.30×CC + 0.25×CI + 0.20×RD + 0.15×FO + 0.10×OO   (normalised 0–100)
+Score = 0.25×CC + 0.25×CI + 0.20×RD + 0.15×FO + 0.05×OO + 0.10×CS   (normalised 0–100)
 ```
 
 | Factor | Weight | What it measures | How to improve |
 |--------|--------|------------------|----------------|
-| CC — Channel Count | 30% | Number of sender channels | Remove unnecessary channels |
+| CC — Channel Count | 25% | Number of sender channels | Remove unnecessary channels |
 | CI — Coupling Index | 25% | Mean QMs per app (ideal = 1.0) | Enforce 1-QM-per-app |
 | RD — Routing Depth | 20% | Max hops between QMs | Eliminate multi-hop paths |
 | FO — Fan-Out Score | 15% | Max outbound channels from one QM | Consolidate outbound routing |
-| OO — Orphan Objects | 10% | QMs with no apps + stopped channels | Remove dead infrastructure |
+| OO — Orphan Objects | 5% | QMs with no apps + stopped channels | Remove dead infrastructure |
+| CS — Channel Sprawl | 10% | Channels per QM ratio | Reduce routing overhead per QM |
 
 Baselines scale with topology size. Same baselines used for both as-is and target scoring.
 
@@ -232,7 +234,13 @@ Each step includes forward MQSC, rollback MQSC, dependency tracking, and a verif
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `GROQ_API_KEY` | No | Groq API key for LLM-powered architecture. Pipeline falls back to rules without it. |
+| `GROQ_API_KEY` | No | Groq API key for dev/fallback LLM. Pipeline falls back to rules without it. |
+| `APIGEE_URL` | No | Tachyon (production) — APIGEE gateway URL |
+| `CONSUMER_KEY` | No | Tachyon — OAuth consumer key |
+| `CONSUMER_SECRET` | No | Tachyon — OAuth consumer secret |
+| `API_KEY` | No | Tachyon — API key |
+| `USE_CASE_ID` | No | Tachyon — registered use case ID |
+| `MODEL` | No | Tachyon — model identifier (e.g. openai/gemini-2.0-flash) |
 
 ---
 
