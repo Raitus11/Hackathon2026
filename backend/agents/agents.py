@@ -1752,7 +1752,11 @@ def provisioner_agent(state: dict) -> dict:
     per_qm_scripts = {}
     port_base = 1414
 
-    for idx, qm in enumerate(sorted(qm_nodes)):
+    # Pre-build port lookup (avoids sorted().index() inside loop)
+    sorted_qms = sorted(qm_nodes)
+    qm_port_map = {qm: port_base + idx for idx, qm in enumerate(sorted_qms)}
+
+    for idx, qm in enumerate(sorted_qms):
         lines = []
         port = port_base + idx
         qm_data = G.nodes[qm]
@@ -1814,7 +1818,7 @@ def provisioner_agent(state: dict) -> dict:
             lines.append("* --- Sender Channels ---")
             for to_qm, ch_name, xmitq in outbound[qm]:
                 to_hostname = f"{to_qm.lower().replace('_', '-')}.target.corp.com"
-                to_port = port_base + sorted(qm_nodes).index(to_qm)
+                to_port = qm_port_map.get(to_qm, port_base)
                 lines.append(
                     f"DEFINE CHANNEL('{ch_name}') CHLTYPE(SDR) "
                     f"CONNAME('{to_hostname}({to_port})') "
@@ -1854,6 +1858,7 @@ def provisioner_agent(state: dict) -> dict:
         combined.append("")
 
     # ── Target State CSV Output ───────────────────────────────────────────
+    logger.info("PROVISIONER: MQSC done. Generating target CSVs...")
     target_csvs = _generate_target_csvs(G, state)
 
     # ── target-topology.json (Output.md §8.2 Deliverable 1) ──────────────
@@ -2038,7 +2043,9 @@ def _generate_target_csvs(G: nx.DiGraph, state: dict) -> dict:
     # ── MQ_Raw_Data_Target.csv — SAME FORMAT AS INPUT ─────────────────────
     # One CSV with the original 29 columns, reflecting the optimised topology.
     # Judges can feed this back into IntelliAI to verify complexity dropped.
+    logger.info("PROVISIONER: generating unified 29-column target CSV...")
     csvs["MQ_Raw_Data_Target"] = _generate_unified_target_csv(G, state)
+    logger.info("PROVISIONER: unified CSV done.")
 
     return csvs
 
@@ -2076,14 +2083,12 @@ def _generate_unified_target_csv(G: nx.DiGraph, state: dict) -> str:
 
     qm_region_map = {}
     qm_lob_map = {}
+    # Pre-build LOB lookup from raw data
+    raw_qm_lob = {qm_row["qm_id"]: qm_row.get("line_of_business", "") for qm_row in raw_data.get("queue_managers", [])}
     for n, d in G.nodes(data=True):
         if d.get("type") == "qm":
             qm_region_map[n] = d.get("region", "")
-            # Get line_of_business from raw data
-            for qm_row in raw_data.get("queue_managers", []):
-                if qm_row["qm_id"] == n:
-                    qm_lob_map[n] = qm_row.get("line_of_business", "")
-                    break
+            qm_lob_map[n] = raw_qm_lob.get(n, "")
 
     # Build original app metadata lookup from raw input
     app_meta = {}
@@ -2106,6 +2111,16 @@ def _generate_unified_target_csv(G: nx.DiGraph, state: dict) -> str:
             })
 
     rows = []
+
+    # Pre-build lookup: qm → list of apps (avoids O(n) scan per channel)
+    qm_to_apps = {}
+    for a, q in app_qm_map.items():
+        qm_to_apps.setdefault(q, []).append(a)
+
+    # Pre-build lookup: qm → list of outbound channels
+    qm_outbound = {}
+    for ch in channels:
+        qm_outbound.setdefault(ch["from_qm"], []).append(ch)
 
     # For each app, generate rows showing its queue relationships
     for app_id, qm_id in app_qm_map.items():
@@ -2150,13 +2165,10 @@ def _generate_unified_target_csv(G: nx.DiGraph, state: dict) -> str:
         })
 
         # 2. Remote queues: for each outbound channel from this app's QM
-        for ch in channels:
-            if ch["from_qm"] != qm_id:
-                continue
+        for ch in qm_outbound.get(qm_id, []):
             to_qm = ch["to_qm"]
-            # Find consumer apps on the target QM
-            consumer_apps = [a for a, q in app_qm_map.items() if q == to_qm]
-            for cons_app in consumer_apps:
+            # Use pre-built lookup instead of scanning all apps
+            for cons_app in qm_to_apps.get(to_qm, []):
                 rq_name = f"REMOTE.{cons_app}.VIA.{to_qm}"
                 remote_local_q = f"LOCAL.{cons_app}.IN"
                 rows.append({
@@ -2222,10 +2234,14 @@ def migration_planner_agent(state: dict) -> dict:
         return {"migration_plan": None, "topology_diff": None, "messages": messages}
 
     # ── Step 1: Compute topology diff ─────────────────────────────────────
+    logger.info("MIGRATION PLANNER: computing topology diff...")
     diff = _compute_topology_diff(as_is_graph, target_graph, state)
+    logger.info(f"MIGRATION PLANNER: diff done — {len(diff.get('qms_added',[]))} QMs added, {len(diff.get('channels_added',[]))} channels added, {len(diff.get('apps_reassigned',[]))} apps reassigned")
 
     # ── Step 2: Generate ordered migration steps ──────────────────────────
+    logger.info("MIGRATION PLANNER: generating migration steps...")
     steps = _generate_migration_steps(diff, target_graph)
+    logger.info(f"MIGRATION PLANNER: {len(steps)} steps generated")
 
     migration_plan = {
         "total_steps": len(steps),
@@ -2362,12 +2378,14 @@ def _generate_migration_steps(diff: dict, target_graph) -> list:
                 f"DELETE CHANNEL('{ch_name}')  * Delete RCVR on {to_qm}\n"
                 f"DELETE QLOCAL('{xmitq}')"
             ),
-            "depends_on": [s["step_number"] for s in steps if s["phase"] == "CREATE" and "queue manager" in s["description"]],
+            "depends_on": [],  # All CREATE steps can run in parallel
             "verification": f"DISPLAY CHSTATUS('{ch_name}')  -- should show RUNNING",
         })
 
     # ── PHASE 2: REROUTE — move applications ─────────────────────────────
+    # Depends on phase 1 completion (just reference the phase, not every step)
     reroute_step_nums = []
+    phase1_last = step_num  # last CREATE step number
     for app_info in diff["apps_reassigned"]:
         step_num += 1
         reroute_step_nums.append(step_num)
@@ -2386,12 +2404,12 @@ def _generate_migration_steps(diff: dict, target_graph) -> list:
                 f"* Reconfigure {app_info['app_id']} connection back to {app_info['old_qm']}\n"
                 f"* Restart {app_info['app_id']}"
             ),
-            "depends_on": create_step_nums.copy(),
+            "depends_on": [phase1_last],  # Depends on phase 1 completion, not every step
             "verification": f"Verify {app_info['app_id']} messages flowing through {app_info['new_qm']}",
         })
 
     # ── PHASE 3: DRAIN — wait for old queues to empty ────────────────────
-    drain_deps = create_step_nums + reroute_step_nums
+    phase2_last = step_num  # last REROUTE step number
     for from_qm, to_qm in diff["channels_removed"]:
         step_num += 1
         ch_name = f"{from_qm}.{to_qm}"
@@ -2406,12 +2424,12 @@ def _generate_migration_steps(diff: dict, target_graph) -> list:
                 f"* Wait until CURDEPTH = 0. If messages stuck, investigate before proceeding."
             ),
             "mqsc_rollback": "* Non-destructive step — no rollback needed",
-            "depends_on": drain_deps.copy(),
+            "depends_on": [phase2_last],  # Depends on phase 2 completion
             "verification": f"DISPLAY QLOCAL('{xmitq}') CURDEPTH  -- should show 0",
         })
 
     # ── PHASE 4: CLEANUP — remove old objects ─────────────────────────────
-    cleanup_deps = [s["step_number"] for s in steps if s["phase"] in ("REROUTE", "DRAIN")]
+    phase3_last = step_num  # last DRAIN step number
 
     for from_qm, to_qm in diff["channels_removed"]:
         step_num += 1
@@ -2434,7 +2452,7 @@ def _generate_migration_steps(diff: dict, target_graph) -> list:
                 f"DEFINE CHANNEL('{ch_name}') CHLTYPE(RCVR) REPLACE  * On {to_qm}\n"
                 f"START CHANNEL('{ch_name}')"
             ),
-            "depends_on": cleanup_deps.copy(),
+            "depends_on": [phase3_last],  # Depends on phase 3 completion
             "verification": f"DISPLAY CHANNEL('{ch_name}')  -- should show not found",
         })
 
@@ -2601,10 +2619,11 @@ def doc_expert_agent(state: dict) -> dict:
             )
         report_lines.append("")
 
-        # Detailed forward/rollback for each step
+        # Detailed forward/rollback for each step (cap at 50 to avoid giant report)
         report_lines.append("### Detailed Migration Commands")
         report_lines.append("")
-        for step in migration_plan["steps"]:
+        display_steps = migration_plan["steps"][:50]
+        for step in display_steps:
             report_lines += [
                 f"#### Step {step['step_number']}: {step['description']}",
                 f"**Phase:** {step['phase']} | **Target QM:** {step['target_qm']}",
@@ -2619,6 +2638,8 @@ def doc_expert_agent(state: dict) -> dict:
                 f"**Verification:** {step.get('verification', '')}",
                 "",
             ]
+        if len(migration_plan["steps"]) > 50:
+            report_lines.append(f"*... {len(migration_plan['steps']) - 50} more steps omitted. Full MQSC available in migration-plan deliverable.*\n")
 
     report_lines += [
         "## Agent Execution Trace",
@@ -2634,12 +2655,19 @@ def doc_expert_agent(state: dict) -> dict:
     # ── Generate additional deliverables (Output.md §8.2 & §9) ────────────
     deliverable_docs = {}
     try:
+        logger.info("DOC_EXPERT: generating complexity-algorithm...")
         deliverable_docs["complexity-algorithm"] = _generate_complexity_algorithm_md(state)
+        logger.info("DOC_EXPERT: generating complexity-scores...")
         deliverable_docs["complexity-scores"] = _generate_complexity_scores_csv(state)
+        logger.info("DOC_EXPERT: generating regression-testing-plan...")
         deliverable_docs["regression-testing-plan"] = _generate_regression_testing_plan(state)
+        logger.info("DOC_EXPERT: generating insights...")
         deliverable_docs["insights"] = _generate_insights_md(state)
+        logger.info("DOC_EXPERT: generating migration-plan md...")
         deliverable_docs["migration-plan"] = _generate_migration_plan_md(state)
+        logger.info("DOC_EXPERT: generating subgraph-analysis...")
         deliverable_docs["subgraph-analysis"] = _generate_subgraph_analysis_md(state)
+        logger.info("DOC_EXPERT: all deliverables done")
         messages.append({"agent": "DOC_EXPERT", "msg": f"Generated {len(deliverable_docs)} additional deliverables: {list(deliverable_docs.keys())}"})
     except Exception as e:
         logger.error(f"DOC_EXPERT: Failed to generate some deliverables: {e}")
@@ -2681,38 +2709,45 @@ def _generate_target_topology_json(G, state: dict) -> str:
                 "status": d.get("status", "RUNNING"),
             })
 
-    # QMs with their apps and channels
+    # QMs with their apps and channels — use pre-built lookups
+    qm_apps_map = {}
+    for a, q in app_qm.items():
+        qm_apps_map.setdefault(q, []).append(a)
+
+    ch_out_map = {}
+    ch_in_map = {}
+    for c in channels:
+        ch_out_map.setdefault(c["sender_qm"], []).append(c["channel_name"])
+        ch_in_map.setdefault(c["receiver_qm"], []).append(c["channel_name"])
+
     qm_list = []
     for n, d in qm_nodes:
-        apps = [a for a, q in app_qm.items() if q == n]
-        ch_out = [c["channel_name"] for c in channels if c["sender_qm"] == n]
-        ch_in = [c["channel_name"] for c in channels if c["receiver_qm"] == n]
         owned_queues = [v for _, v, ed in G.out_edges(n, data=True) if ed.get("rel") == "owns"]
         qm_list.append({
             "qm_id": n,
             "qm_name": d.get("name", n),
             "region": d.get("region", ""),
-            "apps": apps,
-            "channels_out": ch_out,
-            "channels_in": ch_in,
+            "apps": qm_apps_map.get(n, []),
+            "channels_out": ch_out_map.get(n, []),
+            "channels_in": ch_in_map.get(n, []),
             "queue_count": len(owned_queues),
         })
 
-    # Applications
+    # Applications — pre-build direction lookup
+    raw_apps = state.get("raw_data", {}).get("applications", [])
+    app_dir_map = {}
+    for r in raw_apps:
+        aid = r.get("app_id")
+        if aid and aid not in app_dir_map:
+            app_dir_map[aid] = r.get("direction", "")
+
     app_list = []
     for n, d in app_nodes:
-        direction = d.get("direction", "")
-        raw_apps = state.get("raw_data", {}).get("applications", [])
-        dir_from_data = ""
-        for r in raw_apps:
-            if r.get("app_id") == n:
-                dir_from_data = r.get("direction", "")
-                break
         app_list.append({
             "app_id": n,
             "app_name": d.get("name", n),
             "assigned_qm": app_qm.get(n, ""),
-            "direction": dir_from_data or direction,
+            "direction": app_dir_map.get(n, "") or d.get("direction", ""),
         })
 
     # Queues by type
@@ -3222,18 +3257,34 @@ not a generic technology preference.
     # ── Detect request-reply pairs (bidirectional apps sharing queues) ────
     # A request-reply pair is two apps that both PUT and GET on overlapping
     # queues — one sends a request, the other sends a response.
+    # Pre-build per-app queue sets to avoid scanning all queues per pair
+    app_produces_queues = {}  # {app: set of queue names it produces to}
+    app_consumes_queues = {}  # {app: set of queue names it consumes from}
+    for qname, prods in queue_prod.items():
+        for p in prods:
+            app_produces_queues.setdefault(p, set()).add(qname)
+    for qname, cons in queue_cons.items():
+        for c in cons:
+            app_consumes_queues.setdefault(c, set()).add(qname)
+
     request_reply_pairs = []
-    for app_a in bidirectional:
-        for app_b in bidirectional:
-            if app_a >= app_b:
-                continue
-            # Check if A produces to a queue B consumes AND B produces to a queue A consumes
-            a_produces = set(q for q, prods in queue_prod.items() if app_a in prods)
-            b_consumes = set(q for q, cons in queue_cons.items() if app_b in cons)
-            b_produces = set(q for q, prods in queue_prod.items() if app_b in prods)
-            a_consumes = set(q for q, cons in queue_cons.items() if app_a in cons)
-            if (a_produces & b_consumes) and (b_produces & a_consumes):
+    bidir_list = sorted(bidirectional)
+    # Cap at 200 to avoid O(n^2) explosion on large datasets
+    bidir_check = bidir_list[:200]
+    for i, app_a in enumerate(bidir_check):
+        a_prod = app_produces_queues.get(app_a, set())
+        a_cons = app_consumes_queues.get(app_a, set())
+        if not a_prod or not a_cons:
+            continue
+        for app_b in bidir_check[i+1:]:
+            b_prod = app_produces_queues.get(app_b, set())
+            b_cons = app_consumes_queues.get(app_b, set())
+            if (a_prod & b_cons) and (b_prod & a_cons):
                 request_reply_pairs.append((app_a, app_b))
+                if len(request_reply_pairs) >= 50:
+                    break
+        if len(request_reply_pairs) >= 50:
+            break
 
     # ── Detect low-volume point-to-point flows (1:1 producer:consumer) ────
     p2p_queues = sorted(
@@ -3574,15 +3625,18 @@ each step to re-create removed objects if needed.
     else:
         md += "No CLEANUP steps required.\n\n"
 
-    # Detailed commands
+    # Detailed commands (cap at 100 to avoid massive output)
     if steps:
         md += "## Detailed Migration Commands\n\n"
-        for s in steps:
+        display_steps = steps[:100]
+        for s in display_steps:
             md += f"### Step {s['step_number']}: {s['description']}\n"
             md += f"**Phase:** {s['phase']} | **Target QM:** {s['target_qm']}\n\n"
             md += f"**Forward MQSC:**\n```\n{s.get('mqsc_forward', 'N/A')}\n```\n\n"
             md += f"**Rollback MQSC:**\n```\n{s.get('mqsc_rollback', 'N/A')}\n```\n\n"
             md += f"**Verification:** `{s.get('verification', 'N/A')}`\n\n"
+        if len(steps) > 100:
+            md += f"\n*... {len(steps) - 100} more steps. Full MQSC scripts available in provisioner output.*\n\n"
 
     md += """## Rollback Strategy
 
