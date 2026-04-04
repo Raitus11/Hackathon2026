@@ -324,3 +324,259 @@ def build_architect_prompt(state: dict) -> str:
         cs_score=factor_scores.get("cs_weighted", "N/A"),
         human_feedback_section=feedback_section,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLUSTER-BASED PROMPT — Single LLM call for 400+ app topologies
+# Instead of sending 400 apps, sends ~12 cluster summaries + bridge apps.
+# ─────────────────────────────────────────────────────────────────────────────
+
+CLUSTER_SYSTEM_PROMPT = """You are a senior IBM MQ architect. A rules engine has already:
+1. Assigned every app to its dedicated QM (1:1 strict ownership)
+2. Derived all channels from actual producer→consumer flows
+3. Detected communities (clusters of tightly-connected QMs)
+4. Identified bridge apps that connect clusters
+
+Your job is NOT to redo the assignments. The rules engine handled that correctly.
+Your job is to provide ARCHITECTURAL INTELLIGENCE that rules cannot:
+
+## TASK 1: CLUSTER REVIEW
+For each cluster, assess whether the apps grouped together make architectural sense.
+Flag any apps that should move to a different cluster. Explain WHY.
+
+## TASK 2: BRIDGE APP DECISIONS
+Bridge apps sit between clusters — these are the genuinely hard decisions.
+For each, recommend whether the rules assignment is correct or should change.
+
+## TASK 3: ARCHITECTURE DECISION RECORDS
+Generate ADRs referencing SPECIFIC entity names from the data. No generic statements.
+
+## TASK 4: MODERNIZATION INSIGHTS
+Identify:
+- Queue pairs that are disguised synchronous RPC calls (bidirectional)
+- Fan-out patterns that would benefit from Kafka/event streaming
+- Hub QMs that are single points of failure
+- Apps that could use direct gRPC instead of MQ
+
+## OUTPUT FORMAT — RETURN ONLY VALID JSON
+{
+  "cluster_reviews": [
+    {
+      "cluster_id": 0,
+      "assessment": "Well-grouped — all payment-processing apps",
+      "move_recommendations": [
+        {"app_id": "X", "from_cluster": 0, "to_cluster": 2, "reason": "X is a logging service, not payment"}
+      ]
+    }
+  ],
+  "bridge_app_decisions": [
+    {
+      "app_id": "BRIDGE_APP",
+      "current_qm": "QM_X",
+      "recommended_qm": "QM_Y",
+      "reason": "Produces 80% of messages to cluster 2",
+      "keep_current": false
+    }
+  ],
+  "reassignments": [
+    {
+      "app_id": "A001",
+      "from_qm": "QM_OLD",
+      "to_qm": "QM_NEW",
+      "reason": "Co-locate with dependent apps to eliminate 3 cross-QM channels"
+    }
+  ],
+  "adrs": [
+    {
+      "id": "ADR-001",
+      "title": "Payment cluster isolation",
+      "context": "Apps A001, A002, A003 form a payment pipeline across 3 QMs",
+      "decision": "Co-locate on cluster 1 QMs to minimize cross-cluster latency",
+      "rationale": "Payment flows are latency-sensitive",
+      "consequences": "Reduces cross-cluster channels by 4"
+    }
+  ],
+  "modernization_insights": [
+    {
+      "type": "KAFKA_CANDIDATE | GRPC_CANDIDATE | SPOF | ANTI_PATTERN",
+      "entities": ["APP_X", "APP_Y"],
+      "detail": "APP_X fans out to 12 consumers — classic pub/sub for Kafka",
+      "recommendation": "Replace fan-out with Kafka topic"
+    }
+  ],
+  "design_decisions": [
+    {
+      "id": "DD-001",
+      "type": "REASSIGN | MODERNIZE",
+      "affected_entities": ["A001", "QM007"],
+      "description": "What you are doing",
+      "rationale": "Why — reference specific apps, queues, flow counts"
+    }
+  ]
+}
+
+## RULES
+- Reference ONLY entity names from the provided data.
+- Every ADR must reference at least 2 specific entity names.
+- Reassignments must not break 1:1 ownership.
+- Keep reassignment count small (5-15). The rules engine got 90%+ right.
+- Focus on the HARD cases — bridges, hubs, anti-patterns."""
+
+
+def build_cluster_prompt(state: dict) -> str:
+    """
+    Build a cluster-level prompt for the LLM.
+    Sends ~12 cluster summaries + bridge apps instead of 400+ individual apps.
+    Total: ~3-6K tokens regardless of app count.
+    """
+    from collections import Counter
+    
+    raw_data = state["raw_data"]
+    communities = state.get("as_is_communities", {})
+    centrality = state.get("as_is_centrality", {})
+    metrics = state.get("as_is_metrics", {})
+
+    app_list = raw_data.get("applications", [])
+    qm_list = raw_data.get("queue_managers", [])
+
+    # ── Build app→QM ownership (weighted majority) ────────────────────────
+    app_qm_counts = {}
+    for row in app_list:
+        aid = row["app_id"]
+        qm = row["qm_id"]
+        app_qm_counts.setdefault(aid, {})
+        app_qm_counts[aid][qm] = app_qm_counts[aid].get(qm, 0) + 1
+
+    app_preferred_qm = {}
+    for aid, qm_counts in app_qm_counts.items():
+        app_preferred_qm[aid] = max(qm_counts, key=lambda q: qm_counts[q])
+
+    qm_region = {qm["qm_id"]: qm.get("region", "UNKNOWN") for qm in qm_list}
+
+    # ── Community data ────────────────────────────────────────────────────
+    community_map = communities.get("community_map", {})
+    community_list = communities.get("communities", [])
+
+    community_apps = {}
+    for aid, qm in app_preferred_qm.items():
+        cluster = community_map.get(qm, -1)
+        community_apps.setdefault(cluster, []).append(aid)
+
+    # ── Flow analysis ─────────────────────────────────────────────────────
+    queue_prod, queue_cons = {}, {}
+    for row in app_list:
+        aid, qname = row["app_id"], row.get("queue_name", "")
+        if not qname:
+            continue
+        d = row.get("direction", "").upper()
+        if d in ("PUT", "PRODUCER"):
+            queue_prod.setdefault(qname, set()).add(aid)
+        elif d in ("GET", "CONSUMER"):
+            queue_cons.setdefault(qname, set()).add(aid)
+
+    flow_pairs = set()
+    cross_cluster_flows = []
+    for qname in set(queue_prod.keys()) & set(queue_cons.keys()):
+        for p in queue_prod[qname]:
+            for c in queue_cons[qname]:
+                if p != c:
+                    flow_pairs.add((p, c))
+                    p_cl = community_map.get(app_preferred_qm.get(p, ""), -1)
+                    c_cl = community_map.get(app_preferred_qm.get(c, ""), -1)
+                    if p_cl != c_cl and p_cl >= 0 and c_cl >= 0:
+                        cross_cluster_flows.append((p, c, p_cl, c_cl, qname))
+
+    # ── Bridge apps ───────────────────────────────────────────────────────
+    app_cluster_conns = {}
+    for p, c, p_cl, c_cl, _ in cross_cluster_flows:
+        app_cluster_conns.setdefault(p, set()).add(c_cl)
+        app_cluster_conns.setdefault(c, set()).add(p_cl)
+
+    bridge_apps = []
+    for aid, clusters in app_cluster_conns.items():
+        if len(clusters) >= 2:
+            own_qm = app_preferred_qm.get(aid, "")
+            bridge_apps.append({
+                "app_id": aid, "assigned_qm": own_qm,
+                "own_cluster": community_map.get(own_qm, -1),
+                "connects_to_clusters": sorted(clusters),
+                "strength": app_qm_counts.get(aid, {}).get(own_qm, 0),
+            })
+    bridge_apps.sort(key=lambda x: len(x["connects_to_clusters"]), reverse=True)
+
+    app_fanout = Counter(p for p, _ in flow_pairs)
+    bidir_pairs = [(p, c) for p, c in flow_pairs if (c, p) in flow_pairs and p < c]
+
+    # ── Build prompt ──────────────────────────────────────────────────────
+    lines = [
+        f"## TOPOLOGY OVERVIEW",
+        f"{len(app_preferred_qm)} apps, {len(set(app_preferred_qm.values()))} QMs after 1:1 assignment.",
+        f"{len(flow_pairs)} flows, {len(cross_cluster_flows)} cross-cluster.",
+        f"Complexity: {metrics.get('total_score', 'N/A')}/100, "
+        f"Modularity: {communities.get('modularity', 'N/A')}",
+        f"SPOFs: {centrality.get('spof_qms', [])[:5]}",
+        f"Hubs: {centrality.get('hub_qms', [])[:5]}",
+        "",
+        f"## CLUSTERS ({len(community_list)} communities)",
+    ]
+
+    for idx, comm_qms in enumerate(community_list):
+        apps_in = community_apps.get(idx, [])
+        regions = sorted(set(qm_region.get(qm, "?") for qm in comm_qms))
+        top = sorted([(a, app_fanout.get(a, 0)) for a in apps_in], key=lambda x: -x[1])[:5]
+        top_str = ", ".join(f"{a}(→{f})" for a, f in top if f > 0)
+        lines.append(f"  C{idx}: {len(comm_qms)} QMs, {len(apps_in)} apps, regions={regions}")
+        lines.append(f"    QMs: {', '.join(sorted(comm_qms)[:10])}{'...' if len(comm_qms)>10 else ''}")
+        if top_str:
+            lines.append(f"    Producers: {top_str}")
+
+    lines += ["", f"## BRIDGE APPS ({len(bridge_apps)} connecting multiple clusters)"]
+    for ba in bridge_apps[:30]:
+        lines.append(f"  {ba['app_id']}: on {ba['assigned_qm']} (C{ba['own_cluster']}), "
+                     f"→ clusters {ba['connects_to_clusters']}, strength={ba['strength']}")
+    if len(bridge_apps) > 30:
+        lines.append(f"  ... and {len(bridge_apps)-30} more")
+
+    lines += ["", f"## CROSS-CLUSTER FLOW DENSITY"]
+    fc = Counter((p_cl, c_cl) for _, _, p_cl, c_cl, _ in cross_cluster_flows)
+    for (f, t), cnt in fc.most_common(15):
+        lines.append(f"  C{f} → C{t}: {cnt} flows")
+
+    lines += ["", f"## HIGH FAN-OUT (Kafka candidates)"]
+    for aid, cnt in app_fanout.most_common(10):
+        lines.append(f"  {aid}: → {cnt} consumers, on {app_preferred_qm.get(aid,'?')}")
+
+    if bidir_pairs:
+        lines += ["", f"## BIDIRECTIONAL PAIRS (RPC candidates, {len(bidir_pairs)} pairs)"]
+        for p, c in bidir_pairs[:10]:
+            lines.append(f"  {p} ↔ {c}")
+        if len(bidir_pairs) > 10:
+            lines.append(f"  ... and {len(bidir_pairs)-10} more")
+
+    # ── Reassignment constraints ──────────────────────────────────────────
+    # Tell the LLM which QMs are occupied so it doesn't suggest invalid moves.
+    # Also tell it how to make valid reassignments (swap, not overwrite).
+    lines += ["", "## REASSIGNMENT CONSTRAINTS"]
+    lines.append("Every QM already has exactly 1 app assigned (1:1 rule).")
+    lines.append("To move app A from QM_X to QM_Y, you MUST ALSO move the app currently on QM_Y.")
+    lines.append("Alternatively, suggest moving app A to a NEW QM name (e.g. QM_CLUSTER1_A001).")
+    lines.append("If you suggest a reassignment to an occupied QM without swapping, it will be rejected.")
+    lines.append("")
+    lines.append("OCCUPIED QMs (sample — ALL original QMs are occupied):")
+    # Show a sample of QM→app mappings so the LLM understands the constraint
+    qm_to_app = {}
+    for aid, qm in app_preferred_qm.items():
+        qm_to_app[qm] = aid
+    for qm in sorted(qm_to_app.keys())[:20]:
+        lines.append(f"  {qm} ← {qm_to_app[qm]}")
+    if len(qm_to_app) > 20:
+        lines.append(f"  ... all {len(qm_to_app)} QMs are occupied")
+
+    feedback = state.get("human_feedback", "")
+    if feedback:
+        lines += ["", f"## HUMAN FEEDBACK", feedback]
+
+    lines += ["", "Analyse this topology. Focus on bridge apps, cluster coherence, modernization.", 
+              "Return ONLY valid JSON."]
+
+    return "\n".join(lines)

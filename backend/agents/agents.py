@@ -32,7 +32,10 @@ from backend.graph.mq_graph import (
     compute_graph_entropy, compare_topologies,
 )
 from backend.llm.llm_client import call_llm, validate_architect_response
-from backend.llm.prompts import ARCHITECT_SYSTEM_PROMPT, build_architect_prompt
+from backend.llm.prompts import (
+    ARCHITECT_SYSTEM_PROMPT, build_architect_prompt,
+    CLUSTER_SYSTEM_PROMPT, build_cluster_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -298,12 +301,20 @@ def analyst_agent(state: dict) -> dict:
 # Pipeline NEVER crashes due to LLM failure.
 # ─────────────────────────────────────────────────────────────────────────────
 def architect_agent(state: dict) -> dict:
-    logger.info("ARCHITECT: Designing target state topology")
+    """
+    Architect agent — hybrid cluster-based approach.
+    
+    Phase A: Rules build complete baseline (instant, 0 API calls)
+    Phase B: ONE LLM call on clusters + bridge apps (1 API call, ~10-15s)
+    Phase C: Merge LLM refinements into rules baseline + validate
+    
+    architect_method = "hybrid_cluster" when LLM contributes.
+    """
+    logger.info("ARCHITECT: Designing target state topology (hybrid cluster)")
     messages = state.get("messages", [])
-    adrs = state.get("adrs", [])
+    adrs = state.get("adrs", []) or []
     redesign_count = state.get("redesign_count", 0)
 
-    # Bail if upstream failed
     if state.get("error"):
         messages.append({"agent": "ARCHITECT", "msg": f"SKIPPED — upstream error: {state['error']}"})
         return {"messages": messages}
@@ -315,29 +326,115 @@ def architect_agent(state: dict) -> dict:
         return {"error": err, "messages": messages}
 
     try:
-        # Try LLM approach first
+        # ── PHASE A: Rules build complete baseline ────────────────────────
+        target_graph = _build_target_rules(state)
+        
+        app_count = sum(1 for _, d in target_graph.nodes(data=True) if d.get("type") == "app")
+        qm_count = sum(1 for _, d in target_graph.nodes(data=True) if d.get("type") == "qm")
+        logger.info(f"ARCHITECT: Phase A — Rules baseline: {app_count} apps, {qm_count} QMs")
+        messages.append({"agent": "ARCHITECT", "msg": f"Rules baseline built — {app_count} apps assigned in Phase A"})
+
+        # ── PHASE B: Cluster-based LLM call ───────────────────────────────
         llm_result = _architect_llm(state)
 
         if llm_result is not None:
-            target_graph, llm_adrs = _build_target_from_llm(llm_result, state)
-            adrs.extend(llm_adrs)
-            method = "llm"
-            logger.info(f"ARCHITECT: LLM method succeeded — {len(llm_adrs)} ADRs generated")
+            # ── PHASE C: Merge LLM refinements ────────────────────────────
+            reassignment_count = 0
+            rejected_count = 0
+
+            # Apply reassignments
+            all_reassignments = list(llm_result.get("reassignments", []))
+            # Also treat bridge_app_decisions with keep_current=False as reassignments
+            for bridge in llm_result.get("bridge_app_decisions", []):
+                if not bridge.get("keep_current", True):
+                    all_reassignments.append({
+                        "app_id": bridge.get("app_id", ""),
+                        "to_qm": bridge.get("recommended_qm", ""),
+                        "reason": bridge.get("reason", "bridge decision"),
+                    })
+
+            for entry in all_reassignments:
+                app_id = entry.get("app_id", "")
+                to_qm = entry.get("to_qm", "")
+                if not app_id or not to_qm or app_id not in target_graph.nodes:
+                    continue
+
+                # Check if target QM is occupied
+                apps_on_target = [u for u, v, d in target_graph.in_edges(to_qm, data=True)
+                                  if d.get("rel") == "connects_to"] if to_qm in target_graph.nodes else []
+                
+                if apps_on_target and apps_on_target != [app_id]:
+                    # Target QM is occupied — try a SWAP
+                    occupant = apps_on_target[0]
+                    # Find app_id's current QM
+                    current_edges = [(u, v) for u, v, d in target_graph.out_edges(app_id, data=True)
+                                     if d.get("rel") == "connects_to"]
+                    if not current_edges:
+                        rejected_count += 1
+                        continue
+                    from_qm = current_edges[0][1]
+                    
+                    # Perform swap: occupant moves to from_qm, app_id moves to to_qm
+                    # Remove both old edges
+                    target_graph.remove_edge(app_id, from_qm)
+                    target_graph.remove_edge(occupant, to_qm)
+                    # Add swapped edges
+                    target_graph.add_edge(app_id, to_qm, rel="connects_to")
+                    target_graph.add_edge(occupant, from_qm, rel="connects_to")
+                    reassignment_count += 1
+                    logger.info(f"ARCHITECT: Swapped {app_id}→{to_qm} and {occupant}→{from_qm}: "
+                               f"{entry.get('reason', '')[:80]}")
+                    continue
+
+                # Target QM is free or doesn't exist yet
+                old_edges = [(u, v) for u, v, d in target_graph.out_edges(app_id, data=True)
+                             if d.get("rel") == "connects_to"]
+                for u, v in old_edges:
+                    target_graph.remove_edge(u, v)
+
+                if to_qm not in target_graph.nodes:
+                    target_graph.add_node(to_qm, type="qm", name=to_qm, region="")
+
+                target_graph.add_edge(app_id, to_qm, rel="connects_to")
+                reassignment_count += 1
+                logger.info(f"ARCHITECT: Applied {app_id} → {to_qm}: {entry.get('reason', '')[:80]}")
+
+            # Parse LLM ADRs
+            for adr in llm_result.get("adrs", []):
+                adrs.append({
+                    "id": adr.get("id", f"ADR-LLM-{len(adrs)+1:03d}"),
+                    "decision": adr.get("decision") or adr.get("title", "LLM decision"),
+                    "context": adr.get("context", ""),
+                    "rationale": adr.get("rationale", ""),
+                    "consequences": adr.get("consequences", ""),
+                })
+
+            method = "hybrid_cluster"
+            llm_coverage_str = (
+                f"{reassignment_count} reassignments applied, {rejected_count} rejected, "
+                f"{len(llm_result.get('adrs', []))} ADRs, "
+                f"{len(llm_result.get('modernization_insights', []))} insights"
+            )
+            logger.info(f"ARCHITECT: Phase C — {llm_coverage_str}")
+            messages.append({"agent": "ARCHITECT", "msg": f"LLM cluster analysis: {llm_coverage_str}"})
         else:
-            target_graph = _build_target_rules(state)
             rule_adrs = _generate_rule_adrs(state, target_graph, redesign_count)
             adrs.extend(rule_adrs)
             method = "rules_fallback"
-            logger.info(f"ARCHITECT: Fell back to rule-based method — {len(rule_adrs)} ADRs")
+            logger.info(f"ARCHITECT: Rules fallback — {len(rule_adrs)} ADRs")
 
-        # ── SAFETY NET: enforce 1-QM-per-app on whatever graph was built ────
+        # ── Safety net + channel backfill ─────────────────────────────────
         dupes_removed = _enforce_single_qm(target_graph, raw_data)
         if dupes_removed:
-            logger.warning(f"ARCHITECT: _enforce_single_qm removed {dupes_removed} duplicate connects_to edges")
-            # _enforce_single_qm may have created new QMs that lack channels.
-            # Backfill channels from actual producer→consumer flows.
-            _backfill_channels(target_graph, raw_data)
+            logger.warning(f"ARCHITECT: _enforce_single_qm removed {dupes_removed} duplicate edges")
 
+        # ALWAYS backfill channels — new QMs from rules splitting need channels
+        # derived from actual producer→consumer flows, not just when enforce_single_qm
+        # makes corrections. Without this, QM_A345 etc. end up with zero channels
+        # and the tester flags them as ISOLATED_QM (CRITICAL).
+        _backfill_channels(target_graph, raw_data)
+
+        # ── Final counts ──────────────────────────────────────────────────
         as_is = state.get("as_is_graph")
         original_qm_count = sum(1 for _, d in as_is.nodes(data=True) if d.get("type") == "qm") if as_is else 0
         target_qm_count = sum(1 for _, d in target_graph.nodes(data=True) if d.get("type") == "qm")
@@ -346,8 +443,7 @@ def architect_agent(state: dict) -> dict:
         msg = (
             f"Target state designed using {method}: "
             f"{target_qm_count} QMs (was {original_qm_count}), "
-            f"{target_ch_count} channels. "
-            f"{len(adrs)} ADRs written."
+            f"{target_ch_count} channels, {len(adrs)} ADRs."
         )
         messages.append({"agent": "ARCHITECT", "msg": msg})
 
@@ -531,28 +627,55 @@ def _backfill_channels(G: nx.DiGraph, raw_data: dict):
 
 
 def _architect_llm(state: dict) -> dict | None:
-    """Call Groq LLM for architecture design. Returns parsed dict or None."""
+    """
+    Cluster-based LLM architecture call (v2).
+    
+    Instead of sending 400+ apps in batches of 75 (which fails at Tachyon gateway),
+    sends ONE call with ~12 cluster summaries + bridge apps (~3-6K tokens).
+    
+    The LLM reviews clusters, decides bridge app placement, generates ADRs,
+    and identifies modernization candidates — all in a single pass.
+    """
     try:
-        user_prompt = build_architect_prompt(state)
+        user_prompt = build_cluster_prompt(state)
+        
+        logger.info(f"ARCHITECT-LLM: Sending cluster-based prompt "
+                    f"(~{len(user_prompt)} chars, ~{len(user_prompt)//4} tokens)")
+        
         result = call_llm(
-            system_prompt=ARCHITECT_SYSTEM_PROMPT,
+            system_prompt=CLUSTER_SYSTEM_PROMPT,
             user_prompt=user_prompt,
             max_retries=2,
             temperature=0.1,
             max_tokens=8192,
         )
+        
         if result is None:
+            logger.warning("ARCHITECT-LLM: LLM call returned None")
             return None
-
-        # Validate required keys
-        missing = validate_architect_response(result)
-        if missing:
-            logger.warning(f"LLM response missing keys: {missing}")
+        
+        # Validate we got something useful (new schema has different keys)
+        has_content = any([
+            result.get("cluster_reviews"),
+            result.get("bridge_app_decisions"),
+            result.get("reassignments"),
+            result.get("adrs"),
+            result.get("modernization_insights"),
+        ])
+        
+        if not has_content:
+            logger.warning("ARCHITECT-LLM: Response had no actionable content")
             return None
-
+        
+        logger.info(f"ARCHITECT-LLM: Got {len(result.get('reassignments', []))} reassignments, "
+                    f"{len(result.get('adrs', []))} ADRs, "
+                    f"{len(result.get('modernization_insights', []))} insights, "
+                    f"{len(result.get('bridge_app_decisions', []))} bridge decisions")
+        
         return result
+        
     except Exception as e:
-        logger.error(f"Architect LLM call failed: {e}")
+        logger.error(f"ARCHITECT-LLM: Cluster call failed: {e}")
         return None
 
 
@@ -1499,6 +1622,34 @@ def tester_agent(state: dict) -> dict:
     # one channel (inbound or outbound) connecting it to the rest of the topology.
     # A QM with apps but zero channels is disconnected — its apps can't
     # communicate with anything outside that QM.
+    #
+    # HOWEVER: if the app has zero cross-app flows (no producer→consumer 
+    # relationships with any other app), it is legitimately self-contained.
+    # This is a WARNING, not CRITICAL — the app simply doesn't need channels.
+    
+    # Build flow data to distinguish "broken isolation" from "genuine isolation"
+    _queue_prod_t = {}
+    _queue_cons_t = {}
+    for row in state.get("raw_data", {}).get("applications", []):
+        _aid = row["app_id"]
+        _qn = row.get("queue_name", "")
+        if not _qn:
+            continue
+        _dir = row.get("direction", "").upper()
+        if _dir in ("PUT", "PRODUCER"):
+            _queue_prod_t.setdefault(_qn, set()).add(_aid)
+        elif _dir in ("GET", "CONSUMER"):
+            _queue_cons_t.setdefault(_qn, set()).add(_aid)
+    
+    # Apps with cross-app flows
+    _apps_with_flows = set()
+    for _qn in set(_queue_prod_t.keys()) & set(_queue_cons_t.keys()):
+        for _p in _queue_prod_t[_qn]:
+            for _c in _queue_cons_t[_qn]:
+                if _p != _c:
+                    _apps_with_flows.add(_p)
+                    _apps_with_flows.add(_c)
+    
     if len(qms_with_apps) > 1:
         for qm in qm_nodes:
             if qm not in qms_with_apps:
@@ -1513,11 +1664,13 @@ def tester_agent(state: dict) -> dict:
             )
             if not has_outbound and not has_inbound:
                 apps_on_qm = [a for a, q in app_qm_map.items() if q == qm]
+                # Check if any app on this QM has cross-app flows
+                has_flows = any(a in _apps_with_flows for a in apps_on_qm)
                 violations.append({
                     "rule": "ISOLATED_QM",
                     "entity": qm,
                     "detail": f"QM {qm} has apps {apps_on_qm} but zero channels — apps are completely disconnected from the topology",
-                    "severity": "CRITICAL",
+                    "severity": "CRITICAL" if has_flows else "WARNING",
                 })
 
     passed = not any(v["severity"] == "CRITICAL" for v in violations)
