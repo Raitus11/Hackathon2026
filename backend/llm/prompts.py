@@ -343,13 +343,20 @@ Your job is to provide ARCHITECTURAL INTELLIGENCE that rules cannot:
 ## TASK 1: CLUSTER REVIEW
 For each cluster, assess whether the apps grouped together make architectural sense.
 Flag any apps that should move to a different cluster. Explain WHY.
+PAY SPECIAL ATTENTION TO:
+- PCI-compliant apps mixed with non-PCI apps (compliance boundary violation)
+- Payment-critical apps co-located with non-critical batch jobs (blast radius risk)
+- Restricted-data apps sharing clusters with lower-classification apps
+- Low-latency apps (TRTC <30min) placed far from their consumers
 
 ## TASK 2: BRIDGE APP DECISIONS
 Bridge apps sit between clusters — these are the genuinely hard decisions.
 For each, recommend whether the rules assignment is correct or should change.
+Consider business criticality: a PCI payment gateway bridging clusters is higher risk than a logging service.
 
 ## TASK 3: ARCHITECTURE DECISION RECORDS
 Generate ADRs referencing SPECIFIC entity names from the data. No generic statements.
+Include business rationale: "Isolate PCI apps A041, A078 into dedicated cluster to maintain PCI-DSS compliance boundary."
 
 ## TASK 4: MODERNIZATION INSIGHTS
 Identify:
@@ -357,6 +364,7 @@ Identify:
 - Fan-out patterns that would benefit from Kafka/event streaming
 - Hub QMs that are single points of failure
 - Apps that could use direct gRPC instead of MQ
+- PCI boundary violations that need architectural remediation
 
 ## OUTPUT FORMAT — RETURN ONLY VALID JSON
 {
@@ -507,6 +515,33 @@ def build_cluster_prompt(state: dict) -> str:
     app_fanout = Counter(p for p, _ in flow_pairs)
     bidir_pairs = [(p, c) for p, c in flow_pairs if (c, p) in flow_pairs and p < c]
 
+    # ── Business metadata lookup ──────────────────────────────────────────
+    app_meta = raw_data.get("app_metadata", {})
+    
+    def _app_tag(aid):
+        """Compact business tag for an app: A084 (PaymentGW, PCI, CRITICAL)"""
+        m = app_meta.get(aid, {})
+        tags = []
+        # Neighborhood/domain
+        nb = m.get("neighborhood", "")
+        if nb and nb != "UNKNOWN":
+            tags.append(nb)
+        # PCI
+        if m.get("is_pci", "").upper() == "YES":
+            tags.append("PCI")
+        # Payment critical
+        if m.get("is_payment_critical", "").upper() == "YES":
+            tags.append("CRITICAL")
+        # Data classification
+        dc = m.get("data_classification", "")
+        if dc and dc != "UNKNOWN" and dc.upper() == "RESTRICTED":
+            tags.append("Restricted")
+        # TRTC (latency requirement)
+        trtc = m.get("trtc", "")
+        if "0-30" in trtc:
+            tags.append("Low-latency")
+        return f"{aid} ({', '.join(tags)})" if tags else aid
+
     # ── Build prompt ──────────────────────────────────────────────────────
     lines = [
         f"## TOPOLOGY OVERVIEW",
@@ -516,23 +551,62 @@ def build_cluster_prompt(state: dict) -> str:
         f"Modularity: {communities.get('modularity', 'N/A')}",
         f"SPOFs: {centrality.get('spof_qms', [])[:5]}",
         f"Hubs: {centrality.get('hub_qms', [])[:5]}",
-        "",
-        f"## CLUSTERS ({len(community_list)} communities)",
     ]
+
+    # ── PCI / Criticality summary ─────────────────────────────────────────
+    if app_meta:
+        pci_apps = [a for a, m in app_meta.items() if m.get("is_pci", "").upper() == "YES"]
+        critical_apps = [a for a, m in app_meta.items() if m.get("is_payment_critical", "").upper() == "YES"]
+        restricted_apps = [a for a, m in app_meta.items() if m.get("data_classification", "").upper() == "RESTRICTED"]
+        low_latency_apps = [a for a, m in app_meta.items() if "0-30" in m.get("trtc", "")]
+        
+        lines += [
+            "",
+            f"## BUSINESS CONTEXT",
+            f"  PCI-compliant apps: {len(pci_apps)} — {', '.join(sorted(pci_apps)[:8])}{'...' if len(pci_apps)>8 else ''}",
+            f"  Payment-critical apps: {len(critical_apps)} — {', '.join(sorted(critical_apps)[:8])}{'...' if len(critical_apps)>8 else ''}",
+            f"  Restricted data apps: {len(restricted_apps)}",
+            f"  Low-latency (TRTC <30min): {len(low_latency_apps)}",
+        ]
+        
+        # Check if PCI apps are scattered across clusters
+        pci_clusters = set()
+        for a in pci_apps:
+            qm = app_preferred_qm.get(a, "")
+            cl = community_map.get(qm, -1)
+            if cl >= 0:
+                pci_clusters.add(cl)
+        if len(pci_clusters) > 1:
+            lines.append(f"  WARNING: PCI apps are spread across {len(pci_clusters)} clusters — consider isolating")
+        
+        # LOB distribution
+        lob_counter = Counter(m.get("line_of_business", "?") for m in app_meta.values())
+        lines.append(f"  Lines of business: {dict(lob_counter.most_common(5))}")
+
+    lines += ["", f"## CLUSTERS ({len(community_list)} communities)"]
 
     for idx, comm_qms in enumerate(community_list):
         apps_in = community_apps.get(idx, [])
         regions = sorted(set(qm_region.get(qm, "?") for qm in comm_qms))
         top = sorted([(a, app_fanout.get(a, 0)) for a in apps_in], key=lambda x: -x[1])[:5]
-        top_str = ", ".join(f"{a}(→{f})" for a, f in top if f > 0)
+        top_str = ", ".join(f"{_app_tag(a)}(→{f})" for a, f in top if f > 0)
+        
+        # Per-cluster business profile
+        cluster_pci = sum(1 for a in apps_in if app_meta.get(a, {}).get("is_pci", "").upper() == "YES")
+        cluster_critical = sum(1 for a in apps_in if app_meta.get(a, {}).get("is_payment_critical", "").upper() == "YES")
+        cluster_neighborhoods = Counter(app_meta.get(a, {}).get("neighborhood", "?") for a in apps_in)
+        top_neighborhoods = ", ".join(f"{n}({c})" for n, c in cluster_neighborhoods.most_common(3))
+        
         lines.append(f"  C{idx}: {len(comm_qms)} QMs, {len(apps_in)} apps, regions={regions}")
         lines.append(f"    QMs: {', '.join(sorted(comm_qms)[:10])}{'...' if len(comm_qms)>10 else ''}")
+        if cluster_pci or cluster_critical:
+            lines.append(f"    Business: {cluster_pci} PCI, {cluster_critical} payment-critical, domains: {top_neighborhoods}")
         if top_str:
-            lines.append(f"    Producers: {top_str}")
+            lines.append(f"    Top producers: {top_str}")
 
     lines += ["", f"## BRIDGE APPS ({len(bridge_apps)} connecting multiple clusters)"]
     for ba in bridge_apps[:30]:
-        lines.append(f"  {ba['app_id']}: on {ba['assigned_qm']} (C{ba['own_cluster']}), "
+        lines.append(f"  {_app_tag(ba['app_id'])}: on {ba['assigned_qm']} (C{ba['own_cluster']}), "
                      f"→ clusters {ba['connects_to_clusters']}, strength={ba['strength']}")
     if len(bridge_apps) > 30:
         lines.append(f"  ... and {len(bridge_apps)-30} more")
@@ -544,12 +618,12 @@ def build_cluster_prompt(state: dict) -> str:
 
     lines += ["", f"## HIGH FAN-OUT (Kafka candidates)"]
     for aid, cnt in app_fanout.most_common(10):
-        lines.append(f"  {aid}: → {cnt} consumers, on {app_preferred_qm.get(aid,'?')}")
+        lines.append(f"  {_app_tag(aid)}: → {cnt} consumers, on {app_preferred_qm.get(aid,'?')}")
 
     if bidir_pairs:
         lines += ["", f"## BIDIRECTIONAL PAIRS (RPC candidates, {len(bidir_pairs)} pairs)"]
         for p, c in bidir_pairs[:10]:
-            lines.append(f"  {p} ↔ {c}")
+            lines.append(f"  {_app_tag(p)} ↔ {_app_tag(c)}")
         if len(bidir_pairs) > 10:
             lines.append(f"  ... and {len(bidir_pairs)-10} more")
 

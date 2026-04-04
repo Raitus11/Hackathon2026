@@ -144,6 +144,36 @@ def load_and_clean(csv_paths: dict) -> tuple[dict, dict]:
                 break
         app_name_map[r["app_id"]] = name
 
+    # ── Extract per-app business metadata (for LLM context) ──────────────
+    # These columns exist in the raw CSV but get lost during deduplication.
+    # We extract the dominant value per app_id using mode() so the LLM can
+    # reason about PCI boundaries, criticality, data classification, etc.
+    biz_meta_cols = {
+        "Primary Data Classification": "data_classification",
+        "Primary Enterprise Critical Payment Application": "is_payment_critical",
+        "Primary PCI": "is_pci",
+        "Primary TRTC": "trtc",
+        "Primary Hosting Type": "hosting_type",
+        "Neighborhood": "neighborhood",
+        "line_of_business": "line_of_business",
+    }
+    app_metadata = {}  # {app_id: {field: value}}
+    available_biz_cols = [c for c in biz_meta_cols if c in df.columns]
+    if available_biz_cols:
+        meta_df = df[["app_id"] + available_biz_cols].copy()
+        for app_id, grp in meta_df.groupby("app_id"):
+            meta = {}
+            for raw_col in available_biz_cols:
+                field_name = biz_meta_cols[raw_col]
+                vals = grp[raw_col].dropna()
+                if len(vals):
+                    mode_vals = vals.mode()
+                    meta[field_name] = str(mode_vals.iloc[0]) if len(mode_vals) else str(vals.iloc[0])
+                else:
+                    meta[field_name] = "UNKNOWN"
+            app_metadata[app_id] = meta
+        report["steps"].append(f"Business metadata extracted for {len(app_metadata)} apps")
+
     # Keep per-queue detail: one row per (app_id, qm_id, queue, direction)
     # This preserves the graph density needed for accurate complexity scoring
     adf["queue_name"] = df["Discrete Queue Name"]
@@ -215,4 +245,5 @@ def load_and_clean(csv_paths: dict) -> tuple[dict, dict]:
     return {
         "queue_managers": qm_rows, "queues": queue_rows,
         "applications": app_rows, "channels": channel_rows,
+        "app_metadata": app_metadata,
     }, report
