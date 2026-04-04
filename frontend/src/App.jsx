@@ -435,11 +435,50 @@ function drawAsIsForce(g, nodes, edges, w, h, svg, zoom, title, showQueues) {
   const nodeCount = nodes.length;
 
   // Scale forces aggressively for large graphs
-  const chargeStrength = nodeCount > 400 ? -40 : nodeCount > 200 ? -60 : nodeCount > 80 ? -120 : -250;
-  const linkDist = nodeCount > 400 ? 10 : nodeCount > 200 ? 15 : nodeCount > 80 ? 30 : 40;
-  const chDist = nodeCount > 400 ? 25 : nodeCount > 200 ? 40 : nodeCount > 80 ? 70 : 100;
+  const chargeStrength = nodeCount > 400 ? -60 : nodeCount > 200 ? -80 : nodeCount > 80 ? -120 : -250;
+  const linkDist = nodeCount > 400 ? 12 : nodeCount > 200 ? 15 : nodeCount > 80 ? 30 : 40;
+  const chDist = nodeCount > 400 ? 30 : nodeCount > 200 ? 40 : nodeCount > 80 ? 70 : 100;
   const ownsDist = 12;
-  const collideRadius = nodeCount > 400 ? 5 : nodeCount > 200 ? 8 : nodeCount > 80 ? 15 : 22;
+  const collideRadius = nodeCount > 400 ? 6 : nodeCount > 200 ? 8 : nodeCount > 80 ? 15 : 22;
+
+  // Pre-position nodes in a spread circle to avoid initial clumping
+  // Without this, all nodes start at (0,0) and the simulation can't untangle them
+  // in limited iterations, causing the bottom-left cluster problem
+  const qmNodes_pre = nodes.filter(n => n.type === "qm");
+  const appNodes_pre = nodes.filter(n => n.type === "app");
+  const qmIdSet = new Set(qmNodes_pre.map(n => n.id));
+
+  // Place QMs in a circle first
+  qmNodes_pre.forEach((n, i) => {
+    const angle = (2 * Math.PI * i) / qmNodes_pre.length;
+    const radius = Math.min(w, h) * 0.3;
+    n.x = w / 2 + radius * Math.cos(angle);
+    n.y = h / 2 + radius * Math.sin(angle);
+  });
+
+  // Place apps near their connected QM (find via edges)
+  const appQmMap = {};
+  edges.forEach(e => {
+    const src = typeof e.source === "object" ? e.source.id : e.source;
+    const tgt = typeof e.target === "object" ? e.target.id : e.target;
+    if (e.rel === "connects_to" && qmIdSet.has(tgt)) {
+      appQmMap[src] = tgt;
+    }
+  });
+
+  appNodes_pre.forEach(n => {
+    const qmId = appQmMap[n.id];
+    const qmNode = qmId ? qmNodes_pre.find(q => q.id === qmId) : null;
+    if (qmNode) {
+      // Place near the QM with some jitter
+      n.x = qmNode.x + (Math.random() - 0.5) * 40;
+      n.y = qmNode.y + (Math.random() - 0.5) * 40;
+    } else {
+      // No connected QM found — place randomly in center area
+      n.x = w / 2 + (Math.random() - 0.5) * w * 0.5;
+      n.y = h / 2 + (Math.random() - 0.5) * h * 0.5;
+    }
+  });
 
   const sim = d3.forceSimulation(nodes)
     .force("link", d3.forceLink(edges).id(d => d.id)
@@ -450,8 +489,8 @@ function drawAsIsForce(g, nodes, edges, w, h, svg, zoom, title, showQueues) {
     .force("collide", d3.forceCollide(collideRadius))
     .stop();
 
-  // Run simulation synchronously for instant render
-  const iterations = nodeCount > 200 ? 150 : 250;
+  // Run simulation synchronously — more iterations for large graphs to settle properly
+  const iterations = nodeCount > 400 ? 300 : nodeCount > 200 ? 200 : 250;
   for (let i = 0; i < iterations; i++) sim.tick();
 
   // ── Draw edges ─────────────────────────────────────────────────────
@@ -1076,8 +1115,9 @@ function zoomToFit(svg, zoom, nodes, w, h) {
   const xMin = Math.min(...xs), xMax = Math.max(...xs);
   const yMin = Math.min(...ys), yMax = Math.max(...ys);
   const gw = xMax - xMin || 1, gh = yMax - yMin || 1;
-  const pad = 30;
-  const scale = Math.min((w - pad * 2) / gw, (h - pad * 2) / gh, 4);
+  const pad = 40;
+  // Cap scale at 2x to prevent over-zoom on tightly clustered graphs
+  const scale = Math.min((w - pad * 2) / gw, (h - pad * 2) / gh, 2);
   const tx = (w - gw * scale) / 2 - xMin * scale;
   const ty = (h - gh * scale) / 2 - yMin * scale;
 
