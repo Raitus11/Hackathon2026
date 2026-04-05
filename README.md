@@ -1,28 +1,54 @@
-# IntelliAI
-## MQ Topology Intelligence & Transformation Agent Network
+# Intelli AI
 
-IBM MQ Hackathon 2026 — 10-agent LangGraph pipeline with LLM-powered architecture for transforming legacy MQ topologies.
+**Intelligent MQ Topology Simplification & Modernization**
+
+IBM MQ Hackathon 2026 — Team IntelliAI
 
 ---
 
 ## What It Does
 
-1. Ingests 4 CSV files representing an as-is MQ environment
-2. Builds a NetworkX directed graph of the topology
-3. Runs **10 coordinated AI agents** to analyse, redesign, validate, and provision
-4. **Human-in-the-loop review** — approve, revise with feedback, or abort
-5. Produces: target state topology, complexity metrics, AI-generated ADRs, per-QM MQSC scripts, target CSVs, and a **migration plan with rollback**
+Intelli AI is a 10-agent LangGraph pipeline that transforms legacy IBM MQ topologies into simplified, standards-compliant, automation-ready architectures. It ingests a raw MQ dataset, builds a NetworkX graph, runs coordinated AI agents to analyse, redesign, validate, and provision the target state, and pauses for human review before generating outputs.
 
-**Result from sample data: 39.1 → 26.2 complexity score = 33% reduction, zero constraint violations.**
+The system enforces the hackathon's core constraint — one queue manager per application — through a hybrid intelligence architecture: deterministic rules guarantee constraint compliance, while LLM agents (powered by Wells Fargo's internal Tachyon client with Gemini 2.0 Flash) handle the decisions that require reasoning: cluster analysis, PCI/payment zone isolation, bridge app placement, and human feedback interpretation.
+
+**Pipeline output includes:** target state topology (CSV), complexity metrics with as-is vs target scoring, AI-generated Architecture Decision Records (ADRs), per-QM MQSC provisioning scripts, a 4-phase migration plan with rollback, regression testing plan, subgraph analysis, and an executive summary report.
 
 ---
 
-## Key Differentiators
+## How to Run
 
-- **LLM-Powered Architecture** — Tachyon (Gemini 2.0 Flash / 2.5 Pro) in production, Groq (Llama 3.3 70B) as dev fallback. Reasons about topology and generates ADRs referencing actual entity names. Falls back to deterministic rules if no LLM available.
-- **Valid MQSC Output** — Per-QM scripts with QLOCAL, QREMOTE, XMITQ, LISTENER, SDR/RCVR channels, correct ordering. Runnable via `runmqsc QM_NAME < file.mqsc`.
-- **Migration Plan with Rollback** — 4-phase ordered steps (CREATE → REROUTE → DRAIN → CLEANUP) with forward MQSC, rollback MQSC, dependency tracking, and verification commands.
-- **Human-in-the-Loop** — Pipeline pauses for human review. Approve to provision, revise with feedback the LLM acts on, or abort with a cancellation report.
+You need two terminals running simultaneously.
+
+**Terminal 1 — Backend (FastAPI + Uvicorn):**
+
+```bash
+cd src
+python -m uvicorn backend.api.main:app --host 0.0.0.0 --port 8000
+```
+
+**Terminal 2 — Frontend (React + Vite):**
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+The frontend runs on `http://localhost:3000` and the backend API on `http://localhost:8000`.
+
+**Environment variables** (create a `.env` file in `src/`):
+
+| Variable | Description |
+|----------|-------------|
+| `APIGEE_URL` | Tachyon APIGEE gateway URL |
+| `CONSUMER_KEY` | Tachyon OAuth consumer key |
+| `CONSUMER_SECRET` | Tachyon OAuth consumer secret |
+| `API_KEY` | Tachyon API key |
+| `USE_CASE_ID` | Tachyon registered use case ID |
+| `MODEL` | Model identifier (e.g. `openai/gemini-2.0-flash`) |
+
+The pipeline works without LLM credentials — it falls back to the deterministic rule engine, which enforces all constraints and produces a valid target state. The LLM adds intelligent cluster analysis, richer ADRs, and natural-language feedback interpretation on top of the rule baseline.
 
 ---
 
@@ -30,187 +56,190 @@ IBM MQ Hackathon 2026 — 10-agent LangGraph pipeline with LLM-powered architect
 
 ```
 intelli-ai/
-├── backend/
-│   ├── agents/agents.py          # All 10 agents
-│   ├── llm/
-│   │   ├── llm_client.py         # LLM API wrapper with retry/fallback
-│   │   └── prompts.py            # Architect system + user prompt templates
-│   ├── graph/mq_graph.py         # NetworkX graph builder + complexity metrics
-│   ├── tools/csv_ingest.py       # 6-step CSV cleanup pipeline
-│   ├── orchestration/
-│   │   ├── state.py              # IntelliAIState TypedDict
-│   │   └── workflow.py           # LangGraph StateGraph (10 nodes)
-│   └── api/main.py               # FastAPI server
+├── src/
+│   └── backend/
+│       ├── agents/
+│       │   └── agents.py              # All 10 agents (~5,000 lines)
+│       ├── llm/
+│       │   ├── llm_client.py          # Tachyon LLM client with retry & circuit breaker
+│       │   └── prompts.py             # Architect system + user prompt templates
+│       ├── graph/
+│       │   └── mq_graph.py            # NetworkX graph builder + complexity metrics +
+│       │                              #   Louvain communities, centrality, entropy,
+│       │                              #   subgraph analysis, topology comparison
+│       ├── tools/
+│       │   └── csv_ingest.py          # Raw CSV → 4 logical tables (vectorized)
+│       ├── orchestration/
+│       │   ├── state.py               # IntelliAIState TypedDict
+│       │   └── workflow.py            # LangGraph StateGraph (full + revise pipelines)
+│       └── api/
+│           └── main.py                # FastAPI server + chat endpoint
 ├── frontend/
-│   └── src/App.jsx               # React UI with D3.js topology viewer
-├── data/sample_input/            # Sample CSV datasets (4 files)
-├── .env.example                  # API key template (copy to .env)
-├── .gitignore
-└── requirements.txt
+│   └── src/
+│       └── App.jsx                    # React UI with D3.js topology visualizations
+├── data/                              # Input CSV datasets
+├── .env                               # Tachyon credentials (not committed)
+└── requirements.txt                   # Python dependencies
 ```
-
----
-
-## Setup
-
-### Backend
-```bash
-cd intelli-ai
-pip install -r requirements.txt
-uvicorn backend.api.main:app --reload --port 8000
-```
-
-### Frontend
-```bash
-cd frontend
-npm install
-npm run dev       # runs on http://localhost:3000
-```
-
-### LLM (optional — pipeline works without it)
-```bash
-pip install groq python-dotenv
-cp .env.example .env
-# Edit .env and add your Groq API key (dev fallback):
-# GROQ_API_KEY=gsk_your_key_here
-# For production, configure Tachyon credentials in src/.env
-```
-
-Get a free API key at [console.groq.com](https://console.groq.com) — no credit card required. (Dev fallback only; production uses Tachyon.)
-
----
-
-## Running the Demo
-
-With the backend running, click **"Run Demo"** in the React UI, or:
-```
-POST http://localhost:8000/api/demo
-```
-
-The pipeline runs through all 10 agents and pauses at the **human review gate**. Review the proposed target state, then approve, revise, or abort.
-
----
-
-## API Endpoints
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET  | `/health` | Health check |
-| POST | `/api/demo` | Run pipeline on sample data |
-| POST | `/api/analyse` | Upload 4 CSVs and run full pipeline |
-| GET  | `/api/review/{id}` | Get pending review data |
-| POST | `/api/review/{id}` | Submit review: approve / revise / abort |
-| GET  | `/api/session/{id}` | Retrieve a completed session |
-| GET  | `/api/session/{id}/csv/{name}` | Download a target CSV file |
-
-### Review decisions
-```json
-{"approved": true}                                 // approve → generate outputs
-{"approved": false, "feedback": "merge EU QMs"}     // revise → LLM redesigns
-{"approved": false, "abort": true}                  // abort → cancellation report
-```
-
----
-
-## CSV Format
-
-### queue_managers.csv
-```
-qm_id, qm_name, region, host, description
-```
-
-### queues.csv
-```
-queue_id, queue_name, qm_id, queue_type, usage, description
-```
-
-### applications.csv
-```
-app_id, app_name, qm_id, direction (PRODUCER|CONSUMER), queue_id, description
-```
-
-### channels.csv
-```
-channel_id, channel_name, channel_type (SENDER|RECEIVER), from_qm, to_qm, xmit_queue, status, description
-```
-
----
-
-## The 10 Agents
-
-| # | Agent | Role |
-|---|-------|------|
-| 1 | **Supervisor** | Session init, input validation |
-| 2 | **Sanitiser** | CSV cleanup, dedup, referential integrity |
-| 3 | **Researcher** | Graph construction, violation detection |
-| 4 | **Analyst** | 6-factor complexity scoring |
-| 5 | **Architect** | LLM-powered target state design + ADRs (Tachyon/Gemini) |
-| 6 | **Optimizer** | Reachability pruning + MST channel reduction |
-| 7 | **Tester** | 8 constraint checks, redesign loop trigger |
-| 8 | **Provisioner** | Per-QM MQSC scripts + target state CSVs |
-| 9 | **Migration Planner** | 4-phase migration with rollback MQSC |
-| 10 | **Doc Expert** | Final transformation report |
-
-**Human Review Gate** sits between Tester and Provisioner — pipeline pauses for human approval.
 
 ---
 
 ## Pipeline Flow
 
+The pipeline has two phases. Phase 1 runs on initial upload and pauses at the human review gate. Phase 2 resumes based on the human's decision.
+
+### Phase 1 — Initial Analysis & Design
+
 ```
-Supervisor → Sanitiser → Researcher → Analyst → Architect → Optimizer → Tester
+SUPERVISOR → SANITISER → RESEARCHER → ANALYST → ARCHITECT → OPTIMIZER → TESTER
                                                                           │
-                                          ┌──── fail (retries left) ──────┘
-                                          │
-                                          ▼
-                                      Architect (retry)
-                                          │
-                                          ▼ pass / retries exhausted
-                                   Human Review Gate
-                                    │       │       │
-                              approve   revise    abort
-                                 │        │         │
-                                 ▼        ▼         ▼
-                            Provisioner  Architect  Doc Expert
-                                 │                  (abort report)
-                                 ▼
-                          Migration Planner
-                                 │
-                                 ▼
-                            Doc Expert → END
+                                           ┌─── fail (up to 3 retries) ──┘
+                                           │
+                                           ▼
+                                       ARCHITECT (retry)
+                                           │
+                                           ▼ pass / retries exhausted
+                                    HUMAN REVIEW GATE
+                                           ⏸ (pipeline pauses)
 ```
+
+### Phase 2 — Human Decision
+
+```
+                                    HUMAN REVIEW GATE
+                                     │       │       │
+                               APPROVE   REVISE    ABORT
+                                  │        │         │
+                                  ▼        ▼         ▼
+                             Provisioner  Architect  Doc Expert
+                                  │       (re-run)   (abort report)
+                                  ▼        │
+                           Migration       ▼
+                            Planner     Optimizer
+                                  │        │
+                                  ▼        ▼
+                             Doc Expert  Tester
+                                  │        │
+                                  ▼        ▼
+                                END    Human Review
+                                       (re-pauses)
+```
+
+The **Revise** path skips Supervisor, Sanitiser, Researcher, and Analyst since the input data hasn't changed. The Architect receives the human's feedback (natural language), interprets it via the LLM with HIGH/MEDIUM/LOW confidence scoring, and applies targeted changes to the existing target graph rather than redesigning from scratch.
+
+---
+
+## The 10 Agents
+
+| # | Agent | What It Does |
+|---|-------|-------------|
+| 1 | **Supervisor** | Session initialization, input file validation, routing to Sanitiser |
+| 2 | **Sanitiser** | CSV cleanup, deduplication, normalisation, referential integrity checks |
+| 3 | **Researcher** | Builds the as-is NetworkX graph; detects violations (multi-QM apps, orphan QMs, cycles); runs Louvain community detection, betweenness centrality (SPOF detection), Shannon entropy analysis; calls LLM anomaly detective |
+| 4 | **Analyst** | Computes the 6-factor complexity score (CC, CI, RD, FO, OO, CS) for the as-is topology |
+| 5 | **Architect** | Designs the target state topology. Phase A: rule-based 1:1 app-to-QM assignment. Phase B: LLM cluster analysis for PCI isolation, payment-critical zones, bridge app placement. Phase C: LLM reassignments with self-correction (rejects INCORRECT assignments). Generates ADRs. In revision mode, interprets human feedback and applies targeted deltas |
+| 6 | **Optimizer** | Two-phase graph optimization. Phase 1: reachability pruning (removes dead channels). Phase 2: weighted MST (removes redundant channels). Also runs Kernighan-Lin bisection, Louvain community detection, SPOF analysis, and topology entropy on the target. Calls LLM design critic and capacity planner |
+| 7 | **Tester** | Validates all constraints: 1-QM-per-app, sender/receiver pairs, deterministic channel naming, XMITQ existence, consumer queues, orphan QMs, path completeness. Calls LLM compliance auditor. 0 critical violations = PASS |
+| 8 | **Provisioner** | Generates per-QM MQSC scripts (LISTENER, QLOCAL, QREMOTE, XMITQ, SDR/RCVR channels in correct dependency order) and target state CSVs (queue_managers, channels, queues, applications, unified target) |
+| 9 | **Migration Planner** | Computes topology diff (QMs added/removed, channels added/removed, apps reassigned). Generates 2,600+ ordered migration steps across 4 phases: CREATE → REROUTE → DRAIN → CLEANUP. Each step has forward MQSC, rollback MQSC, dependencies, and verification commands. Calls LLM risk assessor |
+| 10 | **Doc Expert** | Generates the final report, enriches ADRs via LLM, produces executive summary, complexity algorithm documentation, complexity scores CSV, regression testing plan, insights report, migration plan markdown, and subgraph analysis |
+
+---
+
+## Hybrid Intelligence Architecture
+
+The system uses a rules-first, LLM-second approach:
+
+**Rule Engine (deterministic, zero-tolerance)** handles constraint enforcement: 1:1 app-to-QM assignment, channel naming conventions, routing patterns, XMITQ provisioning. This runs in milliseconds on 438 apps with guaranteed 100% compliance.
+
+**LLM Agents (Tachyon / Gemini 2.0 Flash)** handle decisions that require reasoning: which apps belong in PCI-dedicated zones, how to isolate payment-critical workloads, where to place bridge apps that connect clusters, how to interpret human feedback like "consolidate low-traffic QMs." The LLM's output is always validated back through the rule engine and tester — if it suggests something that violates a constraint, the rules catch and reject it.
+
+This means the pipeline produces a valid, constraint-compliant target state even with no LLM available (rule-only fallback), and a richer, more intelligent design when the LLM is available.
 
 ---
 
 ## Complexity Metric
 
+The 6-factor weighted complexity score measures topology health on a 0–100 scale (higher = more complex):
+
 ```
-Score = 0.25×CC + 0.25×CI + 0.20×RD + 0.15×FO + 0.05×OO + 0.10×CS   (normalised 0–100)
+Score = 0.25×CC + 0.25×CI + 0.20×RD + 0.15×FO + 0.05×OO + 0.10×CS
 ```
 
-| Factor | Weight | What it measures | How to improve |
-|--------|--------|------------------|----------------|
-| CC — Channel Count | 25% | Number of sender channels | Remove unnecessary channels |
-| CI — Coupling Index | 25% | Mean QMs per app (ideal = 1.0) | Enforce 1-QM-per-app |
-| RD — Routing Depth | 20% | Max hops between QMs | Eliminate multi-hop paths |
-| FO — Fan-Out Score | 15% | Max outbound channels from one QM | Consolidate outbound routing |
-| OO — Orphan Objects | 5% | QMs with no apps + stopped channels | Remove dead infrastructure |
-| CS — Channel Sprawl | 10% | Channels per QM ratio | Reduce routing overhead per QM |
+| Factor | Weight | What It Measures |
+|--------|--------|-----------------|
+| CC — Channel Count | 25% | Number of sender channels (each is a failure point) |
+| CI — Coupling Index | 25% | Mean QMs per app; ideal = 1.0 after 1:1 enforcement |
+| RD — Routing Depth | 20% | Max hops between QMs; fewer hops = less latency |
+| FO — Fan-Out Score | 15% | Max outbound channels from one QM; high = bottleneck |
+| OO — Orphan Objects | 5% | QMs with no apps + stopped channels; waste |
+| CS — Channel Sprawl | 10% | Channels-per-QM ratio; efficiency of channel usage |
 
-Baselines scale with topology size. Same baselines used for both as-is and target scoring.
+Baselines scale with topology size so scores are meaningful regardless of whether the estate has 5 QMs or 500.
+
+---
+
+## Graph Analytics
+
+Beyond the complexity score, the Researcher and Optimizer agents compute:
+
+**Louvain Community Detection** — identifies natural clusters of queue managers based on channel connectivity, with modularity scoring. Used by the Architect to understand existing groupings before redesign.
+
+**Betweenness Centrality (SPOF Detection)** — identifies queue managers through which a disproportionate share of message routes must pass. QMs with betweenness > 2× the mean are flagged as single points of failure.
+
+**Shannon Entropy** — measures how uniform or skewed the QM degree distribution is. High entropy = evenly distributed channels (healthy). Low entropy = hub-and-spoke fragility.
+
+**Subgraph Analysis** — decomposes the topology into connected components, identifying isolated QMs, the largest connected cluster, and fragmentation patterns.
+
+**Topology Comparison** — quantitative before/after diff: QM counts, channel counts, density, average degree, component counts, with percentage reductions.
+
+---
+
+## Frontend
+
+The React UI has 10 tabs providing full visibility into the pipeline:
+
+| Tab | Content |
+|-----|---------|
+| **Upload** | Drag-and-drop file upload or demo mode |
+| **Review** | Human review panel with approve/revise/abort controls and "Ask the Architect" chat |
+| **Topology** | Side-by-side as-is vs target D3.js force-directed graphs with app tracing, diff overlay, and full MQ object view (queues, channels, XMITQs) |
+| **Metrics** | As-is vs target complexity scores with per-factor breakdown |
+| **ADRs** | Architecture Decision Records generated by the Architect and enriched by the Doc Expert |
+| **Migration** | 4-phase migration plan with step details, dependencies, and risk assessment |
+| **MQSC** | Per-QM MQSC provisioning scripts, searchable and downloadable |
+| **CSVs** | All target state CSVs and deliverable documents, downloadable |
+| **Report** | Final transformation report with executive summary |
+| **Trace** | Ordered agent execution trace showing every step of the pipeline |
+
+The topology tab supports per-app tracing: select any application from the dropdown to see its as-is connections (shared QMs, multiple channels) vs its target state (dedicated QM, standardized routing).
+
+---
+
+## Human-in-the-Loop
+
+The pipeline pauses at the Human Review Gate after the Tester validates the target state. The reviewer sees the complexity reduction, constraint status, ADRs, and topology visualizations.
+
+**Approve** — accepts the design. Pipeline continues to Provisioner → Migration Planner → Doc Expert, generating all output deliverables.
+
+**Revise with Feedback** — the reviewer provides natural-language feedback (e.g. "consolidate low-traffic QMs" or "isolate all PCI apps"). The Architect re-enters revision mode, interprets the feedback via LLM, applies targeted changes, and re-runs through Optimizer and Tester. The pipeline re-pauses at the review gate for another round.
+
+**Ask the Architect** — a chat interface in the Review tab where the reviewer can ask questions about the design before deciding. The Architect responds with specific QM names, channel counts, and rationale from the ADRs.
+
+**Abort** — cancels the pipeline. Doc Expert generates a cancellation report.
 
 ---
 
 ## MQSC Output
 
-Each QM gets its own script, runnable via `runmqsc QM_NAME < QM_NAME_target.mqsc`. Objects generated in correct order:
+Each queue manager gets its own provisioning script, runnable via `runmqsc QM_NAME < QM_NAME_target.mqsc`. Objects are generated in correct dependency order:
 
 1. LISTENER (TCP port)
 2. QLOCAL (application queues)
 3. QLOCAL USAGE(XMITQ) (transmission queues)
 4. QREMOTE (remote queue definitions with RQMNAME, RNAME, XMITQ)
 5. CHANNEL CHLTYPE(SDR) (sender channels with CONNAME)
-6. CHANNEL CHLTYPE(RCVR) (receiver channels — same name as sender)
+6. CHANNEL CHLTYPE(RCVR) (receiver channels)
 7. START CHANNEL
 
 ---
@@ -219,31 +248,104 @@ Each QM gets its own script, runnable via `runmqsc QM_NAME < QM_NAME_target.mqsc
 
 The Migration Planner generates ordered steps across 4 phases:
 
-| Phase | What happens | Rollback |
-|-------|-------------|----------|
-| **CREATE** | New listeners, queues, XMITQs, channels | Delete created objects |
-| **REROUTE** | Move apps to new QMs | Revert app configuration |
-| **DRAIN** | Wait for old queues to empty (CURDEPTH = 0) | Non-destructive |
-| **CLEANUP** | Stop old channels, delete old objects, decommission QMs | Re-create from backup |
+| Phase | What Happens | Risk Level |
+|-------|-------------|------------|
+| **CREATE** | New listeners, queues, XMITQs, channels | LOW |
+| **REROUTE** | Move apps to new QMs, update connections | HIGH |
+| **DRAIN** | Wait for old queues to empty (CURDEPTH = 0) | MEDIUM |
+| **CLEANUP** | Stop old channels, delete old objects, decommission QMs | MEDIUM |
 
-Each step includes forward MQSC, rollback MQSC, dependency tracking, and a verification command.
-
----
-
-## Environment Variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `GROQ_API_KEY` | No | Groq API key for dev/fallback LLM. Pipeline falls back to rules without it. |
-| `APIGEE_URL` | No | Tachyon (production) — APIGEE gateway URL |
-| `CONSUMER_KEY` | No | Tachyon — OAuth consumer key |
-| `CONSUMER_SECRET` | No | Tachyon — OAuth consumer secret |
-| `API_KEY` | No | Tachyon — API key |
-| `USE_CASE_ID` | No | Tachyon — registered use case ID |
-| `MODEL` | No | Tachyon — model identifier (e.g. openai/gemini-2.0-flash) |
+Each step includes forward MQSC, rollback MQSC, dependency tracking, and a verification command. The LLM risk assessor identifies high-risk steps and recommends maintenance windows.
 
 ---
 
-## License
+## API Endpoints
 
-Built for IBM MQ Hackathon 2026.
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/health` | Health check |
+| `POST` | `/api/upload` | Upload a single MQ raw data file (CSV or Excel) and run the pipeline |
+| `POST` | `/api/demo` | Run pipeline on bundled demo data |
+| `GET` | `/api/review/{session_id}` | Get pending review data |
+| `POST` | `/api/review/{session_id}` | Submit review decision (approve / revise / abort) |
+| `POST` | `/api/chat/{session_id}` | Chat with the Architect AI about the design |
+| `GET` | `/api/session/{session_id}` | Retrieve a completed session |
+| `GET` | `/api/session/{session_id}/csv/{csv_name}` | Download a target CSV or deliverable file |
+
+### Review Decision Payloads
+
+```json
+{"approved": true}
+{"approved": false, "feedback": "consolidate low-traffic QMs"}
+{"approved": false, "abort": true}
+```
+
+---
+
+## Deliverables Generated
+
+| Deliverable | Format | Description |
+|-------------|--------|-------------|
+| Target topology dataset | CSV | Queue managers, channels, queues, applications in target state |
+| Unified target CSV | CSV | Single file matching input schema for automation |
+| Complexity algorithm | Markdown | Algorithm description, weights, rationale |
+| Complexity scores | CSV | Per-factor as-is vs target breakdown with reductions |
+| Topology visualizations | Interactive (D3.js) | As-is and target graphs with diff overlay |
+| Architecture Decision Records | Structured JSON + Markdown | AI-generated and enriched ADRs |
+| Migration plan | Markdown | 4-phase ordered steps with MQSC and rollback |
+| Regression testing plan | Markdown | Test strategy, categories, acceptance criteria |
+| Key insights | Markdown | Anomalies, SPOFs, bottlenecks, optimization opportunities |
+| Subgraph analysis | Markdown | Connected component decomposition for both states |
+| MQSC scripts | Text | Per-QM provisioning scripts |
+| Executive summary | Text | AI-generated recommendation with business justification |
+
+---
+
+## Technology Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Orchestration | LangGraph (StateGraph with conditional edges) |
+| LLM | Tachyon (Wells Fargo internal) → Gemini 2.0 Flash |
+| Graph Engine | NetworkX (directed graphs, community detection, centrality) |
+| Data Processing | Pandas (vectorized CSV ingestion) |
+| Backend | FastAPI + Uvicorn |
+| Frontend | React 18 + D3.js v7 + Vite |
+| State | Python TypedDict (IntelliAIState) |
+
+---
+
+## Dependencies
+
+### Python (Backend)
+
+```
+langchain>=0.3.0
+langgraph>=0.2.0
+langsmith>=0.1.0
+fastapi>=0.115.0
+uvicorn>=0.30.0
+pandas>=2.2.0
+networkx>=3.3
+pydantic>=2.7.0
+python-multipart>=0.0.9
+python-dotenv>=1.0.0
+numpy>=1.26.0
+```
+
+### Node.js (Frontend)
+
+```
+react ^18.3.0
+react-dom ^18.3.0
+d3 ^7.9.0
+vite ^5.4.0
+```
+
+---
+
+## Team
+
+**Team IntelliAI** — IBM MQ Hackathon 2026
+
+**Mission:** Transform legacy MQ sprawl into intelligent, simplified architectures through autonomous analysis, explainable design decisions, and human-in-the-loop validation.
