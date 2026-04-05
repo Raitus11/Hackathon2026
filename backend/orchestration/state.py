@@ -50,6 +50,7 @@ class IntelliAIState(TypedDict):
     adrs: Optional[list]               # list[ADR]
     redesign_count: int
     human_feedback: Optional[str]      # feedback from human rejection
+    chat_history: Optional[list]       # full chat conversation [{role, content}] for revision context
     architect_method: Optional[str]    # "llm" or "rules_fallback" — tracks which path was used
 
     # ── Optimizer output ───────────────────────────────

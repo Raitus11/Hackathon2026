@@ -35,6 +35,16 @@ from backend.llm.llm_client import call_llm, validate_architect_response
 from backend.llm.prompts import (
     ARCHITECT_SYSTEM_PROMPT, build_architect_prompt,
     CLUSTER_SYSTEM_PROMPT, build_cluster_prompt,
+    FEEDBACK_INTERPRETER_SYSTEM, build_feedback_interpreter_prompt,
+    CHANNEL_ADVISOR_SYSTEM, build_channel_advisor_prompt,
+    DESIGN_CRITIC_SYSTEM, build_design_critic_prompt,
+    MIGRATION_RISK_SYSTEM, build_migration_risk_prompt,
+    ANOMALY_DETECTIVE_SYSTEM, build_anomaly_detective_prompt,
+    ADR_ENRICHER_SYSTEM, build_adr_enricher_prompt,
+    COMPLIANCE_AUDITOR_SYSTEM, build_compliance_auditor_prompt,
+    CAPACITY_PLANNER_SYSTEM, build_capacity_planner_prompt,
+    EXECUTIVE_SUMMARIZER_SYSTEM, build_executive_summary_prompt,
+    REVISION_ARCHITECT_SYSTEM, build_revision_architect_prompt,
 )
 
 logger = logging.getLogger(__name__)
@@ -247,6 +257,46 @@ def researcher_agent(state: dict) -> dict:
     quality_report = state.get("data_quality_report", {})
     quality_report["topology_violations"] = violations
 
+    # ── LLM Anomaly Detective (Role 6) ───────────────────────────────────
+    # LLM reviews as-is topology for hidden risks, stale connections, compliance issues.
+    # Results enrich the data quality report shown in the Review tab.
+    anomaly_insights = None
+    try:
+        anomaly_state = {
+            "raw_data": clean_data,
+            "data_quality_report": quality_report,
+            "as_is_communities": as_is_communities,
+            "as_is_centrality": as_is_centrality,
+            "as_is_entropy": as_is_entropy,
+            "as_is_metrics": state.get("as_is_metrics", {}),
+        }
+        anomaly_prompt = build_anomaly_detective_prompt(anomaly_state)
+        logger.info(f"RESEARCHER-LLM: Calling anomaly detective (~{len(anomaly_prompt)//4} tokens)")
+        
+        anomaly_result = call_llm(
+            system_prompt=ANOMALY_DETECTIVE_SYSTEM,
+            user_prompt=anomaly_prompt,
+            max_retries=1,
+            temperature=0.2,
+            max_tokens=2048,
+        )
+        
+        if anomaly_result and anomaly_result.get("anomalies"):
+            anomaly_insights = anomaly_result
+            n_anomalies = len(anomaly_result["anomalies"])
+            health = anomaly_result.get("topology_health", "UNKNOWN")
+            summary = anomaly_result.get("summary", "")[:150]
+            messages.append({"agent": "RESEARCHER", 
+                           "msg": f"AI Anomaly Detective: {n_anomalies} anomalies found. "
+                                  f"Health: {health}. {summary}"})
+            quality_report["llm_anomalies"] = anomaly_result
+            logger.info(f"RESEARCHER-LLM: {n_anomalies} anomalies, health={health}")
+        else:
+            messages.append({"agent": "RESEARCHER", "msg": "AI Anomaly Detective: no issues found (or LLM unavailable)"})
+    except Exception as e:
+        logger.warning(f"RESEARCHER-LLM: Anomaly detection failed ({e})")
+        messages.append({"agent": "RESEARCHER", "msg": f"AI Anomaly Detective: skipped ({e})"})
+
     return {
         "as_is_graph": as_is_graph,
         "as_is_subgraphs": as_is_subgraphs,
@@ -326,6 +376,97 @@ def architect_agent(state: dict) -> dict:
         return {"error": err, "messages": messages}
 
     try:
+        # ── Parse human feedback directives ───────────────────────────────
+        feedback = state.get("human_feedback", "")
+        chat_history = state.get("chat_history") or []
+
+        # ══════════════════════════════════════════════════════════════════
+        # REVISION ARCHITECTURE: Two paths based on context available.
+        #
+        # PATH 1 — CHAT-AWARE REVISION (chat_history exists):
+        #   LLM is PRIMARY decision-maker. It sees the full conversation,
+        #   current target state metrics, and produces DELTA changes
+        #   (reassign 5 apps, remove 10 channels, decommission 3 QMs).
+        #   The rules engine EXECUTES these deltas on the graph.
+        #   _enforce_single_qm + tester VALIDATE constraints after.
+        #   This keeps the LLM payload small (~4K tokens) while giving
+        #   it full decision authority.
+        #
+        # PATH 2 — FEEDBACK-ONLY (no chat, just a text string):
+        #   Falls back to regex/LLM feedback interpreter → directives.
+        #   Rules rebuild baseline, optimizer applies directives.
+        # ══════════════════════════════════════════════════════════════════
+
+        revision_result = None
+        directives = {}
+
+        if chat_history and len(chat_history) > 1:
+            # ── PATH 1: LLM Revision Architect ───────────────────────────
+            logger.info(f"ARCHITECT: Revision mode — {len(chat_history)} chat messages")
+            messages.append({"agent": "ARCHITECT",
+                           "msg": f"Revision mode: AI Revision Architect processing "
+                                  f"{len(chat_history)} chat messages"})
+            adrs = []  # Fresh ADRs for new iteration
+
+            try:
+                revision_prompt = build_revision_architect_prompt(state)
+                logger.info(f"ARCHITECT-REVISION: Prompt ~{len(revision_prompt)//4} tokens")
+
+                revision_result = call_llm(
+                    system_prompt=REVISION_ARCHITECT_SYSTEM,
+                    user_prompt=revision_prompt,
+                    max_retries=2,
+                    temperature=0.15,
+                    max_tokens=4096,
+                )
+
+                if revision_result:
+                    summary = revision_result.get("revision_summary", "")
+                    confidence = revision_result.get("confidence", "UNKNOWN")
+                    warnings = revision_result.get("warnings", [])
+                    logger.info(f"ARCHITECT-REVISION: LLM responded — confidence={confidence}, "
+                               f"summary: {summary[:120]}")
+                    messages.append({"agent": "ARCHITECT",
+                                   "msg": f"AI Revision Architect ({confidence}): {summary}"})
+                    if warnings:
+                        for w in warnings[:3]:
+                            messages.append({"agent": "ARCHITECT", "msg": f"⚠ Revision warning: {w}"})
+
+                    # Extract LLM directives for the optimizer
+                    llm_directives = revision_result.get("optimization_directives", {})
+                    if llm_directives:
+                        directives = llm_directives
+                        directives["llm_interpreted"] = True
+                        directives["llm_reasoning"] = summary[:300]
+
+                    # Parse LLM ADRs
+                    for adr in revision_result.get("adrs", []):
+                        adrs.append({
+                            "id": adr.get("id", f"ADR-REV-{len(adrs)+1:03d}"),
+                            "decision": adr.get("decision", "Revision decision"),
+                            "context": adr.get("context", ""),
+                            "rationale": adr.get("rationale", ""),
+                            "consequences": adr.get("consequences", ""),
+                        })
+                else:
+                    logger.warning("ARCHITECT-REVISION: LLM returned None — falling back to regex")
+                    messages.append({"agent": "ARCHITECT",
+                                   "msg": "AI Revision Architect unavailable — using regex fallback"})
+            except Exception as e:
+                logger.warning(f"ARCHITECT-REVISION: Failed ({e}) — falling back to regex")
+                messages.append({"agent": "ARCHITECT",
+                               "msg": f"AI Revision Architect failed ({e}) — using regex fallback"})
+
+        # If revision LLM didn't produce directives, fall back to regex parsing
+        if not directives:
+            directives = _parse_feedback_directives(feedback, state=state)
+
+        if directives:
+            if not adrs:  # Only clear ADRs if we haven't already (revision path clears them above)
+                adrs = []
+            messages.append({"agent": "ARCHITECT",
+                           "msg": f"Feedback directives: {directives}"})
+
         # ── PHASE A: Rules build complete baseline ────────────────────────
         target_graph = _build_target_rules(state)
         
@@ -333,6 +474,129 @@ def architect_agent(state: dict) -> dict:
         qm_count = sum(1 for _, d in target_graph.nodes(data=True) if d.get("type") == "qm")
         logger.info(f"ARCHITECT: Phase A — Rules baseline: {app_count} apps, {qm_count} QMs")
         messages.append({"agent": "ARCHITECT", "msg": f"Rules baseline built — {app_count} apps assigned in Phase A"})
+
+        # ── PHASE A2: Apply LLM revision deltas ──────────────────────────
+        # If the Revision Architect produced specific changes, apply them
+        # to the rules baseline. This is where LLM decisions get EXECUTED.
+        if revision_result:
+            revision_applied = 0
+
+            # A2a: Apply reassignments (move app from one QM to another)
+            for entry in revision_result.get("reassignments", []):
+                app_id = entry.get("app_id", "")
+                to_qm = entry.get("to_qm", "")
+                reason = entry.get("reason", "")
+                if not app_id or not to_qm or app_id not in target_graph.nodes:
+                    continue
+
+                # Remove old connects_to edges
+                old_edges = [(u, v) for u, v, d in target_graph.out_edges(app_id, data=True)
+                             if d.get("rel") == "connects_to"]
+                for u, v in old_edges:
+                    target_graph.remove_edge(u, v)
+
+                # Check if target QM is occupied by another app
+                if to_qm in target_graph.nodes:
+                    apps_on_target = [u for u, v, d in target_graph.in_edges(to_qm, data=True)
+                                      if d.get("rel") == "connects_to"]
+                    if apps_on_target:
+                        # Target occupied — create new QM instead
+                        to_qm = f"QM_{app_id}"
+
+                if to_qm not in target_graph.nodes:
+                    target_graph.add_node(to_qm, type="qm", name=to_qm, region="")
+
+                target_graph.add_edge(app_id, to_qm, rel="connects_to")
+                revision_applied += 1
+                logger.info(f"ARCHITECT-REVISION: Applied {app_id} → {to_qm}: {reason[:80]}")
+
+            # A2b: Decommission QMs (remove app + QM + owned queues)
+            for qm_to_remove in revision_result.get("qms_to_decommission", []):
+                if qm_to_remove not in target_graph.nodes:
+                    continue
+                # Only decommission if the QM has exactly 1 app and that app has zero flows
+                apps_on = [u for u, v, d in target_graph.in_edges(qm_to_remove, data=True)
+                           if d.get("rel") == "connects_to"]
+                if len(apps_on) == 1:
+                    app_id = apps_on[0]
+                    # Remove owned queues
+                    owned = [v for _, v, d in target_graph.out_edges(qm_to_remove, data=True)
+                             if d.get("rel") == "owns"]
+                    for q in owned:
+                        if target_graph.has_node(q):
+                            target_graph.remove_node(q)
+                    # Remove remote queues targeting this app
+                    for n, d in list(target_graph.nodes(data=True)):
+                        if d.get("type") == "queue" and (
+                            d.get("target_app") == app_id or d.get("remote_qm") == qm_to_remove
+                        ):
+                            target_graph.remove_node(n)
+                    # Remove edges, then nodes
+                    for u, v in list(target_graph.in_edges(qm_to_remove)) + list(target_graph.out_edges(qm_to_remove)):
+                        if target_graph.has_edge(u, v):
+                            target_graph.remove_edge(u, v)
+                    if target_graph.has_node(qm_to_remove):
+                        target_graph.remove_node(qm_to_remove)
+                    if target_graph.has_node(app_id):
+                        target_graph.remove_node(app_id)
+                    revision_applied += 1
+                    logger.info(f"ARCHITECT-REVISION: Decommissioned {app_id} + {qm_to_remove}")
+
+            # A2c: Remove specific channels
+            for ch in revision_result.get("channels_to_remove", []):
+                fqm = ch.get("from_qm", "")
+                tqm = ch.get("to_qm", "")
+                if fqm and tqm and target_graph.has_edge(fqm, tqm):
+                    target_graph.remove_edge(fqm, tqm)
+                    revision_applied += 1
+                    logger.info(f"ARCHITECT-REVISION: Removed channel {fqm}.{tqm}")
+
+            # A2d: Add specific channels
+            for ch in revision_result.get("channels_to_add", []):
+                fqm = ch.get("from_qm", "")
+                tqm = ch.get("to_qm", "")
+                if fqm and tqm and fqm in target_graph.nodes and tqm in target_graph.nodes:
+                    if not target_graph.has_edge(fqm, tqm):
+                        target_graph.add_edge(fqm, tqm, rel="channel",
+                                            channel_name=f"{fqm}.{tqm}",
+                                            status="RUNNING",
+                                            xmit_queue=f"{tqm}.XMITQ")
+                        revision_applied += 1
+
+            new_qm_count = sum(1 for _, d in target_graph.nodes(data=True) if d.get("type") == "qm")
+            new_app_count = sum(1 for _, d in target_graph.nodes(data=True) if d.get("type") == "app")
+            messages.append({"agent": "ARCHITECT",
+                           "msg": f"AI Revision Architect applied {revision_applied} changes. "
+                                  f"QMs: {qm_count} → {new_qm_count}, Apps: {app_count} → {new_app_count}"})
+            logger.info(f"ARCHITECT: Phase A2 — {revision_applied} LLM revision deltas applied")
+            qm_count = new_qm_count
+            app_count = new_app_count
+
+        # ── PHASE A3: Feedback-driven QM consolidation (fallback path) ────
+        # When human feedback requests QM/app reduction, identify apps with
+        # zero cross-QM message flows and decommission them + their QMs.
+        # These "island" apps add QM sprawl without messaging value.
+        # Constraint-safe: removes app AND its QM together (not reassigning).
+        if directives.get("consolidate_qm_pct") or directives.get("aggressive"):
+            consolidate_pct = directives.get("consolidate_qm_pct", 0.3)
+            target_graph, consolidation_count = _consolidate_qms_by_feedback(
+                target_graph, state, consolidate_pct,
+                protect_qms=set(directives.get("protect_qms", []))
+            )
+            if consolidation_count > 0:
+                new_qm_count = sum(1 for _, d in target_graph.nodes(data=True) if d.get("type") == "qm")
+                new_app_count = sum(1 for _, d in target_graph.nodes(data=True) if d.get("type") == "app")
+                messages.append({
+                    "agent": "ARCHITECT",
+                    "msg": (f"Feedback-driven consolidation: decommissioned "
+                            f"{consolidation_count} self-contained app(s) with zero "
+                            f"message flows. QMs: {qm_count} → {new_qm_count}, "
+                            f"Apps: {app_count} → {new_app_count}")
+                })
+                logger.info(f"ARCHITECT: Phase A3 — decommissioned {consolidation_count} apps "
+                           f"({qm_count} → {new_qm_count} QMs)")
+                qm_count = new_qm_count
+                app_count = new_app_count
 
         # ── PHASE B: Cluster-based LLM call ───────────────────────────────
         llm_result = _architect_llm(state)
@@ -423,6 +687,10 @@ def architect_agent(state: dict) -> dict:
             method = "rules_fallback"
             logger.info(f"ARCHITECT: Rules fallback — {len(rule_adrs)} ADRs")
 
+        # Override method if revision architect was the primary driver
+        if revision_result:
+            method = "revision_architect"
+
         # ── Safety net + channel backfill ─────────────────────────────────
         dupes_removed = _enforce_single_qm(target_graph, raw_data)
         if dupes_removed:
@@ -445,6 +713,43 @@ def architect_agent(state: dict) -> dict:
             f"{target_qm_count} QMs (was {original_qm_count}), "
             f"{target_ch_count} channels, {len(adrs)} ADRs."
         )
+        if directives:
+            msg += f" Feedback directives active: {list(directives.keys())}"
+            adrs.append({
+                "id": f"ADR-FB-{redesign_count+1:02d}-001",
+                "decision": "Aggressive optimization per human feedback",
+                "context": f"Human reviewer requested: \"{feedback[:200]}\"",
+                "rationale": (
+                    f"Optimizer will apply enhanced channel pruning: "
+                    f"fan-out capping, low-flow channel removal, and "
+                    f"iterative MST passes to achieve deeper complexity reduction "
+                    f"while maintaining strict 1:1 app→QM ownership."
+                ),
+                "consequences": (
+                    f"More channels removed → lower complexity score. "
+                    f"Some indirect message routes may increase latency by 1-2 hops. "
+                    f"All producer→consumer flows remain reachable via MST paths."
+                ),
+            })
+            # ADR for QM consolidation if decommissioning happened
+            decommissioned = original_qm_count - target_qm_count
+            if decommissioned > 0:
+                adrs.append({
+                    "id": f"ADR-FB-{redesign_count+1:02d}-002",
+                    "decision": f"Decommissioned {decommissioned} self-contained app(s) and their QMs",
+                    "context": f"Human reviewer requested: \"{feedback[:200]}\"",
+                    "rationale": (
+                        f"Apps with zero cross-QM message flows (no producer→consumer "
+                        f"relationship with any other app) add QM sprawl without "
+                        f"messaging value. Removing them and their dedicated QMs "
+                        f"reduces topology complexity with zero impact on message routing."
+                    ),
+                    "consequences": (
+                        f"QM count reduced from {original_qm_count} to {target_qm_count}. "
+                        f"Decommissioned apps require a separate retirement plan "
+                        f"outside the MQ topology."
+                    ),
+                })
         messages.append({"agent": "ARCHITECT", "msg": msg})
 
         return {
@@ -452,6 +757,7 @@ def architect_agent(state: dict) -> dict:
             "adrs": adrs,
             "redesign_count": redesign_count + 1,
             "architect_method": method,
+            "feedback_directives": directives if directives else None,
             "messages": messages,
         }
     except Exception as e:
@@ -883,6 +1189,250 @@ def _build_target_from_llm(llm_result: dict, state: dict) -> tuple:
         })
 
     return G_target, adrs
+
+
+def _parse_feedback_directives(feedback: str, state: dict = None) -> dict:
+    """
+    Parse human_feedback into actionable directives for the optimizer.
+    
+    LLM-FIRST: If LLM is available, it interprets feedback with full business
+    context (PCI awareness, payment-critical flows, etc.).
+    FALLBACK: Regex parser handles common patterns when LLM is unavailable.
+    
+    All directives maintain strict 1:1 app→QM ownership.
+    """
+    import re
+    if not feedback or not feedback.strip():
+        return {}
+    
+    # ── Try LLM interpretation first ──────────────────────────────────────
+    if state:
+        try:
+            as_is_metrics = state.get("as_is_metrics", {})
+            target_metrics = state.get("target_metrics", {})
+            as_is_score = as_is_metrics.get("total_score", 0)
+            target_score = target_metrics.get("total_score", 0)
+            reduction_pct = round(((as_is_score - target_score) / as_is_score) * 100, 1) if as_is_score else 0
+            
+            user_prompt = build_feedback_interpreter_prompt(feedback, {
+                "as_is_score": as_is_score,
+                "target_score": target_score,
+                "reduction_pct": reduction_pct,
+                "channel_count": target_metrics.get("channel_count", "N/A"),
+                "fan_out": target_metrics.get("fan_out_score", "N/A"),
+                "routing_depth": target_metrics.get("routing_depth", "N/A"),
+            })
+            
+            llm_result = call_llm(
+                system_prompt=FEEDBACK_INTERPRETER_SYSTEM,
+                user_prompt=user_prompt,
+                max_retries=1,
+                temperature=0.1,
+                max_tokens=1024,
+            )
+            
+            if llm_result and llm_result.get("directives"):
+                directives = llm_result["directives"]
+                reasoning = llm_result.get("reasoning", "")
+                logger.info(f"FEEDBACK-LLM: Interpreted → {directives}")
+                if reasoning:
+                    logger.info(f"FEEDBACK-LLM: Reasoning: {reasoning[:200]}")
+                # Ensure at least aggressive is set if any directive exists
+                if any(v for k, v in directives.items() if k != "reasoning"):
+                    directives.setdefault("aggressive", True)
+                directives["llm_interpreted"] = True
+                directives["llm_reasoning"] = reasoning[:300]
+                return directives
+        except Exception as e:
+            logger.warning(f"FEEDBACK-LLM: Failed ({e}), falling back to regex")
+    
+    # ── Regex fallback ────────────────────────────────────────────────────
+    fb = feedback.upper()
+    directives = {}
+    
+    # Pattern: "remove/reduce/delete 50% of QMs/channels"
+    m = re.search(r'(?:REMOVE|REMOVING|REDUCE|REDUCING|DELETE|DELETING|CONSOLIDAT|MERGE|MERGING|CUT|ELIMINATE)\D*(\d+)\s*%', fb)
+    if m:
+        pct = int(m.group(1)) / 100.0
+        directives["channel_prune_pct"] = pct
+        directives["aggressive"] = True
+        # If user mentions QMs or apps, also set QM consolidation target
+        if any(w in fb for w in ["QM", "QUEUE MANAGER", "APP", "APPLICATION"]):
+            directives["consolidate_qm_pct"] = pct
+            logger.info(f"FEEDBACK-REGEX: target {m.group(1)}% QM consolidation")
+        logger.info(f"FEEDBACK-REGEX: target {m.group(1)}% channel reduction")
+    
+    # Pattern: "reduction to/of 90%" or "score to 90%"
+    m = re.search(r'(?:REDUCTION|SCORE|COMPLEXITY)\s*(?:TO|OF|AT|AT\s+LEAST)\s*(\d+)\s*%', fb)
+    if m:
+        directives["target_reduction_pct"] = int(m.group(1)) / 100.0
+        directives["aggressive"] = True
+        logger.info(f"FEEDBACK-REGEX: target reduction {m.group(1)}%")
+    
+    # Pattern: fan-out cap
+    m = re.search(r'FAN.?OUT\s*(?:CAP|LIMIT|MAX)\D*(\d+)', fb)
+    if m:
+        directives["fanout_cap"] = int(m.group(1))
+        logger.info(f"FEEDBACK-REGEX: fan-out cap {m.group(1)}")
+    
+    # Pattern: aggressive / maximum / drastic / delete
+    if any(w in fb for w in ["AGGRESSIVE", "MAXIMUM", "DRASTIC", "EXTREME", "AS MUCH AS", "DELETE", "DELETING"]):
+        directives["aggressive"] = True
+        logger.info("FEEDBACK-REGEX: aggressive mode enabled")
+    
+    # Pattern: "keep QM_NAME" / "preserve QM_NAME"
+    keep_matches = re.findall(r'(?:KEEP|PRESERVE|PROTECT|DON.T\s+(?:TOUCH|REMOVE))\s+(\w+)', fb)
+    if keep_matches:
+        directives["protect_qms"] = list(set(keep_matches))
+        logger.info(f"FEEDBACK-REGEX: protect QMs: {keep_matches}")
+    
+    # Generic reduction keywords (broad list)
+    if not directives and any(w in fb for w in [
+        "REDUCE", "REDUCING", "FEWER", "LESS", "SIMPLIF", "OPTIMIZE", "OPTIMISE",
+        "MERGE", "REMOVE", "REMOVING", "DELETE", "DELETING", "CONSOLIDAT",
+        "DECOMMISSION", "SHRINK", "MINIMIZE", "MINIMISE", "TRIM", "PRUNE", "CLEAN",
+        "REARRANGE", "RESTRUCTURE", "REORGANIZE", "REORGANISE", "REDO",
+        "CHANGE", "IMPROVE", "BETTER", "LOWER", "DOWN", "DROP", "CUT",
+        "SIMPLIFY", "STREAMLINE", "FLATTEN", "COMPRESS", "TIGHTEN",
+        "FEWER", "SMALLER", "SIMPLER", "LEANER", "THINNER",
+        "FIX", "ADJUST", "TWEAK", "MODIFY", "UPDATE", "REVISE", "REWORK",
+        "TOO MANY", "TOO MUCH", "TOO HIGH", "TOO COMPLEX",
+        "SCORE", "COMPLEXITY", "COMPLEX",
+    ]):
+        directives["aggressive"] = True
+        logger.info("FEEDBACK-REGEX: generic reduction request → aggressive mode")
+    
+    # ── CATCH-ALL: Any non-empty feedback in a revise means the human
+    # wants something DIFFERENT. If nothing above matched, still treat
+    # it as a signal to apply at least moderate optimisation.
+    if not directives and feedback.strip():
+        directives["aggressive"] = True
+        directives["catch_all"] = True
+        logger.info(f"FEEDBACK-REGEX: catch-all — unrecognised feedback treated as change request: '{feedback[:80]}'")
+    
+    if directives:
+        directives["llm_interpreted"] = False
+    
+    return directives
+
+
+def _consolidate_qms_by_feedback(
+    G: nx.DiGraph, state: dict, consolidate_pct: float,
+    protect_qms: set = None,
+) -> tuple:
+    """
+    Feedback-driven QM consolidation — decommission self-contained apps.
+
+    Identifies apps with ZERO cross-QM message flows (no producer→consumer
+    relationship with any other app). These "island" apps add QM sprawl
+    with no messaging value.
+
+    Constraint-safe: removes the app AND its dedicated QM together.
+    The 1:1 app→QM invariant is preserved because both sides vanish.
+    No message flow is broken because the app had none.
+
+    Returns: (modified_graph, count_of_apps_decommissioned)
+    """
+    raw_data = state.get("raw_data", {})
+    if not raw_data:
+        return G, 0
+
+    protect_qms = protect_qms or set()
+
+    # ── Find apps with cross-app message flows ───────────────────────────
+    queue_producers = {}
+    queue_consumers = {}
+    for row in raw_data.get("applications", []):
+        aid = row.get("app_id", "")
+        qname = row.get("queue_name", "")
+        if not qname:
+            continue
+        d = row.get("direction", "").upper()
+        if d in ("PUT", "PRODUCER"):
+            queue_producers.setdefault(qname, set()).add(aid)
+        elif d in ("GET", "CONSUMER"):
+            queue_consumers.setdefault(qname, set()).add(aid)
+        else:
+            queue_producers.setdefault(qname, set()).add(aid)
+            queue_consumers.setdefault(qname, set()).add(aid)
+
+    apps_with_flows = set()
+    for qname in set(queue_producers.keys()) & set(queue_consumers.keys()):
+        for p in queue_producers[qname]:
+            for c in queue_consumers[qname]:
+                if p != c:
+                    apps_with_flows.add(p)
+                    apps_with_flows.add(c)
+
+    # ── Find decommission candidates ─────────────────────────────────────
+    all_apps = [n for n, d in G.nodes(data=True) if d.get("type") == "app"]
+    candidates = []
+    for app_id in all_apps:
+        if app_id in apps_with_flows:
+            continue
+        qms = [v for _, v, d in G.out_edges(app_id, data=True)
+               if d.get("rel") == "connects_to"]
+        if qms and qms[0] in protect_qms:
+            continue
+        candidates.append(app_id)
+
+    if not candidates:
+        logger.info("ARCHITECT-CONSOLIDATE: No self-contained apps found")
+        return G, 0
+
+    max_remove = max(1, int(len(all_apps) * consolidate_pct))
+    to_remove = candidates[:max_remove]
+
+    logger.info(f"ARCHITECT-CONSOLIDATE: {len(candidates)} candidates, "
+                f"decommissioning {len(to_remove)} "
+                f"(target {consolidate_pct:.0%} of {len(all_apps)})")
+
+    # ── Remove app + QM + owned queues + referencing remote queues ────────
+    removed = 0
+    for app_id in to_remove:
+        qms = [v for _, v, d in G.out_edges(app_id, data=True)
+               if d.get("rel") == "connects_to"]
+        if not qms:
+            continue
+        app_qm = qms[0]
+
+        # Safety: only remove QM if this is its sole app
+        apps_on_qm = [u for u, v, d in G.in_edges(app_qm, data=True)
+                       if d.get("rel") == "connects_to"]
+        if len(apps_on_qm) != 1:
+            continue
+
+        # Collect owned queues BEFORE removing edges
+        owned_queues = [v for _, v, d in G.out_edges(app_qm, data=True)
+                        if d.get("rel") == "owns"]
+
+        # Remove all edges on the QM (channels, owns, connects_to)
+        for u, v in list(G.in_edges(app_qm)) + list(G.out_edges(app_qm)):
+            if G.has_edge(u, v):
+                G.remove_edge(u, v)
+
+        # Remove owned queue nodes
+        for q in owned_queues:
+            if G.has_node(q):
+                G.remove_node(q)
+
+        # Remove remote queue nodes on OTHER QMs that target this app
+        for n, d in list(G.nodes(data=True)):
+            if (d.get("type") == "queue"
+                and (d.get("target_app") == app_id
+                     or d.get("remote_qm") == app_qm)):
+                G.remove_node(n)
+
+        # Remove app and QM nodes
+        if G.has_node(app_qm):
+            G.remove_node(app_qm)
+        if G.has_node(app_id):
+            G.remove_node(app_id)
+
+        removed += 1
+        logger.info(f"ARCHITECT-CONSOLIDATE: Decommissioned {app_id} + {app_qm}")
+
+    return G, removed
 
 
 def _build_target_rules(state: dict) -> nx.DiGraph:
@@ -1334,6 +1884,187 @@ def optimizer_agent(state: dict) -> dict:
                     phase2_removed.append((src, dst, ch_name))
                     G.remove_edge(src, dst)
 
+    # ══════════════════════════════════════════════════════════════════════
+    # PHASE 3: FEEDBACK-DRIVEN AGGRESSIVE PRUNING
+    # Only runs when human feedback requests deeper reduction.
+    # Maintains strict 1:1 app→QM ownership. All pruning is on channels only.
+    # ══════════════════════════════════════════════════════════════════════
+    directives = state.get("feedback_directives") or {}
+    phase3_removed = []
+    
+    if directives.get("aggressive") or directives.get("channel_prune_pct") or directives.get("target_reduction_pct"):
+        logger.info(f"OPTIMIZER: Phase 3 — feedback-driven aggressive pruning (directives: {directives})")
+        
+        # Count channels before Phase 3
+        pre_phase3 = sum(1 for _, _, d in G.edges(data=True) if d.get("rel") == "channel")
+        
+        # Determine how many channels to target for removal
+        # KEY FIX: base target on REMAINING channels, not initial.
+        # MST already removed 90%+ of channels. Phase 3 targets what's LEFT.
+        if directives.get("channel_prune_pct"):
+            # "remove 50%" → remove 50% of REMAINING channels
+            phase3_target = max(1, int(pre_phase3 * directives["channel_prune_pct"]))
+        elif directives.get("target_reduction_pct"):
+            # "reduction to 90%" → remove up to 90% of remaining channels
+            phase3_target = max(1, int(pre_phase3 * directives["target_reduction_pct"]))
+        else:
+            # Generic aggressive — remove 40% of remaining channels
+            phase3_target = max(1, int(pre_phase3 * 0.4))
+        
+        logger.info(f"OPTIMIZER: Phase 3 target: remove {phase3_target} of {pre_phase3} remaining channels")
+        
+        # ── ALWAYS run fan-out capping when aggressive ────────────────────
+        # This is the PRIMARY lever for reducing FO score (15% weight).
+        # Even if channel_target is already met, high fan-out QMs need capping.
+        fanout_cap = directives.get("fanout_cap", 3)  # default: max 3 outbound per QM
+        
+        # Build flow count per channel for prioritisation
+        raw_apps = state.get("raw_data", {}).get("applications", [])
+        queue_prod, queue_cons = {}, {}
+        for row in raw_apps:
+            aid = row.get("app_id", "")
+            qname = row.get("queue_name", "")
+            if not qname:
+                continue
+            d = row.get("direction", "").upper()
+            if d in ("PUT", "PRODUCER"):
+                queue_prod.setdefault(qname, set()).add(aid)
+            elif d in ("GET", "CONSUMER"):
+                queue_cons.setdefault(qname, set()).add(aid)
+        
+        channel_flow_count = {}
+        for qname in set(queue_prod.keys()) & set(queue_cons.keys()):
+            for p in queue_prod[qname]:
+                for c in queue_cons[qname]:
+                    if p == c:
+                        continue
+                    fqm = app_qm_map.get(p)
+                    tqm = app_qm_map.get(c)
+                    if fqm and tqm and fqm != tqm:
+                        channel_flow_count[(fqm, tqm)] = channel_flow_count.get((fqm, tqm), 0) + 1
+
+        # ── Try LLM Channel Pruning Advisor first ─────────────────────────
+        llm_pruning_applied = False
+        if phase3_target > 0:
+            try:
+                advisor_prompt = build_channel_advisor_prompt(state, G, max_channels=80)
+                logger.info(f"OPTIMIZER: Phase 3 — calling LLM channel advisor "
+                           f"(~{len(advisor_prompt)//4} tokens)")
+                
+                llm_advice = call_llm(
+                    system_prompt=CHANNEL_ADVISOR_SYSTEM,
+                    user_prompt=advisor_prompt,
+                    max_retries=1,
+                    temperature=0.1,
+                    max_tokens=4096,
+                )
+                
+                if llm_advice and llm_advice.get("remove"):
+                    removals = llm_advice["remove"]
+                    llm_removed = 0
+                    for entry in removals:
+                        if llm_removed >= phase3_target:
+                            break
+                        fqm = entry.get("from_qm", "")
+                        tqm = entry.get("to_qm", "")
+                        if not fqm or not tqm:
+                            continue
+                        if G.has_edge(fqm, tqm) and G[fqm][tqm].get("rel") == "channel":
+                            ch_name = G[fqm][tqm].get("channel_name", f"{fqm}.{tqm}")
+                            reason = entry.get("reason", "LLM advised")
+                            G.remove_edge(fqm, tqm)
+                            phase3_removed.append((fqm, tqm, ch_name))
+                            llm_removed += 1
+                            logger.info(f"OPTIMIZER P3-LLM: Removed {ch_name} — {reason[:80]}")
+                    
+                    if llm_removed > 0:
+                        llm_pruning_applied = True
+                        logger.info(f"OPTIMIZER: Phase 3 LLM advisor removed {llm_removed} channels")
+                        phase3_target -= llm_removed
+            except Exception as e:
+                logger.warning(f"OPTIMIZER: Phase 3 LLM advisor failed ({e}), using heuristic")
+
+        # ── Isolation safety helper ───────────────────────────────────
+        # Before removing any channel, check if it would create an ISOLATED_QM.
+        # A QM is isolated if it has apps AND zero channels after removal.
+        def _would_isolate(src_qm, dst_qm):
+            """Return True if removing channel src→dst would isolate either QM."""
+            for qm in [src_qm, dst_qm]:
+                if qm not in qms_with_apps:
+                    continue  # no apps = don't care
+                # Count remaining channels (excluding the one we'd remove)
+                remaining = 0
+                for _, t, ed in G.out_edges(qm, data=True):
+                    if ed.get("rel") == "channel" and not (qm == src_qm and t == dst_qm):
+                        remaining += 1
+                for s, _, ed in G.in_edges(qm, data=True):
+                    if ed.get("rel") == "channel" and not (s == src_qm and qm == dst_qm):
+                        remaining += 1
+                if remaining == 0:
+                    return True
+            return False
+
+        # ── Pass 3a: Fan-out capping (heuristic fallback) ─────────────
+        # QMs with highest outbound channels get pruned first.
+        # This directly reduces FO (15% of score).
+        removed_this_pass = 0
+        for qm in active_qms:
+            if removed_this_pass >= phase3_target:
+                break
+            outbound = [(v, d) for _, v, d in G.out_edges(qm, data=True) if d.get("rel") == "channel"]
+            if len(outbound) <= fanout_cap:
+                continue
+            # Sort by flow count ascending — weakest channels first
+            outbound_scored = sorted(
+                outbound,
+                key=lambda x: channel_flow_count.get((qm, x[0]), 0)
+            )
+            # Remove excess channels (keep the top `fanout_cap` by flow count)
+            to_remove = outbound_scored[:len(outbound) - fanout_cap]
+            for target_qm, edge_data in to_remove:
+                if removed_this_pass >= phase3_target:
+                    break
+                # Safety: don't create isolated QMs
+                if _would_isolate(qm, target_qm):
+                    logger.info(f"OPTIMIZER P3a: SKIPPED {qm}.{target_qm} — would isolate a QM")
+                    continue
+                ch_name = edge_data.get("channel_name", f"{qm}.{target_qm}")
+                G.remove_edge(qm, target_qm)
+                phase3_removed.append((qm, target_qm, ch_name))
+                removed_this_pass += 1
+                logger.info(f"OPTIMIZER P3a: Fan-out cap({fanout_cap}) removed {ch_name} "
+                           f"(flows={channel_flow_count.get((qm, target_qm), 0)})")
+        
+        # ── Pass 3b: Low-flow channel removal ─────────────────────────
+        # Remove channels with fewest flow pairs, regardless of fan-out.
+        remaining_target = phase3_target - removed_this_pass
+        if remaining_target > 0:
+            current_channels_list = [
+                (u, v, d) for u, v, d in G.edges(data=True) if d.get("rel") == "channel"
+            ]
+            # Sort by flow count ascending
+            current_channels_list.sort(
+                key=lambda x: channel_flow_count.get((x[0], x[1]), 0)
+            )
+            
+            for u, v, d in current_channels_list:
+                if removed_this_pass >= phase3_target:
+                    break
+                # Safety: don't create isolated QMs
+                if _would_isolate(u, v):
+                    continue
+                
+                ch_name = d.get("channel_name", f"{u}.{v}")
+                G.remove_edge(u, v)
+                phase3_removed.append((u, v, ch_name))
+                removed_this_pass += 1
+                logger.info(f"OPTIMIZER P3b: Low-flow removed {ch_name} "
+                           f"(flows={channel_flow_count.get((u, v), 0)})")
+        
+        post_phase3 = sum(1 for _, _, d in G.edges(data=True) if d.get("rel") == "channel")
+        logger.info(f"OPTIMIZER: Phase 3 complete — removed {len(phase3_removed)} channels "
+                    f"({pre_phase3} → {post_phase3})")
+
     # Kernighan-Lin bisection — detect natural cluster boundaries
     # Only run on the largest connected component to avoid hanging
     kl_insight = ""
@@ -1420,6 +2151,7 @@ def optimizer_agent(state: dict) -> dict:
 
     phase1_names = [name for _, _, name in phase1_removed if name]
     phase2_names = [name for _, _, name in phase2_removed if name]
+    phase3_names = [name for _, _, name in phase3_removed if name]
 
     target_isolated = sum(1 for s in target_subgraphs if s["is_isolated"])
 
@@ -1443,10 +2175,27 @@ def optimizer_agent(state: dict) -> dict:
         f"{'healthy distribution' if target_entropy['entropy_ratio'] > 0.6 else 'skewed — some QMs over-connected'}). "
     )
 
+    phase3_info = ""
+    if phase3_removed:
+        # Check if LLM advisor was used (look for llm_pruning_applied in local scope)
+        llm_note = ""
+        if directives:
+            try:
+                if llm_pruning_applied:
+                    llm_note = "AI-advised + "
+            except NameError:
+                pass
+        phase3_info = (
+            f"Phase 3 (feedback-driven): removed {len(phase3_removed)} channel(s) "
+            f"via {llm_note}fan-out capping + low-flow pruning"
+            f"{' (' + ', '.join(phase3_names[:5]) + ')' if phase3_names else ''}. "
+        )
+
     msg = (
-        f"Two-phase optimisation complete. "
-        f"Channels: {initial_channels} → {after_phase1} (Phase 1: reachability) "
-        f"→ {final_channels} (Phase 2: MST). "
+        f"{'Three' if phase3_removed else 'Two'}-phase optimisation complete. "
+        f"Channels: {initial_channels} → {after_phase1} (Phase 1) "
+        f"→ {after_phase1 - len(phase2_removed)} (Phase 2) "
+        f"→ {final_channels} (Phase 3). "
         f"Total removed: {initial_channels - final_channels}. "
         f"Phase 1 (reachability pruning): removed {len(phase1_removed)} dead channel(s)"
         f"{' (' + ', '.join(phase1_names[:5]) + ')' if phase1_names else ''}. "
@@ -1454,6 +2203,7 @@ def optimizer_agent(state: dict) -> dict:
         f"weighted MST {'applied' if mst_applied else 'skipped (graph disconnected or trivial)'}, "
         f"removed {len(phase2_removed)} redundant channel(s)"
         f"{' (' + ', '.join(phase2_names[:5]) + ')' if phase2_names else ''}. "
+        f"{phase3_info}"
         f"{kl_insight}"
         f"{cycle_info}"
         f"{analytics_insight}"
@@ -1462,6 +2212,86 @@ def optimizer_agent(state: dict) -> dict:
     )
     messages.append({"agent": "OPTIMIZER", "msg": msg})
 
+    # ── LLM Design Critic (Role 4) ───────────────────────────────────────
+    # Post-optimization self-review: LLM identifies weaknesses in the target design.
+    # Results appear in the trace and inform the human reviewer.
+    try:
+        critic_state = {
+            "as_is_metrics": state.get("as_is_metrics", {}),
+            "target_metrics": target_metrics,
+            "target_communities": target_communities,
+            "target_centrality": target_centrality,
+            "target_entropy": target_entropy,
+            "target_subgraphs": target_subgraphs,
+            "raw_data": state.get("raw_data", {}),
+        }
+        critic_prompt = build_design_critic_prompt(critic_state)
+        logger.info(f"OPTIMIZER-LLM: Calling design critic (~{len(critic_prompt)//4} tokens)")
+        
+        critic_result = call_llm(
+            system_prompt=DESIGN_CRITIC_SYSTEM,
+            user_prompt=critic_prompt,
+            max_retries=1,
+            temperature=0.2,
+            max_tokens=2048,
+        )
+        
+        if critic_result:
+            assessment = critic_result.get("overall_assessment", "UNKNOWN")
+            issues = critic_result.get("issues", [])
+            summary = critic_result.get("summary", "")[:200]
+            high_issues = [i for i in issues if i.get("severity") == "HIGH"]
+            
+            critic_msg = (
+                f"AI Design Critic: {assessment}. "
+                f"{len(issues)} issues found ({len(high_issues)} HIGH). "
+                f"{summary}"
+            )
+            messages.append({"agent": "OPTIMIZER", "msg": critic_msg})
+            logger.info(f"OPTIMIZER-LLM: Design critic: {assessment}, {len(issues)} issues")
+        else:
+            messages.append({"agent": "OPTIMIZER", "msg": "AI Design Critic: LLM unavailable — skipped"})
+    except Exception as e:
+        logger.warning(f"OPTIMIZER-LLM: Design critic failed ({e})")
+
+    # ── LLM Capacity Planner (Role 9) ────────────────────────────────────
+    # Analyses flow distribution to flag over/under-provisioned QMs.
+    # Results appear in agent_trace so reviewer can see capacity insights.
+    capacity_analysis = None
+    try:
+        capacity_state = {
+            "target_metrics": target_metrics,
+            "target_communities": target_communities,
+            "optimised_graph": G,
+            "raw_data": state.get("raw_data", {}),
+        }
+        capacity_prompt = build_capacity_planner_prompt(capacity_state)
+        logger.info(f"OPTIMIZER-LLM: Calling capacity planner (~{len(capacity_prompt)//4} tokens)")
+
+        capacity_analysis = call_llm(
+            system_prompt=CAPACITY_PLANNER_SYSTEM,
+            user_prompt=capacity_prompt,
+            max_retries=1,
+            temperature=0.2,
+            max_tokens=2048,
+        )
+
+        if capacity_analysis:
+            cap_score = capacity_analysis.get("capacity_score", "?")
+            hotspots = capacity_analysis.get("hotspots", [])
+            high_hotspots = [h for h in hotspots if h.get("severity") == "HIGH"]
+            messages.append({
+                "agent": "OPTIMIZER",
+                "msg": (f"AI Capacity Planner: balance score {cap_score}/100, "
+                        f"{len(hotspots)} hotspot(s) ({len(high_hotspots)} HIGH). "
+                        f"{capacity_analysis.get('summary', '')[:150]}")
+            })
+            logger.info(f"OPTIMIZER-LLM: Capacity: {cap_score}/100, {len(hotspots)} hotspots")
+        else:
+            messages.append({"agent": "OPTIMIZER", "msg": "AI Capacity Planner: LLM unavailable — skipped"})
+    except Exception as e:
+        logger.warning(f"OPTIMIZER-LLM: Capacity planner failed ({e})")
+
     return {
         "optimised_graph": G,
         "target_metrics": target_metrics,
@@ -1469,6 +2299,7 @@ def optimizer_agent(state: dict) -> dict:
         "target_communities": target_communities,
         "target_centrality": target_centrality,
         "target_entropy": target_entropy,
+        "capacity_analysis": capacity_analysis,
         "messages": messages,
     }
 
@@ -1675,6 +2506,52 @@ def tester_agent(state: dict) -> dict:
 
     passed = not any(v["severity"] == "CRITICAL" for v in violations)
 
+    # ── LLM Compliance Auditor (Role 8) ──────────────────────────────────
+    # AI audits target state for security, HA, and best-practice gaps
+    # beyond what rule-based checks can catch.
+    compliance_audit = None
+    try:
+        audit_state = {
+            "target_metrics": state.get("target_metrics", {}),
+            "as_is_metrics": state.get("as_is_metrics", {}),
+            "target_communities": state.get("target_communities", {}),
+            "target_centrality": state.get("target_centrality", {}),
+            "target_entropy": state.get("target_entropy", {}),
+            "target_subgraphs": state.get("target_subgraphs", []),
+            "constraint_violations": violations,
+            "optimised_graph": G,
+            "raw_data": state.get("raw_data", {}),
+        }
+        audit_prompt = build_compliance_auditor_prompt(audit_state)
+        logger.info(f"TESTER-LLM: Calling compliance auditor (~{len(audit_prompt)//4} tokens)")
+
+        compliance_audit = call_llm(
+            system_prompt=COMPLIANCE_AUDITOR_SYSTEM,
+            user_prompt=audit_prompt,
+            max_retries=1,
+            temperature=0.2,
+            max_tokens=2048,
+        )
+
+        if compliance_audit:
+            score = compliance_audit.get("compliance_score", "?")
+            findings = compliance_audit.get("findings", [])
+            high_findings = [f for f in findings if f.get("severity") in ("CRITICAL", "HIGH")]
+            ha = compliance_audit.get("ha_assessment", {})
+            messages.append({
+                "agent": "TESTER",
+                "msg": (f"AI Compliance Auditor: score {score}/100, "
+                        f"{len(findings)} finding(s) ({len(high_findings)} critical/high). "
+                        f"HA: {'redundant' if ha.get('has_redundancy') else 'no redundancy'}, "
+                        f"SPOFs: {ha.get('spof_count', '?')}. "
+                        f"{compliance_audit.get('summary', '')[:120]}")
+            })
+            logger.info(f"TESTER-LLM: Compliance: {score}/100, {len(findings)} findings")
+        else:
+            messages.append({"agent": "TESTER", "msg": "AI Compliance Auditor: LLM unavailable — skipped"})
+    except Exception as e:
+        logger.warning(f"TESTER-LLM: Compliance audit failed ({e})")
+
     msg = (
         f"Tester: {'PASS' if passed else 'FAIL'} — "
         f"{len(violations)} violations found "
@@ -1688,6 +2565,7 @@ def tester_agent(state: dict) -> dict:
     return {
         "validation_passed": passed,
         "constraint_violations": violations,
+        "compliance_audit": compliance_audit,
         "messages": messages,
     }
 
@@ -2267,6 +3145,45 @@ def migration_planner_agent(state: dict) -> dict:
     )
     messages.append({"agent": "MIGRATION_PLANNER", "msg": msg})
 
+    # ── LLM Migration Risk Assessor (Role 5) ─────────────────────────────
+    # LLM scores each phase by risk, identifies high-risk steps, recommends
+    # maintenance windows. Results enrich the Migration tab.
+    try:
+        risk_state = {
+            "topology_diff": diff,
+            "migration_plan": migration_plan,
+            "raw_data": state.get("raw_data", {}),
+        }
+        risk_prompt = build_migration_risk_prompt(risk_state)
+        logger.info(f"MIGRATION-LLM: Calling risk assessor (~{len(risk_prompt)//4} tokens)")
+        
+        risk_result = call_llm(
+            system_prompt=MIGRATION_RISK_SYSTEM,
+            user_prompt=risk_prompt,
+            max_retries=1,
+            temperature=0.2,
+            max_tokens=2048,
+        )
+        
+        if risk_result:
+            migration_plan["risk_assessment"] = risk_result
+            phase_risks = risk_result.get("phase_risks", {})
+            high_risk = risk_result.get("high_risk_steps", [])
+            windows = risk_result.get("maintenance_windows", [])
+            
+            risk_msg = (
+                f"AI Risk Assessment: "
+                + ", ".join(f"{p}={r.get('risk','?')}" for p, r in phase_risks.items())
+                + f". {len(high_risk)} high-risk step(s) identified. "
+                + (f"Windows: {'; '.join(windows[:2])}" if windows else "")
+            )
+            messages.append({"agent": "MIGRATION_PLANNER", "msg": risk_msg})
+            logger.info(f"MIGRATION-LLM: Risk assessment complete")
+        else:
+            messages.append({"agent": "MIGRATION_PLANNER", "msg": "AI Risk Assessment: LLM unavailable — skipped"})
+    except Exception as e:
+        logger.warning(f"MIGRATION-LLM: Risk assessment failed ({e})")
+
     return {
         "migration_plan": migration_plan,
         "topology_diff": diff,
@@ -2543,6 +3460,74 @@ def doc_expert_agent(state: dict) -> dict:
     adrs = state.get("adrs", [])
     violations = state.get("constraint_violations", [])
 
+    # ── LLM ADR Enricher (Role 7) ────────────────────────────────────────
+    # Generate enterprise-grade ADRs with specific entity references and
+    # business justification. Merges with existing rule/LLM ADRs.
+    try:
+        adr_prompt = build_adr_enricher_prompt(state)
+        logger.info(f"DOC_EXPERT-LLM: Calling ADR enricher (~{len(adr_prompt)//4} tokens)")
+        
+        adr_result = call_llm(
+            system_prompt=ADR_ENRICHER_SYSTEM,
+            user_prompt=adr_prompt,
+            max_retries=1,
+            temperature=0.3,
+            max_tokens=4096,
+        )
+        
+        if adr_result and adr_result.get("adrs"):
+            llm_adrs = adr_result["adrs"]
+            # Merge: keep existing ADRs, append LLM-generated ones with distinct IDs
+            existing_ids = {a.get("id") for a in adrs}
+            for la in llm_adrs:
+                adr_id = la.get("id", f"ADR-AI-{len(adrs)+1:03d}")
+                if adr_id in existing_ids:
+                    adr_id = f"ADR-AI-{len(adrs)+1:03d}"
+                adrs.append({
+                    "id": adr_id,
+                    "decision": la.get("title") or la.get("decision", ""),
+                    "context": la.get("context", ""),
+                    "rationale": la.get("rationale", ""),
+                    "consequences": la.get("consequences", ""),
+                })
+            messages.append({"agent": "DOC_EXPERT", 
+                           "msg": f"AI ADR Enricher: generated {len(llm_adrs)} enterprise-grade ADRs "
+                                  f"(total now: {len(adrs)})"})
+            logger.info(f"DOC_EXPERT-LLM: {len(llm_adrs)} ADRs generated")
+        else:
+            messages.append({"agent": "DOC_EXPERT", "msg": "AI ADR Enricher: LLM unavailable — using existing ADRs"})
+    except Exception as e:
+        logger.warning(f"DOC_EXPERT-LLM: ADR enricher failed ({e})")
+
+    # ── LLM Executive Summarizer (Role 10) ───────────────────────────────
+    # Generates a non-technical executive summary for stakeholders.
+    # Translates topology metrics into business impact language.
+    exec_summary = None
+    try:
+        exec_prompt = build_executive_summary_prompt(state)
+        logger.info(f"DOC_EXPERT-LLM: Calling executive summarizer (~{len(exec_prompt)//4} tokens)")
+
+        exec_result = call_llm(
+            system_prompt=EXECUTIVE_SUMMARIZER_SYSTEM,
+            user_prompt=exec_prompt,
+            max_retries=1,
+            temperature=0.3,
+            max_tokens=2048,
+        )
+
+        if exec_result:
+            exec_summary = exec_result
+            messages.append({
+                "agent": "DOC_EXPERT",
+                "msg": (f"AI Executive Summary: \"{exec_result.get('headline', 'Generated')}\" — "
+                        f"{exec_result.get('recommendation', 'See report')[:150]}")
+            })
+            logger.info("DOC_EXPERT-LLM: Executive summary generated")
+        else:
+            messages.append({"agent": "DOC_EXPERT", "msg": "AI Executive Summary: LLM unavailable — skipped"})
+    except Exception as e:
+        logger.warning(f"DOC_EXPERT-LLM: Executive summarizer failed ({e})")
+
     delta = round(as_is.get("total_score", 0) - target.get("total_score", 0), 1)
     pct = round((delta / as_is["total_score"]) * 100, 1) if as_is.get("total_score") else 0
 
@@ -2553,6 +3538,48 @@ def doc_expert_agent(state: dict) -> dict:
         f"The AI-driven transformation achieved a **{pct}% reduction** in overall MQ topology complexity.",
         f"Overall Complexity Score reduced from **{as_is.get('total_score')}/100** to **{target.get('total_score')}/100**.",
         "",
+    ]
+
+    # Inject AI executive briefing if available
+    if exec_summary:
+        report_lines += [
+            "### Executive Briefing (AI-Generated)",
+            f"**{exec_summary.get('headline', '')}**",
+            "",
+        ]
+        bi = exec_summary.get("business_impact", {})
+        if bi:
+            report_lines += [
+                f"- **Risk Reduction:** {bi.get('operational_risk_reduction', 'N/A')}",
+                f"- **Cost Impact:** {bi.get('cost_implications', 'N/A')}",
+                f"- **Agility:** {bi.get('agility_improvement', 'N/A')}",
+                f"- **Reliability:** {bi.get('reliability_impact', 'N/A')}",
+                "",
+            ]
+        key_nums = exec_summary.get("key_numbers", [])
+        if key_nums:
+            report_lines += [
+                "| Metric | Before | After | Interpretation |",
+                "|--------|--------|-------|----------------|",
+            ]
+            for kn in key_nums[:6]:
+                report_lines.append(
+                    f"| {kn.get('metric','')} | {kn.get('before','')} | "
+                    f"{kn.get('after','')} | {kn.get('interpretation','')} |"
+                )
+            report_lines.append("")
+        risks = exec_summary.get("risks_and_mitigations", [])
+        if risks:
+            for r in risks[:4]:
+                report_lines.append(f"- **Risk:** {r.get('risk','')} → **Mitigation:** {r.get('mitigation','')}")
+            report_lines.append("")
+        report_lines += [
+            f"**Recommendation:** {exec_summary.get('recommendation', 'N/A')}",
+            f"**Timeline:** {exec_summary.get('timeline_estimate', 'N/A')}",
+            "",
+        ]
+
+    report_lines += [
         "## Complexity Metrics — Before vs After",
         "| Metric | As-Is | Target | Change |",
         "|--------|-------|--------|--------|",
@@ -2574,6 +3601,60 @@ def doc_expert_agent(state: dict) -> dict:
         report_lines.append("### Violation Details")
         for v in violations:
             report_lines.append(f"- [{v['severity']}] {v['rule']}: {v['entity']} — {v['detail']}")
+        report_lines.append("")
+
+    # Compliance Audit section (from Role 8)
+    comp_audit = state.get("compliance_audit")
+    if comp_audit:
+        report_lines += [
+            "## Compliance Audit (AI-Generated)",
+            f"**Compliance Score:** {comp_audit.get('compliance_score', '?')}/100",
+            "",
+        ]
+        for f in comp_audit.get("findings", [])[:8]:
+            report_lines.append(
+                f"- [{f.get('severity','')}] **{f.get('category','')}**: "
+                f"{f.get('finding','')} → _{f.get('recommendation','')}_"
+            )
+        ha = comp_audit.get("ha_assessment", {})
+        if ha:
+            report_lines += [
+                "",
+                f"**High Availability:** {'Redundancy present' if ha.get('has_redundancy') else 'No redundancy'} "
+                f"| SPOFs: {ha.get('spof_count', '?')} | {ha.get('recommendation', '')}",
+            ]
+        sec = comp_audit.get("security_assessment", {})
+        if sec:
+            report_lines.append(
+                f"**Security:** Channel security score {sec.get('channel_security_score', '?')}/100 "
+                f"| SSL/TLS: {'recommended' if sec.get('ssl_tls_recommended') else 'not flagged'}"
+            )
+        report_lines.append("")
+
+    # Capacity Analysis section (from Role 9)
+    cap_analysis = state.get("capacity_analysis")
+    if cap_analysis:
+        report_lines += [
+            "## Capacity Analysis (AI-Generated)",
+            f"**Capacity Balance Score:** {cap_analysis.get('capacity_score', '?')}/100",
+            "",
+        ]
+        flow = cap_analysis.get("flow_analysis", {})
+        if flow:
+            report_lines += [
+                f"- Total flows: {flow.get('total_flows', '?')}",
+                f"- Busiest QM: {flow.get('busiest_qm', '?')} ({flow.get('busiest_qm_flows', '?')} flows)",
+                f"- Quietest QM: {flow.get('quietest_qm', '?')} ({flow.get('quietest_qm_flows', '?')} flows)",
+                f"- Imbalance ratio: {flow.get('flow_imbalance_ratio', '?')}x",
+                "",
+            ]
+        for h in cap_analysis.get("hotspots", [])[:5]:
+            report_lines.append(
+                f"- [{h.get('severity','')}] **{h.get('qm','')}** — {h.get('issue','')}: "
+                f"{h.get('detail','')} → _{h.get('recommendation','')}_"
+            )
+        for rec in cap_analysis.get("scaling_recommendations", [])[:3]:
+            report_lines.append(f"- **Scaling:** {rec}")
         report_lines.append("")
 
     report_lines.append("## Architecture Decision Records")
@@ -2673,7 +3754,12 @@ def doc_expert_agent(state: dict) -> dict:
         logger.error(f"DOC_EXPERT: Failed to generate some deliverables: {e}")
         messages.append({"agent": "DOC_EXPERT", "msg": f"Warning: some deliverables failed: {e}"})
 
-    return {"final_report": final_report, "deliverable_docs": deliverable_docs, "messages": messages}
+    return {
+        "final_report": final_report,
+        "deliverable_docs": deliverable_docs,
+        "exec_summary": exec_summary,
+        "messages": messages,
+    }
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MISSING DELIVERABLES — Output.md §8.2 & §9

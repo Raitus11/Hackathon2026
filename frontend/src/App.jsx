@@ -1720,7 +1720,7 @@ export default function App() {
     result?.final_report
   );
 
-  async function submitReview(approved, abort = false, feedbackOverride = null) {
+  async function submitReview(approved, abort = false, feedbackOverride = null, chatHistory = null) {
     const feedback = feedbackOverride !== null ? feedbackOverride : reviewFeedback;
     if (!approved && !abort && !feedback.trim()) {
       setError("Please provide a reason when revising — the Architect needs your feedback to redesign.");
@@ -1739,7 +1739,7 @@ export default function App() {
       const res = await fetch(`${API}/api/review/${result?.session_id}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ approved, feedback, abort }),
+        body: JSON.stringify({ approved, feedback, abort, chat_history: chatHistory }),
       });
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
@@ -1932,7 +1932,7 @@ export default function App() {
                   architectMethod={architectMethod}
                   reviewLoading={reviewLoading}
                   onApprove={() => submitReview(true)}
-                  onRevise={(feedback) => submitReview(false, false, feedback)}
+                  onRevise={(feedback, chatHistory) => submitReview(false, false, feedback, chatHistory)}
                   onAbort={() => submitReview(false, true)}
                   sessionId={result?.session_id}
                 />
@@ -2639,14 +2639,19 @@ function ReviewChatPanel({ result, architectMethod, reviewLoading, onApprove, on
   }
 
   function handleRevise() {
-    // Collect all user messages as the revision feedback
+    // Collect ALL chat messages (user + assistant) as structured context
+    // The assistant's agreements/recommendations are critical for the revision
     const userMessages = messages
       .filter(m => m.role === "user")
       .map(m => m.content);
     const feedback = userMessages.length > 0
       ? userMessages.join("\n")
       : "Please revise the design.";
-    onRevise(feedback);
+    // Pass full structured chat history alongside the flat feedback string
+    const chatHistory = messages
+      .filter(m => m.role === "user" || m.role === "assistant")
+      .map(m => ({ role: m.role, content: m.content }));
+    onRevise(feedback, chatHistory);
   }
 
   return (

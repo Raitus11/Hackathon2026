@@ -61,6 +61,7 @@ class ReviewDecision(BaseModel):
     approved: bool
     abort: bool = False
     feedback: Optional[str] = ""
+    chat_history: Optional[List[dict]] = None  # Full chat conversation for revision context
 
 class ChatMessage(BaseModel):
     role: str
@@ -117,6 +118,9 @@ def _build_response(session_id: str, result: dict) -> dict:
         "target_centrality":    result.get("target_centrality", {}),
         "as_is_entropy":        result.get("as_is_entropy", {}),
         "target_entropy":       result.get("target_entropy", {}),
+        "compliance_audit":     result.get("compliance_audit"),
+        "capacity_analysis":    result.get("capacity_analysis"),
+        "exec_summary":         result.get("exec_summary"),
     })
 
 
@@ -279,6 +283,7 @@ def submit_review(session_id: str, decision: ReviewDecision):
     result["human_feedback"]        = decision.feedback or ""
     result["human_aborted"]         = decision.abort
     result["awaiting_human_review"] = False
+    result["chat_history"]          = decision.chat_history  # Full chat for LLM revision context
 
     # Debug: what's in the stored state?
     state_keys = [k for k in result.keys() if result.get(k) is not None]
@@ -302,6 +307,9 @@ def submit_review(session_id: str, decision: ReviewDecision):
         else:
             # Revise: run architect → optimizer → tester → human_review via LangGraph
             # Skips supervisor/sanitiser/researcher/analyst (data unchanged)
+            # Reset redesign_count so tester retries work on this revision cycle
+            result["redesign_count"] = 0
+            logger.info(f"Revise: reset redesign_count=0, feedback='{(decision.feedback or '')[:80]}'")
             result = intelli_ai_revise_workflow.invoke(
                 result,
                 config={"recursion_limit": 50},
