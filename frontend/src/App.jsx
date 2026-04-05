@@ -1383,7 +1383,7 @@ function DiffTopologyView({ asIsGraph, targetGraph, diff, height = 600 }) {
     if (allQMs.length === 0) return;
 
     const cx = w / 2, cy = h / 2;
-    const ns = "http://www.w3.org/2000/svg";
+    const mkEl = (tag) => svg.ownerDocument.createElementNS(svg.namespaceURI, tag);
 
     // ── DUAL RING LAYOUT ──
     // Inner ring: original/unchanged QMs (the as-is backbone)
@@ -1406,7 +1406,7 @@ function DiffTopologyView({ asIsGraph, targetGraph, diff, height = 600 }) {
 
     // ── LAYER 0: Ring guides (subtle) ──
     [innerR, outerR].forEach(r => {
-      const circle = document.createElementNS(ns, "circle");
+      const circle = mkEl("circle");
       circle.setAttribute("cx", cx); circle.setAttribute("cy", cy); circle.setAttribute("r", r);
       circle.setAttribute("fill", "none"); circle.setAttribute("stroke", "#1e293b");
       circle.setAttribute("stroke-width", "1"); circle.setAttribute("stroke-dasharray", "3,6");
@@ -1414,14 +1414,14 @@ function DiffTopologyView({ asIsGraph, targetGraph, diff, height = 600 }) {
     });
 
     // Ring labels
-    const labelInner = document.createElementNS(ns, "text");
+    const labelInner = mkEl("text");
     labelInner.setAttribute("x", cx); labelInner.setAttribute("y", cy - innerR - 8);
     labelInner.setAttribute("text-anchor", "middle"); labelInner.setAttribute("font-size", "9");
     labelInner.setAttribute("font-family", "DM Sans, sans-serif"); labelInner.setAttribute("fill", "#475569");
     labelInner.textContent = `ORIGINAL QMs (${innerQMs.length})`;
     svg.appendChild(labelInner);
 
-    const labelOuter = document.createElementNS(ns, "text");
+    const labelOuter = mkEl("text");
     labelOuter.setAttribute("x", cx); labelOuter.setAttribute("y", cy - outerR - 8);
     labelOuter.setAttribute("text-anchor", "middle"); labelOuter.setAttribute("font-size", "9");
     labelOuter.setAttribute("font-family", "DM Sans, sans-serif"); labelOuter.setAttribute("fill", "#22c55e60");
@@ -1431,7 +1431,7 @@ function DiffTopologyView({ asIsGraph, targetGraph, diff, height = 600 }) {
     // Helper to draw a line
     function drawLine(src, tgt, color, width, opacity, dash) {
       if (!positions[src] || !positions[tgt]) return null;
-      const line = document.createElementNS(ns, "line");
+      const line = mkEl("line");
       line.setAttribute("x1", positions[src].x); line.setAttribute("y1", positions[src].y);
       line.setAttribute("x2", positions[tgt].x); line.setAttribute("y2", positions[tgt].y);
       line.setAttribute("stroke", color); line.setAttribute("stroke-width", width);
@@ -1469,12 +1469,12 @@ function DiffTopologyView({ asIsGraph, targetGraph, diff, height = 600 }) {
     // Unchanged nodes
     unchangedQMs.forEach(qm => {
       const pos = positions[qm]; if (!pos) return;
-      const c = document.createElementNS(ns, "circle");
+      const c = mkEl("circle")
       c.setAttribute("cx", pos.x); c.setAttribute("cy", pos.y);
       c.setAttribute("r", nodeSize * 0.8); c.setAttribute("fill", "#475569"); c.setAttribute("opacity", "0.6");
       svg.appendChild(c);
       if (showLabels) {
-        const t = document.createElementNS(ns, "text");
+        const t = mkEl("text");
         t.setAttribute("x", pos.x); t.setAttribute("y", pos.y + nodeSize + 8);
         t.setAttribute("text-anchor", "middle"); t.setAttribute("font-size", fontSize);
         t.setAttribute("font-family", "JetBrains Mono, monospace"); t.setAttribute("fill", "#64748b");
@@ -1486,12 +1486,12 @@ function DiffTopologyView({ asIsGraph, targetGraph, diff, height = 600 }) {
     // Added nodes (green, outer ring)
     outerQMs.forEach(qm => {
       const pos = positions[qm]; if (!pos) return;
-      const c = document.createElementNS(ns, "circle");
+      const c = mkEl("circle");
       c.setAttribute("cx", pos.x); c.setAttribute("cy", pos.y);
       c.setAttribute("r", nodeSize); c.setAttribute("fill", "#22c55e"); c.setAttribute("opacity", "0.8");
       svg.appendChild(c);
       if (showLabels) {
-        const t = document.createElementNS(ns, "text");
+        const t = mkEl("text");
         t.setAttribute("x", pos.x); t.setAttribute("y", pos.y + nodeSize + 8);
         t.setAttribute("text-anchor", "middle"); t.setAttribute("font-size", fontSize);
         t.setAttribute("font-family", "JetBrains Mono, monospace"); t.setAttribute("fill", "#22c55e");
@@ -1505,24 +1505,24 @@ function DiffTopologyView({ asIsGraph, targetGraph, diff, height = 600 }) {
       const pos = positions[qm]; if (!pos) return;
       const s = nodeSize * 1.2;
       // Red circle with X
-      const c = document.createElementNS(ns, "circle");
+      const c = mkEl("circle");
       c.setAttribute("cx", pos.x); c.setAttribute("cy", pos.y);
       c.setAttribute("r", s); c.setAttribute("fill", "#ef444430");
       c.setAttribute("stroke", "#ef4444"); c.setAttribute("stroke-width", "2");
       svg.appendChild(c);
       // X cross
-      const x1 = document.createElementNS(ns, "line");
+      const x1 = mkEl("line");
       x1.setAttribute("x1", pos.x - s * 0.5); x1.setAttribute("y1", pos.y - s * 0.5);
       x1.setAttribute("x2", pos.x + s * 0.5); x1.setAttribute("y2", pos.y + s * 0.5);
       x1.setAttribute("stroke", "#ef4444"); x1.setAttribute("stroke-width", "2");
       svg.appendChild(x1);
-      const x2 = document.createElementNS(ns, "line");
+      const x2 = mkEl("line");
       x2.setAttribute("x1", pos.x + s * 0.5); x2.setAttribute("y1", pos.y - s * 0.5);
       x2.setAttribute("x2", pos.x - s * 0.5); x2.setAttribute("y2", pos.y + s * 0.5);
       x2.setAttribute("stroke", "#ef4444"); x2.setAttribute("stroke-width", "2");
       svg.appendChild(x2);
       if (showLabels) {
-        const t = document.createElementNS(ns, "text");
+        const t = mkEl("text");
         t.setAttribute("x", pos.x); t.setAttribute("y", pos.y + s + 10);
         t.setAttribute("text-anchor", "middle"); t.setAttribute("font-size", fontSize);
         t.setAttribute("font-family", "JetBrains Mono, monospace"); t.setAttribute("fill", "#ef4444");
@@ -1532,7 +1532,7 @@ function DiffTopologyView({ asIsGraph, targetGraph, diff, height = 600 }) {
     });
 
     // ── LAYER 5: Legend ──
-    const legendBg = document.createElementNS(ns, "rect");
+    const legendBg = mkEl("rect");
     legendBg.setAttribute("x", 10); legendBg.setAttribute("y", 10);
     legendBg.setAttribute("width", 175); legendBg.setAttribute("height", 105);
     legendBg.setAttribute("rx", 6); legendBg.setAttribute("fill", "#0f172aDD");
@@ -1546,14 +1546,14 @@ function DiffTopologyView({ asIsGraph, targetGraph, diff, height = 600 }) {
     ];
     legend.forEach((item, i) => {
       const y = 30 + i * 24;
-      const line = document.createElementNS(ns, "line");
+      const line = mkEl("line");
       line.setAttribute("x1", 20); line.setAttribute("y1", y);
       line.setAttribute("x2", 44); line.setAttribute("y2", y);
       line.setAttribute("stroke", item.color); line.setAttribute("stroke-width", item.width);
       if (item.dash) line.setAttribute("stroke-dasharray", item.dash);
       svg.appendChild(line);
 
-      const text = document.createElementNS(ns, "text");
+      const text = mkEl("text");
       text.setAttribute("x", 50); text.setAttribute("y", y + 4);
       text.setAttribute("font-size", "10"); text.setAttribute("font-family", "DM Sans, sans-serif");
       text.setAttribute("fill", item.color);
@@ -1564,7 +1564,7 @@ function DiffTopologyView({ asIsGraph, targetGraph, diff, height = 600 }) {
     // Net reduction callout (bottom right)
     const netCh = removedChannels.size - addedChannels.size;
     if (netCh > 0) {
-      const callout = document.createElementNS(ns, "text");
+      const callout = mkEl("text");
       callout.setAttribute("x", w - 20); callout.setAttribute("y", h - 20);
       callout.setAttribute("text-anchor", "end"); callout.setAttribute("font-size", "14");
       callout.setAttribute("font-family", "JetBrains Mono, monospace");

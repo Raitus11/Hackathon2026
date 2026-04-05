@@ -2784,7 +2784,7 @@ def _generate_target_csvs(G: nx.DiGraph, state: dict) -> dict:
                 "qm_name":     d.get("name", n),
                 "region":      d.get("region", ""),
                 "host":        f"{n.lower().replace('_', '-')}.target.corp.com",
-                "description": f"Target state QM — {d.get('name', n)}",
+                "description": f"Target state QM - {d.get('name', n)}",
             })
     csvs["target_queue_managers"] = _to_csv(qm_rows, ["qm_id", "qm_name", "region", "host", "description"])
 
@@ -3696,7 +3696,7 @@ def doc_expert_agent(state: dict) -> dict:
             deps = ", ".join(str(d) for d in step.get("depends_on", []))
             report_lines.append(
                 f"| {step['step_number']} | {step['phase']} | "
-                f"{step['description']} | {step['target_qm']} | {deps or '—'} |"
+                f"{step['description']} | {step['target_qm']} | {deps or '-'} |"
             )
         report_lines.append("")
 
