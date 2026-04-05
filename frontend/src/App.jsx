@@ -2103,11 +2103,12 @@ export default function App() {
                   <span style={{ textAlign: "right" }}>After</span><span style={{ textAlign: "right" }}>Delta</span>
                 </div>
                 {[
-                  ["Channel Count", "channel_count", "30%"],
+                  ["Channel Count", "channel_count", "25%"],
                   ["Coupling Index", "coupling_index", "25%"],
                   ["Routing Depth", "routing_depth", "20%"],
                   ["Fan-Out Score", "fan_out_score", "15%"],
-                  ["Orphan Objects", "orphan_objects", "10%"],
+                  ["Orphan Objects", "orphan_objects", "5%"],
+                  ["Channel Sprawl", "channel_sprawl", "10%"],
                 ].map(([label, key, weight], i) => (
                   <MetricRow key={key}
                     label={`${label} (${weight})`}
@@ -2675,8 +2676,16 @@ function ReviewChatPanel({ result, architectMethod, reviewLoading, onApprove, on
         <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
           {result.redesign_count > 1 && <Badge color={T.amber} style={{ fontSize: 9 }}>Iteration {result.redesign_count}</Badge>}
           {architectMethod && (
-            <Badge color={architectMethod === "llm" ? T.cyan : T.amber} style={{ fontSize: 9 }}>
-              {architectMethod === "llm" ? "◆ AI" : "◇ RULES"}
+            <Badge color={
+              architectMethod === "revision_architect" ? T.purple
+              : architectMethod === "hybrid_cluster" ? T.cyan
+              : architectMethod === "llm" ? T.cyan
+              : T.amber
+            } style={{ fontSize: 9 }}>
+              {architectMethod === "revision_architect" ? "◆ AI REVISION"
+               : architectMethod === "hybrid_cluster" ? "◆ AI HYBRID"
+               : architectMethod === "llm" ? "◆ AI ARCHITECT"
+               : "◇ RULES ENGINE"}
             </Badge>
           )}
         </div>
