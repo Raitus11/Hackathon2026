@@ -2623,6 +2623,34 @@ def tester_agent(state: dict) -> dict:
                         f"{compliance_audit.get('summary', '')[:120]}")
             })
             logger.info(f"TESTER-LLM: Compliance: {score}/100, {len(findings)} findings")
+            # Log the findings themselves (not just the count) so the team can
+            # see WHY the score isn't 100. Aisha + Wei's ask — without these
+            # the score is meaningless, and the LLM's output gets thrown away.
+            for i, f in enumerate(findings[:5], 1):  # first 5 only
+                sev = f.get("severity", "?")
+                cat = f.get("category", "?")
+                # Schema key is "finding" (see prompts.py COMPLIANCE_AUDITOR_SYSTEM)
+                # but tolerate alternate keys in case the LLM drifts.
+                desc = (
+                    f.get("finding")
+                    or f.get("description")
+                    or f.get("detail")
+                    or f.get("issue")
+                    or "(no description in LLM response)"
+                )
+                rec = f.get("recommendation", "")
+                affected = f.get("affected_entities", [])
+                aff_str = (
+                    f" [affecting: {', '.join(affected[:3])}{'...' if len(affected) > 3 else ''}]"
+                    if affected else ""
+                )
+                logger.info(
+                    f"TESTER-LLM:   finding #{i} [{sev}] [{cat}]: {str(desc)[:200]}{aff_str}"
+                )
+                if rec:
+                    logger.info(f"TESTER-LLM:     → recommendation: {str(rec)[:200]}")
+            if len(findings) > 5:
+                logger.info(f"TESTER-LLM:   ... and {len(findings)-5} more findings")
         else:
             messages.append({"agent": "TESTER", "msg": "AI Compliance Auditor: LLM unavailable — skipped"})
     except Exception as e:

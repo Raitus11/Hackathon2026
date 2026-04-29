@@ -245,6 +245,16 @@ def _run_steiner_phase(
         logger.error(f"OPTIMIZER-SOLVER: cannot import Steiner adapters ({e})")
         return None
 
+    # ── Capture architect's actual channel count BEFORE solving ──────────
+    # out.initial_channel_count is the count of unique required pairs (what
+    # the solver starts from, conceptually). The architect's *actual* graph
+    # may have more channels (e.g., backfill for new QMs that have no
+    # required-pair representation yet). For reporting we want the actual
+    # count operators see.
+    architect_channel_count = sum(
+        1 for _, _, d in G.edges(data=True) if d.get("rel") == "channel"
+    )
+
     try:
         optimised, out, debug = run_steiner_on_graph(
             G, raw_data,
@@ -265,22 +275,114 @@ def _run_steiner_phase(
     if analytics is None:
         return None
 
+    # ── Integrity check: optimised graph channel count == solver decision ─
+    # This catches a class of bug where downstream code accidentally adds or
+    # removes channels between the solver returning and the graph being
+    # returned to the optimizer agent. If they ever diverge, every downstream
+    # claim ("75% reduction") becomes a lie. We assert and log loudly.
+    actual_channel_count = sum(
+        1 for _, _, d in optimised.edges(data=True) if d.get("rel") == "channel"
+    )
+    if actual_channel_count != out.final_channel_count:
+        logger.error(
+            f"OPTIMIZER-SOLVER: INTEGRITY FAILURE — solver decided "
+            f"{out.final_channel_count} channels but optimised graph has "
+            f"{actual_channel_count} channels. This is a bug. The reduction "
+            f"numbers reported to the UI will be inconsistent with reality."
+        )
+
+    # ── Pull as-is channel count for the comparison ──────────────────────
+    as_is_graph = state.get("as_is_graph")
+    asis_channel_count = (
+        sum(1 for _, _, d in as_is_graph.edges(data=True) if d.get("rel") == "channel")
+        if as_is_graph is not None else None
+    )
+
     asis_score = asis.get("total_score", 0)
     target_score = analytics["target_metrics"].get("total_score", 0)
     if asis_score:
-        pct = (asis_score - target_score) / asis_score * 100
-        score_str = f"{asis_score:.1f} → {target_score:.1f} ({pct:+.1f}%)"
+        score_pct = (asis_score - target_score) / asis_score * 100  # positive = reduction
+        if score_pct >= 0:
+            score_str = f"{asis_score:.1f} → {target_score:.1f} (-{score_pct:.1f}%, reduction)"
+        else:
+            score_str = f"{asis_score:.1f} → {target_score:.1f} (+{-score_pct:.1f}%, INCREASE)"
     else:
         score_str = f"target={target_score:.1f}"
 
+    # Channel reduction relative to architect's output (what the solver actually
+    # received) AND relative to as-is (what the user actually had before).
+    # Format: negative = reduction, positive = increase. Phrasing made
+    # explicit because "+34.8%" vs "-34.8%" is easy to misread.
+    def _fmt_change(before: int, after: int) -> str:
+        if before <= 0:
+            return "n/a"
+        delta_pct = (after - before) / before * 100
+        if delta_pct < 0:
+            return f"{abs(delta_pct):.1f}% reduction"
+        elif delta_pct > 0:
+            return f"{delta_pct:.1f}% INCREASE"
+        else:
+            return "no change"
+
+    arch_to_solver_str = _fmt_change(architect_channel_count, actual_channel_count)
+    arch_to_solver_pct = (
+        (actual_channel_count - architect_channel_count) / max(architect_channel_count, 1) * 100
+    )
+
+    if asis_channel_count and asis_channel_count > 0:
+        asis_to_solver_str = _fmt_change(asis_channel_count, actual_channel_count)
+        asis_to_solver_pct = (
+            (actual_channel_count - asis_channel_count) / asis_channel_count * 100
+        )
+        channel_str = (
+            f"channels: as-is={asis_channel_count} → "
+            f"architect={architect_channel_count} → "
+            f"solver={actual_channel_count} "
+            f"({asis_to_solver_str} vs as-is, "
+            f"{arch_to_solver_str} vs architect)"
+        )
+    else:
+        asis_to_solver_pct = None
+        channel_str = (
+            f"channels: architect={architect_channel_count} → "
+            f"solver={actual_channel_count} "
+            f"({arch_to_solver_str})"
+        )
+
+    # ── Honest gap reporting (don't clamp to 100%) ────────────────────────
+    # The LP-bound gap can exceed 100% on dense uniform-cost instances where
+    # the LP relaxation is loose. Clamping makes a 200% gap look like a
+    # 100% gap, which is dishonest. Show the real number.
+    if out.lower_bound > 0:
+        true_lp_gap_pct = (out.objective_value - out.lower_bound) / out.lower_bound * 100
+    else:
+        true_lp_gap_pct = float('inf') if out.objective_value > 0 else 0.0
+
     message = (
-        f"Steiner solver: "
-        f"channels {out.initial_channel_count} → {out.final_channel_count} "
-        f"({100*(1 - out.final_channel_count/max(out.initial_channel_count,1)):.1f}% reduction), "
+        f"Steiner solver: {channel_str}; "
         f"obj={out.objective_value:.1f}, LB={out.lower_bound:.1f}, "
-        f"gap≤{out.gap_pct:.1f}%, t={out.solve_time_s:.1f}s, "
-        f"iters={out.iterations}; "
+        f"LP_gap={true_lp_gap_pct:.0f}% "
+        f"(alg max gap ≤{out.max_optimality_gap_pct:.0f}%, Charikar 1999), "
+        f"t={out.solve_time_s:.1f}s, iters={out.iterations}; "
         f"complexity {score_str}"
+    )
+
+    # Log a detailed summary at INFO so it's visible in operator logs
+    # without needing to inspect the messages array.
+    logger.info(f"OPTIMIZER-SOLVER: {channel_str}")
+    logger.info(
+        f"OPTIMIZER-SOLVER: complexity {score_str}; "
+        f"V-009 reachability check is performed by tester_agent next"
+    )
+    logger.info(
+        f"OPTIMIZER-SOLVER: solve_time={out.solve_time_s:.2f}s, "
+        f"iterations={out.iterations}, "
+        f"objective={out.objective_value:.2f}, "
+        f"lower_bound={out.lower_bound:.2f}, "
+        f"LP_gap_pct={true_lp_gap_pct:.1f} (uncapped — large values mean "
+        f"the LP bound is loose, not that the solution is bad), "
+        f"algorithmic_max_gap_pct={out.max_optimality_gap_pct:.0f} "
+        f"(Charikar et al. 1999, 2-approx)"
     )
 
     return {
@@ -296,7 +398,10 @@ def _run_steiner_phase(
             "status":               out.status,
             "objective_value":      out.objective_value,
             "lower_bound":          out.lower_bound,
+            # gap_pct is the legacy clamped value; lp_gap_pct_uncapped is honest
             "gap_pct":              out.gap_pct,
+            "lp_gap_pct_uncapped":  true_lp_gap_pct,
+            "max_optimality_gap_pct": out.max_optimality_gap_pct,
             "approximation_ratio":  "2-approx (Charikar et al. 1999)",
             "channels_chosen":      list(out.channels_chosen),
             "pair_routes":          {str(k): v for k, v in out.pair_routes.items()},
@@ -304,6 +409,14 @@ def _run_steiner_phase(
             "iterations":           out.iterations,
             "initial_channel_count": out.initial_channel_count,
             "final_channel_count":  out.final_channel_count,
+            # Comparison context (so UI can show the full reduction story)
+            "architect_channel_count": architect_channel_count,
+            "asis_channel_count":   asis_channel_count,
+            "actual_channel_count": actual_channel_count,
+            "integrity_check_passed": (actual_channel_count == out.final_channel_count),
+            # NEGATIVE = reduction, POSITIVE = increase. Be explicit.
+            "delta_pct_vs_asis": asis_to_solver_pct,
+            "delta_pct_vs_architect": arch_to_solver_pct,
             "solve_time_s":         out.solve_time_s,
             "alpha":                alpha,
             "beta":                 beta,
