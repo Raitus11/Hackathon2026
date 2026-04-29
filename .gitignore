@@ -1,46 +1,121 @@
+# ─────────────────────────────────────────────────────────────────────
 # Secrets — NEVER commit these
+# ─────────────────────────────────────────────────────────────────────
 .env
-.env.local
-.env.production
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+secrets/
+credentials/
 
+# ─────────────────────────────────────────────────────────────────────
+# Hackathon / project-specific data
+# ─────────────────────────────────────────────────────────────────────
+# Real customer CSVs should NEVER be committed
+uploads/
+raw_data*.csv
+raw_data*.xlsx
+*.bak
+sessions/
+session_*/
+
+# Solver / pipeline run outputs
+outputs/
+output/
+out/
+tmp/
+temp/
+*.zip
+
+# Demo recordings
+*.mp4
+*.mov
+
+# ─────────────────────────────────────────────────────────────────────
 # Python
+# ─────────────────────────────────────────────────────────────────────
 __pycache__/
+**/__pycache__/
 *.pyc
 *.pyo
 *.pyd
 .Python
 *.egg-info/
-dist/
-build/
+*.egg
+.eggs/
+.python-version
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual envs
 .venv/
 venv/
 env/
+.tox/
 
-# Node / React
-node_modules/
+# Test / coverage / lint caches
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+coverage.xml
+*.cover
+
+# Build artifacts (Python)
 dist/
 build/
+sdist/
+wheels/
+*.whl
+
+# ─────────────────────────────────────────────────────────────────────
+# Node / React
+# ─────────────────────────────────────────────────────────────────────
+node_modules/
 .next/
+.cache/
+.parcel-cache/
+.turbo/
+.vite/
 
-# Uploads and runtime data
-uploads/
+# npm / yarn / pnpm logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Build artifacts (frontend)
+# (dist/ and build/ already covered above)
+
+# ─────────────────────────────────────────────────────────────────────
+# Logs (general)
+# ─────────────────────────────────────────────────────────────────────
 *.log
+logs/
 
-# Environment variables
-.env
-.env.local
-.env.production
-
-# IDE
+# ─────────────────────────────────────────────────────────────────────
+# IDE / editor
+# ─────────────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.suo
 *.user
-
-# OS
+*.swp
+*.swo
+*~
 .DS_Store
 Thumbs.db
 
-# Python cache in any subfolder
-**/__pycache__/
-**/*.pyc
+# ─────────────────────────────────────────────────────────────────────
+# OS
+# ─────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
