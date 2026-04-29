@@ -1191,8 +1191,35 @@ function MetricRow({ label, before, after, delay = 0 }) {
    ADR CARD
    ═══════════════════════════════════════════════════════════════════════════ */
 
-function ADRCard({ adr, delay = 0 }) {
-  const [open, setOpen] = useState(false);
+function ADRCard({ adr, delay = 0, defaultOpen = false }) {
+  const [open, setOpen] = useState(defaultOpen);
+
+  // Status maps from ADR ids/sources to a canonical state. Most ADRs are
+  // proposed pending human review — only post-approval would they become
+  // ACCEPTED. We surface this honestly: if the pipeline is past the review
+  // gate (validation_passed=true), they're effectively accepted; otherwise
+  // proposed. For now we render PROPOSED as the conservative default.
+  const status = adr.status || "PROPOSED";
+  const statusColor = status === "ACCEPTED" ? T.green
+                    : status === "DEPRECATED" ? T.t4
+                    : status === "REJECTED" ? T.red
+                    : T.amber;  // PROPOSED
+
+  // The "Rationale" field is what IETF calls "Decision" in the ADR template.
+  // We keep the internal name (rationale) but display it as "Decision".
+  const sections = [
+    { key: "context",      label: "Context",      content: adr.context },
+    { key: "rationale",    label: "Decision",     content: adr.rationale },
+    { key: "consequences", label: "Consequences", content: adr.consequences },
+  ].filter(s => s.content);
+
+  // Preview shows the first ~120 chars of rationale (the "Decision") so a
+  // collapsed ADR still tells the user what was decided, not just that
+  // SOMETHING was decided.
+  const preview = adr.rationale ? (
+    adr.rationale.length > 130 ? adr.rationale.slice(0, 130) + "…" : adr.rationale
+  ) : null;
+
   return (
     <div style={{
       border: `1px solid ${open ? T.cyanBorder : T.border0}`,
@@ -1200,31 +1227,106 @@ function ADRCard({ adr, delay = 0 }) {
       marginBottom: 8,
       animation: `fadeUp 0.3s ease-out ${delay}s both`,
       transition: "border-color 0.2s",
+      background: open ? `${T.cyan}05` : "transparent",
     }}>
+      {/* HEADER — clickable, always visible */}
       <div onClick={() => setOpen(!open)} style={{
         padding: "12px 16px", cursor: "pointer",
-        display: "flex", justifyContent: "space-between", alignItems: "center",
         background: open ? `${T.bg3}80` : T.bg2,
         transition: "background 0.2s",
       }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <Badge color={T.cyan} style={{ fontSize: 10 }}>{adr.id}</Badge>
-          <span style={{ fontSize: 12, fontWeight: 500, color: T.t1 }}>{adr.decision || adr.title}</span>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flex: 1, minWidth: 0 }}>
+            <Badge color={T.cyan} style={{ fontSize: 10, flexShrink: 0 }}>{adr.id}</Badge>
+            <span style={{ fontSize: 12, fontWeight: 500, color: T.t1, flex: 1, minWidth: 0 }}>
+              {adr.decision || adr.title}
+            </span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+            <span style={{
+              fontSize: 9, fontWeight: 700, fontFamily: T.fontMono,
+              color: statusColor,
+              padding: "2px 7px", borderRadius: 3,
+              background: `${statusColor}15`,
+              border: `1px solid ${statusColor}30`,
+              textTransform: "uppercase", letterSpacing: "0.06em",
+            }}>{status}</span>
+            <span style={{
+              fontSize: 10, color: T.t3,
+              transform: open ? "rotate(180deg)" : "rotate(0deg)",
+              transition: "transform 0.2s",
+            }}>▼</span>
+          </div>
         </div>
-        <span style={{
-          fontSize: 10, color: T.t3,
-          transform: open ? "rotate(180deg)" : "rotate(0deg)",
-          transition: "transform 0.2s",
-        }}>▼</span>
+        {/* Preview line — visible only when collapsed */}
+        {!open && preview && (
+          <div style={{
+            fontSize: 11, color: T.t3, marginTop: 6, marginLeft: 8,
+            lineHeight: 1.5, fontStyle: "italic",
+            display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical",
+            overflow: "hidden",
+          }}>
+            {preview}
+          </div>
+        )}
       </div>
+
+      {/* EXPANDED CONTENT — IETF / AWS Well-Architected style */}
       {open && (
-        <div style={{ padding: "14px 16px", fontSize: 12, color: T.t2, lineHeight: 1.7, borderTop: `1px solid ${T.border0}`, animation: "fadeIn 0.2s" }}>
-          {[["Context", adr.context], ["Rationale", adr.rationale], ["Consequences", adr.consequences]].map(([k, v]) => v && (
-            <div key={k} style={{ marginBottom: 10 }}>
-              <span style={{ fontSize: 10, fontWeight: 600, color: T.t3, textTransform: "uppercase", letterSpacing: "0.06em" }}>{k}</span>
-              <p style={{ margin: "4px 0 0", color: T.t2 }}>{v}</p>
+        <div style={{
+          padding: "16px 20px",
+          borderTop: `1px solid ${T.border0}`,
+          animation: "fadeIn 0.2s",
+          background: T.bg1,
+        }}>
+          {/* Top metadata strip */}
+          <div style={{
+            display: "flex", gap: 16,
+            marginBottom: 16,
+            paddingBottom: 12,
+            borderBottom: `1px dashed ${T.border0}`,
+            fontSize: 10, fontFamily: T.fontMono, color: T.t3,
+          }}>
+            <div>
+              <span style={{ color: T.t4, textTransform: "uppercase", letterSpacing: "0.06em" }}>Status: </span>
+              <span style={{ color: statusColor, fontWeight: 600 }}>{status}</span>
+            </div>
+            <div>
+              <span style={{ color: T.t4, textTransform: "uppercase", letterSpacing: "0.06em" }}>ID: </span>
+              <span style={{ color: T.t2 }}>{adr.id}</span>
+            </div>
+          </div>
+
+          {/* Sections */}
+          {sections.map((s, i) => (
+            <div key={s.key} style={{ marginBottom: i === sections.length - 1 ? 0 : 14 }}>
+              <div style={{
+                fontSize: 10, fontWeight: 700, color: T.cyan,
+                fontFamily: T.fontMono,
+                textTransform: "uppercase", letterSpacing: "0.08em",
+                marginBottom: 6,
+                display: "flex", alignItems: "center", gap: 8,
+              }}>
+                <span style={{
+                  width: 18, height: 1, background: T.cyanBorder,
+                }} />
+                {s.label}
+              </div>
+              <p style={{
+                margin: 0, fontSize: 12.5, color: T.t1,
+                lineHeight: 1.65,
+              }}>
+                {s.content}
+              </p>
             </div>
           ))}
+
+          {/* If no sections at all */}
+          {sections.length === 0 && (
+            <div style={{ fontSize: 11, color: T.t3, fontStyle: "italic" }}>
+              No detailed context, decision, or consequences recorded for this ADR.
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -2455,7 +2557,7 @@ export default function App() {
                 {result.adrs?.length > 0 && <Badge color={T.cyan}>{result.adrs.length} decisions</Badge>}
               </div>
               {result.adrs?.length
-                ? result.adrs.map((adr, i) => <ADRCard key={i} adr={adr} delay={0.05 * i} />)
+                ? result.adrs.map((adr, i) => <ADRCard key={i} adr={adr} delay={0.05 * i} defaultOpen={i === 0} />)
                 : <EmptyState icon="◈" message="No architecture decisions recorded." />}
             </div>
           )}
