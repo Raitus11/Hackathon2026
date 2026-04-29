@@ -1769,6 +1769,45 @@ def optimizer_agent(state: dict) -> dict:
     channel_edges = [(u, v, d) for u, v, d in G.edges(data=True) if d.get("rel") == "channel"]
     initial_channels = len(channel_edges)
 
+    # ── NEW: solver-driven optimization (feature-flagged) ────────────────
+    # When INTELLIAI_USE_SOLVER=1 in the environment, route through the
+    # directed Steiner solver (production-scale) or CP-SAT solver (small
+    # benchmarks) via the strategy dispatcher in optimizer_hook.
+    # When the flag is off, this block is a no-op and the existing
+    # MST-based Phase 1/2/3 code below runs unchanged.
+    # See backend/solver/optimizer_hook.py and backend/solver/steiner_solver.py
+    # for math + cites. See PATCH_agents_py.md for the design rationale.
+    try:
+        from backend.solver.optimizer_hook import run_solver_phase, USE_SOLVER
+    except ImportError as _e:
+        # Solver modules not installed — silently fall through to MST.
+        # This keeps the legacy demo working in environments where the
+        # solver hasn't been deployed.
+        logger.debug(f"OPTIMIZER: solver hook unavailable ({_e}); using legacy MST")
+        USE_SOLVER = False
+
+    if USE_SOLVER:
+        try:
+            result = run_solver_phase(G, state)
+        except Exception as _e:
+            logger.exception(f"OPTIMIZER: solver invocation raised; falling through to MST: {_e}")
+            result = None
+
+        if result is not None:
+            messages.append({"agent": "OPTIMIZER", "msg": result["message"]})
+            return {
+                "optimised_graph":    result["graph"],
+                "target_metrics":     result["target_metrics"],
+                "target_subgraphs":   result["target_subgraphs"],
+                "target_communities": result["target_communities"],
+                "target_centrality":  result["target_centrality"],
+                "target_entropy":     result["target_entropy"],
+                "messages":           messages,
+                "solver_run":         result["solver_run"],
+            }
+        # Solver returned None → log and fall through to legacy MST path
+        logger.warning("OPTIMIZER: solver returned None; using legacy MST path")
+
     # ── Build app ownership + direction maps ──────────────────────────────
     app_qm_map = {}
     for app in app_nodes:
@@ -2504,6 +2543,43 @@ def tester_agent(state: dict) -> dict:
                     "severity": "CRITICAL" if has_flows else "WARNING",
                 })
 
+    # ── V-009: Required-pair reachability ─────────────────────────────────
+    # For every (producer_qm, consumer_qm) pair derivable from raw_data,
+    # verify there is a directed channel path src → tgt in G. The legacy
+    # MST-based optimizer can silently drop channels that break specific
+    # directed pairs while leaving the QM graph "connected" in the
+    # undirected sense. This check exposes that. The Steiner solver
+    # guarantees this invariant by construction.
+    try:
+        from backend.solver.reachability_validator import (
+            find_unreachable_pairs,
+            reachability_summary,
+        )
+        unreachable = find_unreachable_pairs(G, state.get("raw_data", {}), max_report=10)
+        rsum = reachability_summary(G, state.get("raw_data", {}))
+        if unreachable:
+            for (s, t, reason) in unreachable:
+                violations.append({
+                    "rule": "REQUIRED_PAIR_REACHABILITY",
+                    "entity": f"{s}→{t}",
+                    "detail": (
+                        f"Required directed pair {s}→{t} has no channel path in "
+                        f"target topology ({reason}). "
+                        f"Total unreachable pairs: {rsum['n_unreachable']}/{rsum['n_required_pairs']} "
+                        f"(reachability {rsum['reachability_ratio']:.1%})."
+                    ),
+                    "severity": "CRITICAL",
+                })
+        logger.info(
+            f"TESTER V-009: required-pair reachability "
+            f"{rsum['n_reachable']}/{rsum['n_required_pairs']} "
+            f"({rsum['reachability_ratio']:.1%})"
+        )
+    except ImportError as _e:
+        logger.debug(f"TESTER V-009: reachability validator unavailable ({_e}); skipping")
+    except Exception as _e:
+        logger.warning(f"TESTER V-009: reachability check failed ({_e}); skipping")
+
     passed = not any(v["severity"] == "CRITICAL" for v in violations)
 
     # ── LLM Compliance Auditor (Role 8) ──────────────────────────────────
@@ -2551,6 +2627,18 @@ def tester_agent(state: dict) -> dict:
             messages.append({"agent": "TESTER", "msg": "AI Compliance Auditor: LLM unavailable — skipped"})
     except Exception as e:
         logger.warning(f"TESTER-LLM: Compliance audit failed ({e})")
+
+    # ── Diagnostic: log the first few CRITICAL violations on FAIL ─────────
+    # This is invaluable when debugging architect↔tester retry loops.
+    if not passed:
+        critical_violations = [v for v in violations if v["severity"] == "CRITICAL"]
+        logger.error(
+            f"TESTER FAIL: {len(critical_violations)} critical violations. "
+            f"First 5: " + " | ".join(
+                f"{v['rule']}({v['entity']}): {v['detail'][:120]}"
+                for v in critical_violations[:5]
+            )
+        )
 
     msg = (
         f"Tester: {'PASS' if passed else 'FAIL'} — "
