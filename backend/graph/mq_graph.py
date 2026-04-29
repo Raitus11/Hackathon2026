@@ -149,35 +149,62 @@ def compute_complexity(G: nx.DiGraph, baseline_overrides: dict = None) -> dict:
         coupling_values.append(len(qm_connections))
     CI = float(np.mean(coupling_values)) if coupling_values else 0.0
 
-    # RD: Routing Depth — max shortest path between any two QMs
-    # For disconnected graphs: max diameter across all components +
-    # fragmentation penalty (each extra component adds routing complexity
-    # because messages between components are impossible without bridging).
+    # RD: Routing Depth — max shortest *directed* path between any two QMs,
+    # plus a fragmentation penalty for unreachable directed pairs.
+    #
+    # Why directed: an MQ SENDER channel A→B carries messages from A to B only.
+    # There is no automatic reverse path. Computing RD on an undirected
+    # projection gives the same number for "A↔B, B↔C" as for "A→B, B→C", but
+    # operationally these topologies are entirely different: in the second,
+    # C cannot send to A at all. The metric must reflect that.
+    #
+    # Formulation (cite: Newman 2010, "Networks: An Introduction" §6.10 for
+    # directed diameter; Latora & Marchiori 2001, "Efficient behavior of
+    # small-world networks" PRL 87:198701 for the fragmentation pattern):
+    #
+    #   D_max = max{ d(u,v) : d(u,v) < ∞ }   (directed diameter, reachable part)
+    #   U     = | { (u,v) : u≠v, d(u,v) = ∞ } |
+    #   P     = N*(N-1)
+    #   RD    = D_max + λ * (U / P) * N
+    #
+    # We use λ=1 so a fully-fragmented graph contributes ~N to RD, dominating
+    # the diameter term (which is typically O(log N) to O(√N)). This matches
+    # operational reality: unreachability is worse than a long path.
     qm_subgraph = G.subgraph(qm_nodes)
+    # Defaults for the case where computation fails or N <= 1
+    D_max = 0.0
+    unreachable_pairs = 0
+    unreachable_ratio = 0.0
     try:
-        G_undir = qm_subgraph.to_undirected()
-        if len(qm_nodes) <= 1:
+        N = len(qm_nodes)
+        if N <= 1:
             RD = 0.0
-        elif nx.is_connected(G_undir):
-            path_lengths = dict(nx.all_pairs_shortest_path_length(G_undir))
-            all_lengths = [l for d in path_lengths.values() for l in d.values() if l > 0]
-            RD = float(max(all_lengths)) if all_lengths else 1.0
         else:
-            # Disconnected: max diameter across components + fragmentation penalty
-            components = list(nx.connected_components(G_undir))
-            max_diameter = 0.0
-            for comp in components:
-                if len(comp) < 2:
-                    continue
-                sub = G_undir.subgraph(comp)
-                try:
-                    diam = nx.diameter(sub)
-                    max_diameter = max(max_diameter, float(diam))
-                except Exception:
-                    max_diameter = max(max_diameter, 1.0)
-            # Penalty: each disconnected component beyond 1 adds 1.0
-            fragmentation_penalty = float(len(components) - 1)
-            RD = max_diameter + fragmentation_penalty
+            # Use the directed graph directly. all_pairs_shortest_path_length
+            # on a DiGraph returns only reachable pairs; missing entries are
+            # implicitly ∞.
+            path_lengths = dict(nx.all_pairs_shortest_path_length(qm_subgraph))
+
+            reachable_distances = []
+            reachable_pairs = 0
+            for u in qm_nodes:
+                dists_from_u = path_lengths.get(u, {})
+                for v in qm_nodes:
+                    if u == v:
+                        continue
+                    if v in dists_from_u:
+                        reachable_pairs += 1
+                        reachable_distances.append(dists_from_u[v])
+
+            total_pairs = N * (N - 1)
+            unreachable_pairs = total_pairs - reachable_pairs
+            unreachable_ratio = unreachable_pairs / total_pairs if total_pairs > 0 else 0.0
+
+            D_max = float(max(reachable_distances)) if reachable_distances else 0.0
+            FRAGMENTATION_LAMBDA = 1.0
+            fragmentation_penalty = FRAGMENTATION_LAMBDA * unreachable_ratio * N
+
+            RD = D_max + fragmentation_penalty
     except Exception:
         RD = 1.0
 
@@ -290,6 +317,18 @@ def compute_complexity(G: nx.DiGraph, baseline_overrides: dict = None) -> dict:
             "fo_weighted": round(0.15 * norm(FO, fo_worst), 1),
             "oo_weighted": round(0.05 * norm(OO, oo_worst), 1),
             "cs_weighted": round(0.10 * norm(CS, cs_worst), 1),
+        },
+        # ── RD diagnostics: surface the math behind the routing-depth score ──
+        # directed_diameter = longest shortest-path among reachable QM pairs
+        # unreachable_pairs = count of (u,v) directed pairs with no path
+        # unreachable_ratio = unreachable_pairs / N*(N-1)  ∈ [0, 1]
+        # fragmentation_penalty = unreachable_ratio * N    (the term added to D_max)
+        # See compute_complexity() RD block; cite Newman 2010 §6.10.
+        "rd_diagnostics": {
+            "directed_diameter": round(D_max, 1),
+            "unreachable_pairs": int(unreachable_pairs),
+            "unreachable_ratio": round(unreachable_ratio, 4),
+            "fragmentation_penalty": round(unreachable_ratio * len(qm_nodes), 1),
         },
     }
 
