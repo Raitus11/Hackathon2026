@@ -21,6 +21,10 @@ import uuid
 import shutil
 import logging
 from pathlib import Path
+
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -31,6 +35,8 @@ from backend.orchestration.workflow import intelli_ai_workflow, intelli_ai_revis
 from backend.agents.agents import provisioner_agent, migration_planner_agent, doc_expert_agent
 from backend.graph.mq_graph import graph_to_dict, sanitise
 from backend.llm.llm_client import call_llm_chat
+
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
