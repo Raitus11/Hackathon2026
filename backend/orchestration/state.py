@@ -60,10 +60,15 @@ class IntelliAIState(TypedDict):
     target_communities: Optional[dict] # Louvain community detection results
     target_centrality: Optional[dict]  # betweenness + degree centrality
     target_entropy: Optional[dict]     # Shannon entropy + density + clustering
+    solver_run: Optional[dict]         # Steiner/CP-SAT telemetry: method, channels, gap, citations, integrity
+                                       # See backend/solver/optimizer_hook.py for the full schema.
 
     # ── Tester output ──────────────────────────────────
     validation_passed: bool
     constraint_violations: Optional[list]
+    compliance_audit: Optional[dict]   # LLM-driven compliance auditor output: score, findings,
+                                       # ha_assessment, security_assessment, summary.
+                                       # See backend/llm/prompts.py COMPLIANCE_AUDITOR_SYSTEM for schema.
 
     # ── Human review gate ──────────────────────────────
     awaiting_human_review: bool        # True when pipeline is paused

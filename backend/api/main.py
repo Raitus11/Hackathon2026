@@ -21,10 +21,6 @@ import uuid
 import shutil
 import logging
 from pathlib import Path
-
-from dotenv import load_dotenv
-load_dotenv()
-
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -35,8 +31,6 @@ from backend.orchestration.workflow import intelli_ai_workflow, intelli_ai_revis
 from backend.agents.agents import provisioner_agent, migration_planner_agent, doc_expert_agent
 from backend.graph.mq_graph import graph_to_dict, sanitise
 from backend.llm.llm_client import call_llm_chat
-
-
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -106,6 +100,11 @@ def _build_response(session_id: str, result: dict) -> dict:
         "agent_trace":           result.get("messages", []),
         "target_csvs":           target_csvs,
         "data_quality":          result.get("data_quality_report", {}),
+        # New telemetry surfaced for Solver and Compliance UI tabs.
+        # solver_run: full telemetry from Steiner/CP-SAT (channel cascade, gap, citations).
+        # compliance_audit: LLM auditor output (score, findings, HA/security assessments).
+        "solver_run":            result.get("solver_run"),
+        "compliance_audit":      result.get("compliance_audit"),
         "awaiting_human_review": (
             result.get("awaiting_human_review", False)
             and not result.get("human_approved")
@@ -269,6 +268,9 @@ def get_pending_review(session_id: str):
         "as_is_communities":    result.get("as_is_communities", {}),
         "target_communities":   result.get("target_communities", {}),
         "topology_diff":        result.get("topology_diff", {}),
+        # Solver and Compliance telemetry — required by Solver and Compliance UI tabs.
+        "solver_run":           result.get("solver_run"),
+        "compliance_audit":     result.get("compliance_audit"),
     })
 
 
