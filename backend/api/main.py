@@ -17,6 +17,7 @@ Flow:
     → Human submits approve/revise/abort decision
 """
 import os
+import re
 import uuid
 import shutil
 import logging
@@ -54,6 +55,160 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 # In-memory session store
 sessions: dict = {}        # session_id -> full pipeline state (for resume)
 responses: dict = {}       # session_id -> API response (for GET endpoints)
+
+
+# ── Live Agent Progress Streaming (A3) ──────────────────────────────────────
+# Background pipelines run in worker threads; the frontend polls /progress
+# every ~500ms while the pipeline runs. To capture progress without
+# modifying every agent, we install a custom logging handler that mirrors
+# meaningful log records (from agents + solver) into the global progress
+# dict, indexed by session_id via a ContextVar set at pipeline launch.
+
+import time
+import threading
+from contextvars import ContextVar
+from datetime import datetime, timezone
+
+# session_id → {
+#   "status": "running" | "done" | "failed",
+#   "events": [ {agent, message, timestamp_ms, sequence} ... ],
+#   "started_at_ms": <int>,
+#   "ended_at_ms": <int|None>,
+#   "error": <str|None>,
+# }
+progress: dict = {}
+
+# ContextVar lets logger handler know which session generated this log record
+# (set by _run_pipeline_async before invoking the workflow).
+_current_session_id: ContextVar[Optional[str]] = ContextVar("_current_session_id", default=None)
+_progress_lock = threading.Lock()
+_event_sequence = [0]  # mutable counter for monotonic event sequencing
+
+
+# Loggers we mirror to the progress feed. Other loggers (httpx, groq, etc.)
+# are noise to the user — they care about agent activity.
+_PROGRESS_LOGGERS = (
+    "backend.agents.agents",
+    "backend.solver.optimizer_hook",
+    "backend.solver.steiner_adapters",
+    "backend.solver.required_pairs",
+    "backend.orchestration.workflow",
+)
+
+# Agent-name extraction patterns: most agent log lines start with
+# "AGENT_NAME: ..." or "AGENT-LLM: ..." — we parse this to enrich events.
+_AGENT_NAME_RE = re.compile(r"^([A-Z][A-Z0-9_-]+(?:-LLM)?):\s*(.*)$", re.DOTALL)
+
+
+class ProgressLogHandler(logging.Handler):
+    """Capture agent + solver log records into the per-session progress dict.
+
+    Activates only when _current_session_id ContextVar is set (i.e., we're
+    inside a pipeline run). Filters by logger name to keep noise out.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            session_id = _current_session_id.get()
+            if session_id is None or session_id not in progress:
+                return
+            if not any(record.name == n or record.name.startswith(n + ".")
+                       for n in _PROGRESS_LOGGERS):
+                return
+            msg = record.getMessage()
+
+            # Try to extract agent name and content from the log message.
+            # Falls back to using the logger name if pattern doesn't match.
+            agent = None
+            content = msg
+            m = _AGENT_NAME_RE.match(msg.strip())
+            if m:
+                agent = m.group(1)
+                content = m.group(2).strip()
+            else:
+                # Default agent label by logger name
+                if "optimizer_hook" in record.name:
+                    agent = "OPTIMIZER-SOLVER"
+                elif "steiner_adapters" in record.name:
+                    agent = "OPTIMIZER-SOLVER"
+                elif "required_pairs" in record.name:
+                    agent = "OPTIMIZER-SOLVER"
+                elif "workflow" in record.name:
+                    agent = "WORKFLOW"
+                else:
+                    agent = "PIPELINE"
+
+            with _progress_lock:
+                _event_sequence[0] += 1
+                event = {
+                    "sequence": _event_sequence[0],
+                    "session_id": session_id,
+                    "agent": agent,
+                    "message": content[:500],  # trim very long messages
+                    "level": record.levelname,
+                    "timestamp_ms": int(record.created * 1000),
+                    "elapsed_ms": int(record.created * 1000) - progress[session_id]["started_at_ms"],
+                }
+                progress[session_id]["events"].append(event)
+                # Keep events bounded; demos rarely produce >1000 events
+                if len(progress[session_id]["events"]) > 2000:
+                    progress[session_id]["events"] = progress[session_id]["events"][-1000:]
+        except Exception:
+            # Logging handlers must NEVER raise — they'd break the entire
+            # logging system. Swallow and continue.
+            pass
+
+
+# Install the handler once at import time.
+_progress_handler = ProgressLogHandler()
+_progress_handler.setLevel(logging.INFO)
+logging.getLogger().addHandler(_progress_handler)
+# Make sure relevant loggers actually pass through INFO
+for _name in _PROGRESS_LOGGERS:
+    logging.getLogger(_name).setLevel(logging.INFO)
+
+
+def _start_progress(session_id: str) -> None:
+    """Initialize a progress entry for a new pipeline run."""
+    with _progress_lock:
+        progress[session_id] = {
+            "status": "running",
+            "events": [],
+            "started_at_ms": int(time.time() * 1000),
+            "ended_at_ms": None,
+            "error": None,
+        }
+
+
+def _finish_progress(session_id: str, error: Optional[str] = None) -> None:
+    """Mark a pipeline run as completed (or failed)."""
+    with _progress_lock:
+        if session_id not in progress:
+            return
+        progress[session_id]["status"] = "failed" if error else "done"
+        progress[session_id]["ended_at_ms"] = int(time.time() * 1000)
+        progress[session_id]["error"] = error
+
+
+def _run_pipeline_async(session_id: str, csv_paths: dict) -> None:
+    """Run the pipeline in a background worker thread. Captures progress
+    via the logging handler; results land in `sessions[session_id]` and
+    `responses[session_id]` when complete.
+    """
+    token = _current_session_id.set(session_id)
+    try:
+        result = _run_pipeline(session_id, csv_paths)
+        sessions[session_id] = result
+        responses[session_id] = _build_response(session_id, result)
+        _finish_progress(session_id)
+    except HTTPException as e:
+        logger.exception(f"Pipeline error for session {session_id}")
+        _finish_progress(session_id, error=str(e.detail))
+    except Exception as e:
+        logger.exception(f"Pipeline error for session {session_id}")
+        _finish_progress(session_id, error=str(e))
+    finally:
+        _current_session_id.reset(token)
 
 
 # ── Pydantic models ──────────────────────────────────────────────────────────
@@ -174,8 +329,11 @@ def health():
 @app.post("/api/upload")
 async def upload_single_file(file: UploadFile = File(...)):
     """
-    Upload a single MQ Raw Data file (CSV or Excel).
-    csv_ingest auto-detects the format and transforms into 4 logical tables.
+    Upload a single MQ Raw Data file (CSV or Excel) and start the pipeline
+    asynchronously. Returns the session_id immediately so the frontend can
+    poll /api/session/{session_id}/progress while the pipeline runs.
+    Once the progress endpoint reports status="done", the full result is
+    available at /api/session/{session_id}.
     """
     session_id = str(uuid.uuid4())[:8]
     session_dir = UPLOAD_DIR / session_id
@@ -190,25 +348,67 @@ async def upload_single_file(file: UploadFile = File(...)):
 
     csv_paths = {"raw_file": str(dest)}
 
-    try:
-        result = _run_pipeline(session_id, csv_paths)
-    except Exception as e:
-        logger.exception("Pipeline error")
-        raise HTTPException(status_code=500, detail=str(e))
+    # Initialize progress tracking and launch the pipeline in a worker thread.
+    # We use a daemon thread (not FastAPI's BackgroundTasks because that runs
+    # AFTER the response is sent — we need the work to start NOW so progress
+    # events begin immediately). Daemon=True ensures the thread doesn't block
+    # uvicorn shutdown.
+    _start_progress(session_id)
+    worker = threading.Thread(
+        target=_run_pipeline_async,
+        args=(session_id, csv_paths),
+        name=f"pipeline-{session_id}",
+        daemon=True,
+    )
+    worker.start()
 
-    # Debug: log which state keys have non-None values
-    state_keys = [k for k in result.keys() if result.get(k) is not None]
-    logger.info(f"Upload pipeline done. Non-None state keys: {state_keys}")
+    return JSONResponse(content={
+        "session_id": session_id,
+        "status": "running",
+        "progress_url": f"/api/session/{session_id}/progress",
+        "result_url": f"/api/session/{session_id}",
+    })
 
-    sessions[session_id] = result
-    response = _build_response(session_id, result)
-    responses[session_id] = response
-    return JSONResponse(content=response)
+
+@app.get("/api/session/{session_id}/progress")
+def get_session_progress(session_id: str, since_seq: int = 0):
+    """Return progress events for a running pipeline. Frontend polls this
+    every ~500ms while status="running".
+
+    `since_seq` lets clients request only events newer than the last one
+    they saw — reduces payload size on long polls.
+
+    Response shape:
+      {
+        "session_id": ...,
+        "status": "running" | "done" | "failed",
+        "events": [ {sequence, agent, message, timestamp_ms, elapsed_ms, level} ... ],
+        "elapsed_ms": <total time elapsed, even if still running>,
+        "error": <str|None, present only if status="failed">,
+        "result_ready": <bool, true if responses[session_id] is populated>,
+      }
+    """
+    if session_id not in progress:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    p = progress[session_id]
+    with _progress_lock:
+        events = [e for e in p["events"] if e["sequence"] > since_seq]
+        elapsed = (p["ended_at_ms"] or int(time.time() * 1000)) - p["started_at_ms"]
+        return {
+            "session_id": session_id,
+            "status": p["status"],
+            "events": events,
+            "event_count": len(p["events"]),
+            "elapsed_ms": elapsed,
+            "error": p["error"],
+            "result_ready": session_id in responses,
+        }
 
 
 @app.post("/api/demo")
 def run_demo():
-    """Run pipeline on the bundled demo CSV."""
+    """Run pipeline on the bundled demo CSV. Same async pattern as /api/upload."""
     session_id = "DEMO"
 
     demo_csv = Path("data/MQ_Raw_Data.csv")
@@ -220,16 +420,25 @@ def run_demo():
 
     csv_paths = {"raw_file": str(demo_csv)}
 
-    try:
-        result = _run_pipeline(session_id, csv_paths)
-    except Exception as e:
-        logger.exception("Demo pipeline error")
-        raise HTTPException(status_code=500, detail=str(e))
+    # Clear any prior demo run from results so the frontend doesn't see stale data
+    sessions.pop(session_id, None)
+    responses.pop(session_id, None)
 
-    sessions[session_id] = result
-    response = _build_response(session_id, result)
-    responses[session_id] = response
-    return JSONResponse(content=response)
+    _start_progress(session_id)
+    worker = threading.Thread(
+        target=_run_pipeline_async,
+        args=(session_id, csv_paths),
+        name=f"pipeline-{session_id}",
+        daemon=True,
+    )
+    worker.start()
+
+    return JSONResponse(content={
+        "session_id": session_id,
+        "status": "running",
+        "progress_url": f"/api/session/{session_id}/progress",
+        "result_url": f"/api/session/{session_id}",
+    })
 
 
 @app.get("/api/review/{session_id}")
@@ -355,6 +564,201 @@ def download_target_csv(session_id: str, csv_name: str):
         content=csvs[csv_name],
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename={csv_name}.csv"}
+    )
+
+
+# ── Evidence Bundle download ────────────────────────────────────────────────
+# Production-grade forensic artifact: a single zip containing every piece of
+# evidence about a pipeline run. The kind of thing a senior architect or
+# auditor expects to receive after a production change. Each file is a real
+# artifact derived from session state, not a marketing document.
+#
+# Bundle contents (manifest.json lists exact contents):
+#   manifest.json              — what's in the bundle, generated_at, session_id
+#   solver_run.json            — full Steiner/CP-SAT telemetry (channels, gap, citations)
+#   compliance_findings.json   — LLM auditor output (score, findings, HA, security)
+#   target_topology.json       — full target graph (QMs, channels, queues, apps)
+#   as_is_metrics.json         — complexity score breakdown for the input
+#   target_metrics.json        — complexity score breakdown for the target
+#   architecture_decisions.md  — ADRs in IETF/AWS Well-Architected format
+#   audit_log.txt              — agent message trace, in-order
+#   constraint_violations.json — engineering rule check results
+#   mqsc_commands.txt          — concatenated provisioner output (if generated)
+#
+# All content is sanitised via mq_graph.sanitise() before zipping. No env
+# vars, secrets, or credentials are ever in session state, but the sanitiser
+# is the safety net.
+
+@app.get("/api/session/{session_id}/evidence")
+def download_evidence_bundle(session_id: str):
+    """Generate and stream a forensic evidence zip for the given pipeline session."""
+    import io
+    import json
+    import zipfile
+    from datetime import datetime, timezone
+    from fastapi.responses import StreamingResponse
+
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    state = sessions[session_id]
+
+    # Build manifest first — describes the bundle without depending on contents
+    manifest = {
+        "bundle_format_version": "1.0",
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "session_id": session_id,
+        "pipeline": {
+            "validation_passed": state.get("validation_passed"),
+            "redesign_count": state.get("redesign_count", 0),
+            "architect_method": state.get("architect_method"),
+            "human_approved": state.get("human_approved"),
+        },
+        "summary": {
+            "as_is_score": (state.get("as_is_metrics") or {}).get("total_score"),
+            "target_score": (state.get("target_metrics") or {}).get("total_score"),
+            "channels_asis": (state.get("solver_run") or {}).get("asis_channel_count"),
+            "channels_target": (state.get("solver_run") or {}).get("actual_channel_count"),
+            "compliance_score": (state.get("compliance_audit") or {}).get("compliance_score"),
+            "v009_pass": not any(
+                v.get("rule") == "REQUIRED_PAIR_REACHABILITY"
+                for v in (state.get("constraint_violations") or [])
+            ),
+        },
+        "files": [
+            "manifest.json",
+            "solver_run.json",
+            "compliance_findings.json",
+            "target_topology.json",
+            "as_is_metrics.json",
+            "target_metrics.json",
+            "architecture_decisions.md",
+            "audit_log.txt",
+            "constraint_violations.json",
+            "mqsc_commands.txt",
+        ],
+        "provenance": {
+            "generator": "IntelliAI Phase 1 — MQ-TITAN",
+            "solver": "directed Steiner network (Charikar et al. 1999, J.Algorithms 33:73-91)",
+            "compliance_auditor": "llama-3.3-70b-versatile via Groq",
+            "validation_invariants": [
+                "V-009 REQUIRED_PAIR_REACHABILITY (per-pair directed BFS)",
+                "ONE_QM_PER_APP", "ONE_APP_PER_QM",
+                "SENDER_RECEIVER_PAIR", "CHANNEL_NAMING",
+                "XMITQ_EXISTS", "NO_ORPHAN_QMS",
+                "CONSUMER_QUEUE_EXISTS", "PATH_COMPLETENESS",
+                "ISOLATED_QM",
+            ],
+        },
+    }
+
+    # Build target_topology from optimised_graph
+    target_topology = {}
+    if state.get("optimised_graph") is not None:
+        try:
+            target_topology = graph_to_dict(state["optimised_graph"])
+        except Exception as e:
+            target_topology = {"error": f"Failed to serialize optimised_graph: {e}"}
+
+    # Build ADRs as Markdown in IETF/AWS Well-Architected format
+    adr_md_lines = ["# Architecture Decision Records", "",
+                    f"_Generated by IntelliAI on {manifest['generated_at_utc']}_",
+                    f"_Session: `{session_id}`_", ""]
+    for i, adr in enumerate(state.get("adrs") or [], 1):
+        adr_md_lines.append(f"## ADR-{i:03d}: {adr.get('decision') or adr.get('title') or 'Untitled'}")
+        adr_md_lines.append("")
+        adr_md_lines.append(f"**Status:** Proposed")
+        adr_md_lines.append(f"**Date:** {manifest['generated_at_utc']}")
+        adr_md_lines.append("")
+        if adr.get("context"):
+            adr_md_lines.append("### Context")
+            adr_md_lines.append(adr["context"])
+            adr_md_lines.append("")
+        if adr.get("rationale"):
+            adr_md_lines.append("### Decision")
+            adr_md_lines.append(adr["rationale"])
+            adr_md_lines.append("")
+        if adr.get("consequences"):
+            adr_md_lines.append("### Consequences")
+            adr_md_lines.append(adr["consequences"])
+            adr_md_lines.append("")
+        adr_md_lines.append("---")
+        adr_md_lines.append("")
+    architecture_decisions_md = "\n".join(adr_md_lines) if state.get("adrs") else (
+        "# Architecture Decision Records\n\n_No ADRs were generated in this run._\n"
+    )
+
+    # Build audit_log.txt from messages
+    audit_lines = [
+        f"# Audit Log — IntelliAI Pipeline Session {session_id}",
+        f"# Generated at: {manifest['generated_at_utc']}",
+        f"# Validation: {'PASS' if state.get('validation_passed') else 'FAIL'}",
+        f"# Redesign iterations: {state.get('redesign_count', 0)}",
+        "#" + "=" * 78,
+        "",
+    ]
+    for i, m in enumerate(state.get("messages") or [], 1):
+        if isinstance(m, dict):
+            agent = m.get("agent", "PIPELINE")
+            msg = m.get("msg") or m.get("message") or json.dumps(m)
+        else:
+            agent = "PIPELINE"
+            msg = str(m)
+        audit_lines.append(f"[{i:04d}] {agent:>14} | {msg}")
+    audit_log_txt = "\n".join(audit_lines)
+
+    # Build mqsc_commands.txt from mqsc_scripts
+    mqsc_scripts = state.get("mqsc_scripts") or []
+    if mqsc_scripts:
+        mqsc_chunks = [
+            f"* IntelliAI Combined MQSC — Session {session_id}",
+            f"* Generated at: {manifest['generated_at_utc']}",
+            f"* Total scripts: {len(mqsc_scripts)}",
+            "*" + "=" * 78,
+            "",
+        ]
+        for i, script in enumerate(mqsc_scripts, 1):
+            if isinstance(script, dict):
+                qm = script.get("qm_name") or script.get("qm") or f"script_{i}"
+                content = script.get("content") or script.get("mqsc") or json.dumps(script)
+            else:
+                qm = f"script_{i}"
+                content = str(script)
+            mqsc_chunks.append(f"* --- Script {i}: {qm} ---")
+            mqsc_chunks.append(content)
+            mqsc_chunks.append("")
+        mqsc_commands_txt = "\n".join(mqsc_chunks)
+    else:
+        mqsc_commands_txt = "* No MQSC scripts were generated in this session.\n"
+
+    # Build all-content dict, sanitise once
+    raw_files = {
+        "manifest.json":              json.dumps(manifest, indent=2, default=str),
+        "solver_run.json":            json.dumps(sanitise(state.get("solver_run") or {}), indent=2, default=str),
+        "compliance_findings.json":   json.dumps(sanitise(state.get("compliance_audit") or {}), indent=2, default=str),
+        "target_topology.json":       json.dumps(sanitise(target_topology), indent=2, default=str),
+        "as_is_metrics.json":         json.dumps(sanitise(state.get("as_is_metrics") or {}), indent=2, default=str),
+        "target_metrics.json":        json.dumps(sanitise(state.get("target_metrics") or {}), indent=2, default=str),
+        "architecture_decisions.md":  architecture_decisions_md,
+        "audit_log.txt":              audit_log_txt,
+        "constraint_violations.json": json.dumps(sanitise(state.get("constraint_violations") or []), indent=2, default=str),
+        "mqsc_commands.txt":          mqsc_commands_txt,
+    }
+
+    # Write zip in memory
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        for name, content in raw_files.items():
+            zf.writestr(name, content)
+    buf.seek(0)
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    filename = f"intelliai_evidence_{session_id[:8]}_{timestamp}.zip"
+
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
 
 

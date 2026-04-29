@@ -1285,24 +1285,18 @@ function PhaseBadge({ phase }) {
    LOADING SPINNER
    ═══════════════════════════════════════════════════════════════════════════ */
 
-function LoadingOverlay() {
-  const [dots, setDots] = useState(0);
-  const [step, setStep] = useState(0);
-  const steps = [
-    "Validating session...",
-    "Transforming raw data...",
-    "Building topology graph...",
-    "Analysing complexity...",
-    "LLM designing target state...",
-    "Optimising channels...",
-    "Running constraint tests...",
-    "Awaiting review...",
-  ];
+function LoadingOverlay({ liveSession }) {
+  // If live session data is flowing, render the streaming agent feed.
+  // Otherwise fall back to the rotating-message spinner.
+  if (liveSession && liveSession.events && liveSession.events.length > 0) {
+    return <LiveAgentStream liveSession={liveSession} />;
+  }
 
+  // Initial state — pipeline started but no events yet (very first 500ms)
+  const [dots, setDots] = useState(0);
   useEffect(() => {
-    const i1 = setInterval(() => setDots(d => (d + 1) % 4), 400);
-    const i2 = setInterval(() => setStep(s => Math.min(s + 1, steps.length - 1)), 2800);
-    return () => { clearInterval(i1); clearInterval(i2); };
+    const i = setInterval(() => setDots(d => (d + 1) % 4), 400);
+    return () => clearInterval(i);
   }, []);
 
   return (
@@ -1315,13 +1309,229 @@ function LoadingOverlay() {
         border: `3px solid ${T.border1}`, borderTopColor: T.cyan,
         borderRadius: "50%", animation: "spin 0.8s linear infinite",
       }} />
-      <div style={{ fontSize: 12, color: T.cyan, fontFamily: T.fontMono, animation: "pulse 2s infinite" }}>
-        {steps[step]}
+      <div style={{ fontSize: 12, color: T.cyan, fontFamily: T.fontMono }}>
+        Initializing pipeline{".".repeat(dots)}
       </div>
-      <div style={{ marginTop: 20, maxWidth: 300, margin: "20px auto 0" }}>
-        <ProgressBar value={(step + 1) / steps.length * 100} color={T.cyan} height={3} />
+      <div style={{ fontSize: 11, color: T.t4, marginTop: 12 }}>
+        {liveSession ? `Session ${liveSession.sessionId} starting...` : "Connecting to backend..."}
       </div>
-      <div style={{ fontSize: 11, color: T.t4, marginTop: 12 }}>This may take 10-30 seconds</div>
+    </div>
+  );
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   LIVE AGENT STREAM — renders agent activity as it arrives during pipeline
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+// Color the agent name based on a stable hash of the agent name.
+// Same agent always gets the same color across runs.
+function _agentColor(name) {
+  const palette = [T.cyan, T.green, T.purple, T.amber];
+  let hash = 0;
+  for (const ch of name) hash = ((hash << 5) - hash) + ch.charCodeAt(0);
+  return palette[Math.abs(hash) % palette.length];
+}
+
+// Status icons for events. Currently we don't get distinct "started" vs "done"
+// events from the backend — every log line is a single point-in-time event —
+// so we render a uniform ◆ glyph and the LATEST event per agent gets a
+// pulsing animation to suggest "this just happened."
+function LiveAgentStream({ liveSession }) {
+  const containerRef = useRef(null);
+  const events = liveSession.events || [];
+  const elapsed = liveSession.elapsedMs || 0;
+  const elapsedSec = (elapsed / 1000).toFixed(1);
+  const isDone = liveSession.status === "done";
+  const isFailed = liveSession.status === "failed";
+
+  // Auto-scroll to bottom on new events
+  useEffect(() => {
+    if (containerRef.current) {
+      containerRef.current.scrollTop = containerRef.current.scrollHeight;
+    }
+  }, [events.length]);
+
+  // Group consecutive events from the same agent for a calmer feed.
+  // Same agent emitting 3 events in a row → one stack with 3 sub-lines.
+  const grouped = [];
+  for (const ev of events) {
+    const last = grouped[grouped.length - 1];
+    if (last && last.agent === ev.agent) {
+      last.events.push(ev);
+    } else {
+      grouped.push({ agent: ev.agent, events: [ev] });
+    }
+  }
+
+  // Latest event sequence (so we can pulse the most recent line)
+  const latestSeq = events.length > 0 ? events[events.length - 1].sequence : -1;
+
+  return (
+    <div style={{
+      padding: "32px 20px",
+      maxWidth: 920, margin: "0 auto",
+      animation: "fadeIn 0.3s ease-out",
+    }}>
+      {/* HEADER */}
+      <div style={{ marginBottom: 20, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div>
+          <div style={{ fontSize: 14, fontWeight: 600, fontFamily: T.fontDisplay, color: T.t1, marginBottom: 2 }}>
+            {isDone   ? "✓ Pipeline Complete"
+             : isFailed ? "✗ Pipeline Failed"
+             : "Pipeline Running"}
+          </div>
+          <div style={{ fontSize: 11, color: T.t3, fontFamily: T.fontMono }}>
+            session={liveSession.sessionId} · {events.length} events · {elapsedSec}s elapsed
+          </div>
+        </div>
+        {!isDone && !isFailed && (
+          <div style={{
+            display: "flex", alignItems: "center", gap: 8,
+            padding: "6px 14px", borderRadius: 20,
+            background: T.cyanBg, border: `1px solid ${T.cyanBorder}`,
+            fontSize: 11, color: T.cyan, fontFamily: T.fontMono, fontWeight: 600,
+          }}>
+            <span style={{
+              width: 8, height: 8, borderRadius: "50%",
+              background: T.cyan, animation: "pulse 1.4s ease-in-out infinite",
+            }} />
+            LIVE
+          </div>
+        )}
+        {isDone && (
+          <div style={{
+            padding: "6px 14px", borderRadius: 20,
+            background: T.greenBg, border: `1px solid ${T.greenBorder}`,
+            fontSize: 11, color: T.green, fontFamily: T.fontMono, fontWeight: 600,
+          }}>
+            ✓ DONE
+          </div>
+        )}
+        {isFailed && (
+          <div style={{
+            padding: "6px 14px", borderRadius: 20,
+            background: T.redBg, border: `1px solid ${T.redBorder}`,
+            fontSize: 11, color: T.red, fontFamily: T.fontMono, fontWeight: 600,
+          }}>
+            ✗ FAILED
+          </div>
+        )}
+      </div>
+
+      {/* TIMELINE */}
+      <div
+        ref={containerRef}
+        style={{
+          background: T.bg2,
+          border: `1px solid ${T.border0}`,
+          borderRadius: T.r2,
+          padding: "16px 20px",
+          maxHeight: 480, overflowY: "auto",
+          fontFamily: T.fontMono,
+          fontSize: 12,
+          position: "relative",
+        }}
+      >
+        {grouped.length === 0 ? (
+          <div style={{ color: T.t3, textAlign: "center", padding: 32 }}>
+            Waiting for first event...
+          </div>
+        ) : (
+          <div style={{ position: "relative" }}>
+            {/* Timeline rail */}
+            <div style={{
+              position: "absolute", left: 96, top: 8, bottom: 8,
+              width: 1, background: T.border0,
+            }} />
+            {grouped.map((group, gi) => {
+              const c = _agentColor(group.agent);
+              return (
+                <div key={gi} style={{
+                  display: "flex", gap: 12, padding: "6px 0",
+                  alignItems: "flex-start",
+                  animation: `slideIn 0.25s ease-out`,
+                }}>
+                  <span style={{
+                    fontSize: 10, fontWeight: 600,
+                    color: c, minWidth: 84, textAlign: "right",
+                    paddingTop: 4, flexShrink: 0,
+                    letterSpacing: "0.04em",
+                  }}>{group.agent}</span>
+                  <div style={{
+                    width: 9, height: 9, borderRadius: "50%",
+                    background: c, border: `2px solid ${T.bg2}`,
+                    marginTop: 6, flexShrink: 0, zIndex: 1,
+                    boxShadow: group.events.some(e => e.sequence === latestSeq && !isDone && !isFailed)
+                      ? `0 0 0 4px ${c}30` : "none",
+                  }} />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    {group.events.map((e, ei) => {
+                      const isLatest = e.sequence === latestSeq && !isDone && !isFailed;
+                      const isFinal = ei === group.events.length - 1;
+                      return (
+                        <div key={e.sequence} style={{
+                          fontSize: 12, color: T.t2, lineHeight: 1.5,
+                          padding: isFinal ? "4px 12px" : "2px 12px",
+                          marginBottom: isFinal ? 4 : 0,
+                          background: isLatest ? T.bg3 : "transparent",
+                          borderRadius: T.r1,
+                          transition: "background 0.2s",
+                          wordBreak: "break-word",
+                        }}>
+                          {e.message}
+                          <span style={{
+                            marginLeft: 8, fontSize: 10, color: T.t4,
+                          }}>+{(e.elapsed_ms / 1000).toFixed(2)}s</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+            {/* Active processing indicator */}
+            {!isDone && !isFailed && (
+              <div style={{
+                display: "flex", gap: 12, padding: "8px 0", marginLeft: 96,
+                color: T.t3, fontSize: 11,
+              }}>
+                <span style={{ marginLeft: 24, fontStyle: "italic" }}>
+                  <span style={{ display: "inline-block", animation: "pulse 1s infinite" }}>◆</span>
+                  {" "}working...
+                </span>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* FAILURE PANEL */}
+      {isFailed && liveSession.error && (
+        <div style={{
+          marginTop: 16, padding: "12px 16px",
+          background: T.redBg, border: `1px solid ${T.redBorder}`,
+          borderRadius: T.r1, color: T.red, fontSize: 12,
+          fontFamily: T.fontMono,
+        }}>
+          <div style={{ fontWeight: 600, marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.06em", fontSize: 10 }}>
+            Pipeline Error
+          </div>
+          {liveSession.error}
+        </div>
+      )}
+
+      {/* COMPLETION PANEL */}
+      {isDone && (
+        <div style={{
+          marginTop: 16, padding: "12px 16px",
+          background: T.greenBg, border: `1px solid ${T.greenBorder}`,
+          borderRadius: T.r1, color: T.green, fontSize: 12,
+          fontFamily: T.fontMono, textAlign: "center",
+        }}>
+          ✓ Completed in {elapsedSec}s — fetching results...
+        </div>
+      )}
     </div>
   );
 }
@@ -1623,6 +1833,14 @@ export default function App() {
   const [topoFilterApp, setTopoFilterApp] = useState("");
   const [topoViewMode, setTopoViewMode] = useState("split"); // "split" | "diff"
 
+  // ── Live Agent Activity Stream (A3) ────────────────────────────────────
+  // While a pipeline runs, we poll /api/session/{id}/progress every 500ms.
+  // Events stream in and are rendered by <LiveAgentStream> during loading.
+  const [liveSession, setLiveSession] = useState(null);
+  // liveSession shape:
+  //   { sessionId, events: [...], status: "running"|"done"|"failed",
+  //     elapsedMs, error, startedAt }
+
   // ── LOCAL approval tracking ──
   // The backend pipeline re-runs from start on resume (Known Limitation #1).
   // This can reset human_approved to null and awaiting_human_review to true.
@@ -1775,16 +1993,111 @@ export default function App() {
     }
   }
 
-  async function runDemo() {
-    setLoading(true); setError(null); setUserDecision(null);
+  // Helper that drives the full async pipeline lifecycle:
+  // POST → start polling → render events live → fetch result on done.
+  // Returns a Promise that resolves when the pipeline completes (or rejects).
+  async function runPipelineAsync(launchFn) {
+    setLoading(true);
+    setError(null);
+    setUserDecision(null);
+    setResult(null);
+
+    const launchResp = await launchFn();
+    if (!launchResp.ok) {
+      const errText = await launchResp.text();
+      setLoading(false);
+      throw new Error(errText || `HTTP ${launchResp.status}`);
+    }
+    const launchData = await launchResp.json();
+    const sessionId = launchData.session_id;
+    if (!sessionId) {
+      setLoading(false);
+      throw new Error("No session_id returned from launch endpoint");
+    }
+
+    setLiveSession({
+      sessionId,
+      events: [],
+      status: "running",
+      elapsedMs: 0,
+      error: null,
+      startedAt: Date.now(),
+    });
+
+    // Poll loop. Polls every 500ms; updates liveSession state as events arrive.
+    // Stops when status="done" or status="failed".
+    let lastSeq = 0;
+    let polling = true;
+    let finalStatus = null;
+
+    while (polling) {
+      await new Promise(r => setTimeout(r, 500));
+      try {
+        const r = await fetch(`${API}/api/session/${sessionId}/progress?since_seq=${lastSeq}`);
+        if (!r.ok) {
+          // 404 transient on very first poll if backend just spun up — retry
+          if (r.status === 404) continue;
+          throw new Error(`Progress poll HTTP ${r.status}`);
+        }
+        const p = await r.json();
+        if (p.events && p.events.length > 0) {
+          lastSeq = Math.max(lastSeq, ...p.events.map(e => e.sequence));
+          setLiveSession(prev => prev ? {
+            ...prev,
+            events: [...prev.events, ...p.events],
+            status: p.status,
+            elapsedMs: p.elapsed_ms,
+            error: p.error,
+          } : prev);
+        } else {
+          setLiveSession(prev => prev ? {
+            ...prev,
+            status: p.status,
+            elapsedMs: p.elapsed_ms,
+            error: p.error,
+          } : prev);
+        }
+        if (p.status === "done" || p.status === "failed") {
+          finalStatus = p.status;
+          polling = false;
+        }
+      } catch (e) {
+        // Transient network blip — wait and retry
+        console.warn("[IntelliAI] progress poll error:", e.message);
+      }
+    }
+
+    if (finalStatus === "failed") {
+      const errMsg = liveSession?.error || "Pipeline failed";
+      setError(errMsg);
+      setLoading(false);
+      return null;
+    }
+
+    // Pipeline done — fetch the full result
     try {
-      const res = await fetch(`${API}/api/demo`, { method: "POST" });
-      if (!res.ok) throw new Error(await res.text());
-      const data = await res.json();
-      console.log("[IntelliAI] Demo response keys:", Object.keys(data));
+      const r = await fetch(`${API}/api/session/${sessionId}`);
+      if (!r.ok) throw new Error(await r.text());
+      const data = await r.json();
+      console.log("[IntelliAI] Pipeline result keys:", Object.keys(data));
       setResult(data);
-      setTab("review"); // Always go to review first — that's the pipeline flow
-    } catch (e) { setError(e.message); } finally { setLoading(false); }
+      setTab("review");
+      return data;
+    } finally {
+      setLoading(false);
+      // Keep liveSession around briefly so the user can see "Done in N seconds"
+      // before it disappears. Comment this out to keep it visible always.
+      setTimeout(() => setLiveSession(null), 3000);
+    }
+  }
+
+  async function runDemo() {
+    try {
+      await runPipelineAsync(() => fetch(`${API}/api/demo`, { method: "POST" }));
+    } catch (e) {
+      setError(e.message);
+      setLoading(false);
+    }
   }
 
   async function handleUpload(e) {
@@ -1796,14 +2109,12 @@ export default function App() {
     }
     const form = new FormData();
     form.append("file", fileInput.files[0]);
-    setLoading(true); setError(null); setUserDecision(null);
     try {
-      const res = await fetch(`${API}/api/upload`, { method: "POST", body: form });
-      if (!res.ok) throw new Error(await res.text());
-      const data = await res.json();
-      setResult(data);
-      setTab("review");
-    } catch (e) { setError(e.message); } finally { setLoading(false); }
+      await runPipelineAsync(() => fetch(`${API}/api/upload`, { method: "POST", body: form }));
+    } catch (e) {
+      setError(e.message);
+      setLoading(false);
+    }
   }
 
   function downloadFile(content, filename, mime = "text/plain") {
@@ -1913,7 +2224,7 @@ export default function App() {
         )}
 
         {/* ── LOADING ── */}
-        {loading && tab !== "review" && <LoadingOverlay />}
+        {loading && tab !== "review" && <LoadingOverlay liveSession={liveSession} />}
 
         {/* ── CONTENT ── */}
         <div style={{ padding: "24px 0 60px" }}>
@@ -1927,7 +2238,7 @@ export default function App() {
           {tab === "review" && result && (
             <div style={{ animation: "fadeUp 0.4s ease-out" }}>
               {loading ? (
-                <LoadingOverlay />
+                <LoadingOverlay liveSession={liveSession} />
               ) : isAwaitingReview ? (
                 <ReviewChatPanel
                   result={result}
@@ -2517,13 +2828,41 @@ export default function App() {
           {/* ── SOLVER TAB — depth-visibility, the "no blackboxes" pitch ── */}
           {tab === "solver" && result && !loading && (
             <div style={{ animation: "fadeUp 0.4s ease-out", display: "flex", flexDirection: "column", gap: 16 }}>
-              <div>
-                <h2 style={{ fontSize: 16, fontWeight: 600, fontFamily: T.fontDisplay, color: T.t1, marginBottom: 4 }}>
-                  Solver Performance
-                </h2>
-                <p style={{ fontSize: 12, color: T.t3 }}>
-                  Optimization algorithm output, math under the hood, and provable guarantees. Every number on this page traces back to a paper you can read.
-                </p>
+              <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12 }}>
+                <div>
+                  <h2 style={{ fontSize: 16, fontWeight: 600, fontFamily: T.fontDisplay, color: T.t1, marginBottom: 4 }}>
+                    Solver Performance
+                  </h2>
+                  <p style={{ fontSize: 12, color: T.t3 }}>
+                    Optimization algorithm output, math under the hood, and provable guarantees. Every number on this page traces back to a paper you can read.
+                  </p>
+                </div>
+                {result.session_id && (
+                  <a
+                    href={`${API}/api/session/${result.session_id}/evidence`}
+                    style={{
+                      display: "inline-flex", alignItems: "center", gap: 8,
+                      padding: "10px 16px", borderRadius: T.r1,
+                      background: T.cyanBg, border: `1px solid ${T.cyanBorder}`,
+                      color: T.cyan, fontSize: 12, fontWeight: 600, fontFamily: T.fontMono,
+                      cursor: "pointer", textDecoration: "none",
+                      textTransform: "uppercase", letterSpacing: "0.06em",
+                      flexShrink: 0,
+                      transition: "all 0.15s",
+                    }}
+                    onMouseEnter={e => {
+                      e.currentTarget.style.background = T.cyan;
+                      e.currentTarget.style.color = T.bg0;
+                    }}
+                    onMouseLeave={e => {
+                      e.currentTarget.style.background = T.cyanBg;
+                      e.currentTarget.style.color = T.cyan;
+                    }}
+                  >
+                    <span style={{ fontSize: 14 }}>↓</span>
+                    Evidence Bundle (.zip)
+                  </a>
+                )}
               </div>
 
               {!result.solver_run ? (
@@ -2772,13 +3111,41 @@ export default function App() {
           {/* ── COMPLIANCE TAB — LLM auditor findings + V-009 reachability ── */}
           {tab === "compliance" && result && !loading && (
             <div style={{ animation: "fadeUp 0.4s ease-out", display: "flex", flexDirection: "column", gap: 16 }}>
-              <div>
-                <h2 style={{ fontSize: 16, fontWeight: 600, fontFamily: T.fontDisplay, color: T.t1, marginBottom: 4 }}>
-                  Compliance &amp; Validation
-                </h2>
-                <p style={{ fontSize: 12, color: T.t3 }}>
-                  LLM-driven compliance audit, formal-style invariant validation, and constraint enforcement results.
-                </p>
+              <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12 }}>
+                <div>
+                  <h2 style={{ fontSize: 16, fontWeight: 600, fontFamily: T.fontDisplay, color: T.t1, marginBottom: 4 }}>
+                    Compliance &amp; Validation
+                  </h2>
+                  <p style={{ fontSize: 12, color: T.t3 }}>
+                    LLM-driven compliance audit, formal-style invariant validation, and constraint enforcement results.
+                  </p>
+                </div>
+                {result.session_id && (
+                  <a
+                    href={`${API}/api/session/${result.session_id}/evidence`}
+                    style={{
+                      display: "inline-flex", alignItems: "center", gap: 8,
+                      padding: "10px 16px", borderRadius: T.r1,
+                      background: T.cyanBg, border: `1px solid ${T.cyanBorder}`,
+                      color: T.cyan, fontSize: 12, fontWeight: 600, fontFamily: T.fontMono,
+                      cursor: "pointer", textDecoration: "none",
+                      textTransform: "uppercase", letterSpacing: "0.06em",
+                      flexShrink: 0,
+                      transition: "all 0.15s",
+                    }}
+                    onMouseEnter={e => {
+                      e.currentTarget.style.background = T.cyan;
+                      e.currentTarget.style.color = T.bg0;
+                    }}
+                    onMouseLeave={e => {
+                      e.currentTarget.style.background = T.cyanBg;
+                      e.currentTarget.style.color = T.cyan;
+                    }}
+                  >
+                    <span style={{ fontSize: 14 }}>↓</span>
+                    Evidence Bundle (.zip)
+                  </a>
+                )}
               </div>
 
               {/* TOP ROW: Compliance Score + V-009 Reachability + Pipeline Status */}
