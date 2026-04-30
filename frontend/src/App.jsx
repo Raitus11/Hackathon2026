@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo, Fragment } from "react";
 import { createPortal } from "react-dom";
 import * as d3 from "d3";
 
@@ -349,6 +349,510 @@ function CardHeader({ children, right, style = {} }) {
     </div>
   );
 }
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   ITEM D — MIGRATION SAFETY COMPONENTS
+
+   Renders the migration_safety block from the API response.
+   Schema reference: backend/migration/migration_safety.py
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function MigrationClassBadge({ migrationClass, size = "normal" }) {
+  const cfg = {
+    TCP_CLIENT:        { color: T.green, label: "TCP CLIENT" },
+    BINDINGS:          { color: T.amber, label: "BINDINGS" },
+    SNA_OUT_OF_SCOPE:  { color: T.red,   label: "SNA · OUT OF SCOPE" },
+    PINNED_REVIEW:     { color: T.purple || T.amber, label: "PINNED · REVIEW" },
+  }[migrationClass] || { color: T.t3, label: migrationClass || "UNKNOWN" };
+
+  const padding = size === "small" ? "1px 6px" : "2px 8px";
+  const fontSize = size === "small" ? 10 : 11;
+
+  return (
+    <span style={{
+      display: "inline-flex", alignItems: "center", gap: 4,
+      padding, borderRadius: 4,
+      fontSize, fontWeight: 600, letterSpacing: "0.04em",
+      fontFamily: T.fontMono,
+      color: cfg.color,
+      background: `${cfg.color}15`,
+      border: `1px solid ${cfg.color}30`,
+      whiteSpace: "nowrap",
+    }}>{cfg.label}</span>
+  );
+}
+
+function MigrationClassBreakdown({ summary }) {
+  const cells = [
+    { key: "TCP_CLIENT",       label: "TCP CLIENT",       color: T.green, sub: "supported" },
+    { key: "BINDINGS",         label: "BINDINGS",         color: T.amber, sub: "redeploy first" },
+    { key: "SNA_OUT_OF_SCOPE", label: "SNA · OUT OF SCOPE", color: T.red,   sub: "separate project" },
+    { key: "PINNED_REVIEW",    label: "PINNED · REVIEW",  color: T.purple || T.amber, sub: "manual review" },
+  ];
+
+  const total = summary.total_apps || 1;
+
+  return (
+    <Card delay={0.1}>
+      <CardHeader right={
+        <Badge color={T.cyan}>{summary.total_apps} apps classified</Badge>
+      }>Migration Class Breakdown</CardHeader>
+      <div style={{
+        padding: 16,
+        display: "grid",
+        gridTemplateColumns: "repeat(4, 1fr)",
+        gap: 12,
+      }}>
+        {cells.map(c => {
+          const count = summary.by_class?.[c.key] ?? 0;
+          const pct = ((count / total) * 100).toFixed(0);
+          return (
+            <div key={c.key} style={{
+              padding: "14px 10px",
+              borderRadius: T.r1,
+              background: count > 0 ? `${c.color}10` : T.bg3,
+              border: `1px solid ${count > 0 ? `${c.color}30` : T.border0}`,
+              textAlign: "center",
+            }}>
+              <div style={{
+                fontSize: 28, fontWeight: 700, fontFamily: T.fontDisplay,
+                color: count > 0 ? c.color : T.t3,
+                lineHeight: 1, marginBottom: 6,
+                textShadow: count > 0 ? `0 0 20px ${c.color}40` : "none",
+              }}>{count}</div>
+              <div style={{
+                fontSize: 10, fontWeight: 600, fontFamily: T.fontMono,
+                color: count > 0 ? c.color : T.t3,
+                textTransform: "uppercase", letterSpacing: "0.06em",
+                marginBottom: 4,
+              }}>{c.label}</div>
+              <div style={{
+                fontSize: 10, color: T.t3, fontStyle: "italic",
+              }}>{c.sub} · {pct}%</div>
+            </div>
+          );
+        })}
+      </div>
+    </Card>
+  );
+}
+
+function MigrationSafetyPanel({ migrationSafety }) {
+  const [sortKey, setSortKey] = useState("app_id");
+  const [sortDesc, setSortDesc] = useState(false);
+  const [filterClass, setFilterClass] = useState(null);
+  // Multi-row expansion (Set so multiple rows can be open at once).
+  const [expandedSet, setExpandedSet] = useState(() => new Set());
+  // Virtualization scroll position
+  const scrollRef = useRef(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(480);
+
+  if (!migrationSafety || !migrationSafety.summary) {
+    return (
+      <Card delay={0.1}>
+        <CardHeader>Migration Safety Analysis</CardHeader>
+        <div style={{ padding: 24, textAlign: "center", color: T.t3 }}>
+          Migration safety data unavailable. The architect agent computes this
+          on the final target topology — check the Trace tab for any errors
+          during the architect step.
+        </div>
+      </Card>
+    );
+  }
+
+  const { summary, per_app = [], notes, method } = migrationSafety;
+
+  // ── Filter + sort ───────────────────────────────────────────────────────
+  const filtered = filterClass
+    ? per_app.filter(r => r.migration_class === filterClass)
+    : per_app;
+
+  const sorted = useMemo(() => {
+    const arr = [...filtered];
+    arr.sort((a, b) => {
+      let av = a[sortKey], bv = b[sortKey];
+      if (sortKey === "dependency_cluster") {
+        av = a.dependency_cluster?.length ?? 0;
+        bv = b.dependency_cluster?.length ?? 0;
+      }
+      if (sortKey === "migration_independent") {
+        av = a.migration_independent ? 1 : 0;
+        bv = b.migration_independent ? 1 : 0;
+      }
+      if (av < bv) return sortDesc ? 1 : -1;
+      if (av > bv) return sortDesc ? -1 : 1;
+      return 0;
+    });
+    return arr;
+  }, [filtered, sortKey, sortDesc]);
+
+  // ── Virtualization geometry ─────────────────────────────────────────────
+  // Each row is BASE_ROW_HEIGHT tall when collapsed, + EXPANDED_EXTRA when expanded.
+  // We compute cumulative offsets so each row knows its absolute `top` position.
+  const BASE_ROW_HEIGHT = 36;
+  const EXPANDED_EXTRA = 110;
+  const SCROLL_VIEWPORT_HEIGHT = 480;
+  const BUFFER_ROWS = 8;
+
+  const { rowOffsets, totalHeight } = useMemo(() => {
+    const offsets = new Array(sorted.length);
+    let acc = 0;
+    for (let i = 0; i < sorted.length; i++) {
+      offsets[i] = acc;
+      acc += BASE_ROW_HEIGHT + (expandedSet.has(sorted[i].app_id) ? EXPANDED_EXTRA : 0);
+    }
+    return { rowOffsets: offsets, totalHeight: acc };
+  }, [sorted, expandedSet]);
+
+  // Binary search to find the first row whose top >= scrollTop.
+  // Then walk forward until we exceed scrollTop + viewport.
+  const visibleRange = useMemo(() => {
+    if (sorted.length === 0) return { start: 0, end: 0 };
+
+    // Binary search for first row whose offset >= (scrollTop - buffer-region)
+    const minTop = Math.max(0, scrollTop - BUFFER_ROWS * BASE_ROW_HEIGHT);
+    const maxTop = scrollTop + viewportHeight + BUFFER_ROWS * BASE_ROW_HEIGHT;
+
+    let lo = 0, hi = sorted.length - 1, start = 0;
+    while (lo <= hi) {
+      const mid = (lo + hi) >>> 1;
+      if (rowOffsets[mid] < minTop) { start = mid; lo = mid + 1; }
+      else hi = mid - 1;
+    }
+    // Walk forward to find end
+    let end = start;
+    while (end < sorted.length && rowOffsets[end] < maxTop) end++;
+    return { start, end };
+  }, [sorted, rowOffsets, scrollTop, viewportHeight]);
+
+  // ── Effect: measure viewport height once mounted ────────────────────────
+  useEffect(() => {
+    if (scrollRef.current) {
+      setViewportHeight(scrollRef.current.clientHeight);
+    }
+  }, [sorted.length]);
+
+  // ── Handlers ────────────────────────────────────────────────────────────
+  const toggleSort = (key) => {
+    if (sortKey === key) setSortDesc(!sortDesc);
+    else { setSortKey(key); setSortDesc(false); }
+  };
+
+  const toggleExpand = (appId) => {
+    setExpandedSet(prev => {
+      const next = new Set(prev);
+      if (next.has(appId)) next.delete(appId);
+      else next.add(appId);
+      return next;
+    });
+  };
+
+  const sortIcon = (key) => {
+    if (sortKey !== key) return null;
+    return <span style={{ marginLeft: 4, color: T.cyan }}>{sortDesc ? "▼" : "▲"}</span>;
+  };
+
+  // ── Column config (shared between header and rows) ──────────────────────
+  const columns = [
+    { key: "app_id",                   label: "App ID",        width: "16%", align: "left"   },
+    { key: "target_qm",                label: "Target QM",     width: "18%", align: "left"   },
+    { key: "migration_class",          label: "Class",         width: "20%", align: "left"   },
+    { key: "migration_independent",    label: "Independent",   width: "12%", align: "left"   },
+    { key: "dependency_cluster",       label: "Cluster",       width: "10%", align: "center" },
+    { key: "estimated_drain_window_s", label: "Drain (s)",     width: "12%", align: "right"  },
+    { key: "_expand",                  label: "",              width: "12%", align: "right"  },
+  ];
+
+  // CSS grid template matching the column widths (replaces table layout)
+  const gridTemplate = columns.map(c => c.width).join(" ");
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+
+      <Card delay={0.05} glow={summary.independent_count === summary.total_apps && summary.total_apps > 0 ? T.green : undefined}>
+        <CardHeader right={
+          <Badge color={T.t3} style={{ fontSize: 10 }}>
+            method · {method || "rules_based_v1"}
+          </Badge>
+        }>Migration Safety Analysis</CardHeader>
+        <div style={{ padding: 16 }}>
+          <p style={{ fontSize: 12, color: T.t3, marginBottom: 14, lineHeight: 1.5 }}>
+            Per-app classification + independence analysis. Every app is
+            classified for migration; every app is checked for independent
+            migratability. Click rows to expand reasoning.
+          </p>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12 }}>
+            <Stat
+              label="Total Apps"
+              value={summary.total_apps}
+              color={T.t1}
+              delay={0}
+            />
+            <Stat
+              label="Independently Migratable"
+              value={summary.independent_count}
+              sub={summary.independent_count === summary.total_apps ? "ALL" : `of ${summary.total_apps}`}
+              color={summary.independent_count === summary.total_apps ? T.green : T.amber}
+              delay={0.05}
+            />
+            <Stat
+              label="Co-migration Required"
+              value={summary.non_independent_count}
+              sub={summary.non_independent_count === 0 ? "none" : "review →"}
+              color={summary.non_independent_count === 0 ? T.green : T.amber}
+              delay={0.10}
+            />
+            <Stat
+              label="Max Cluster Size"
+              value={summary.max_dependency_cluster_size}
+              sub={summary.max_dependency_cluster_size === 1 ? "1:1 strict" : "multi-tenant"}
+              color={summary.max_dependency_cluster_size === 1 ? T.green : T.amber}
+              delay={0.15}
+            />
+          </div>
+        </div>
+      </Card>
+
+      <MigrationClassBreakdown summary={summary} />
+
+      {notes && (
+        <Card delay={0.15}>
+          <CardHeader>How This Classification Works</CardHeader>
+          <div style={{
+            padding: "14px 16px",
+            fontSize: 12,
+            color: T.t2,
+            lineHeight: 1.6,
+            fontStyle: "italic",
+          }}>{notes}</div>
+        </Card>
+      )}
+
+      <Card delay={0.2}>
+        <CardHeader right={
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            {expandedSet.size > 0 && (
+              <button
+                onClick={() => setExpandedSet(new Set())}
+                style={{
+                  padding: "3px 8px", fontSize: 10, fontFamily: T.fontMono,
+                  background: T.bg3, border: `1px solid ${T.border1}`,
+                  borderRadius: 4, color: T.t2, cursor: "pointer",
+                  textTransform: "uppercase", letterSpacing: "0.04em",
+                }}
+              >
+                collapse all ({expandedSet.size}) ✕
+              </button>
+            )}
+            {filterClass && (
+              <button
+                onClick={() => setFilterClass(null)}
+                style={{
+                  padding: "3px 8px", fontSize: 10, fontFamily: T.fontMono,
+                  background: T.bg3, border: `1px solid ${T.border1}`,
+                  borderRadius: 4, color: T.t2, cursor: "pointer",
+                  textTransform: "uppercase", letterSpacing: "0.04em",
+                }}
+              >
+                clear filter ({filterClass}) ✕
+              </button>
+            )}
+            <Badge color={T.cyan}>{sorted.length} rows</Badge>
+          </div>
+        }>Per-App Classification</CardHeader>
+
+        {/* ── Header row (sticky in spirit; sits above the scroll container) ── */}
+        <div style={{
+          display: "grid",
+          gridTemplateColumns: gridTemplate,
+          background: T.bg3,
+          borderBottom: `1px solid ${T.border1}`,
+          fontFamily: T.fontMono,
+          fontSize: 10,
+          fontWeight: 600,
+          color: T.t2,
+          textTransform: "uppercase",
+          letterSpacing: "0.06em",
+        }}>
+          {columns.map(col => (
+            <div key={col.key}
+                 onClick={col.key !== "_expand" ? () => toggleSort(col.key) : undefined}
+                 style={{
+                   padding: "10px 12px",
+                   textAlign: col.align,
+                   cursor: col.key !== "_expand" ? "pointer" : "default",
+                   userSelect: "none",
+                 }}>
+              {col.label}
+              {col.key !== "_expand" && sortIcon(col.key)}
+            </div>
+          ))}
+        </div>
+
+        {/* ── Virtualized scroll container ─────────────────────────────────── */}
+        {sorted.length === 0 ? (
+          <div style={{ padding: 24, textAlign: "center", color: T.t3, fontSize: 12 }}>
+            No apps match the current filter.
+          </div>
+        ) : (
+          <div
+            ref={scrollRef}
+            onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
+            style={{
+              height: SCROLL_VIEWPORT_HEIGHT,
+              overflowY: "auto",
+              overflowX: "hidden",
+              position: "relative",
+            }}
+          >
+            {/* Spacer div sets total scroll height — gives correct scrollbar */}
+            <div style={{ height: totalHeight, position: "relative", fontFamily: T.fontMono, fontSize: 12 }}>
+              {sorted.slice(visibleRange.start, visibleRange.end).map((row, idx) => {
+                const i = visibleRange.start + idx;
+                const top = rowOffsets[i];
+                const isExpanded = expandedSet.has(row.app_id);
+                const rowHeight = BASE_ROW_HEIGHT + (isExpanded ? EXPANDED_EXTRA : 0);
+                const stripe = i % 2 === 0 ? T.bg2 : "transparent";
+
+                return (
+                  <div
+                    key={row.app_id}
+                    style={{
+                      position: "absolute",
+                      top, left: 0, right: 0,
+                      height: rowHeight,
+                      borderBottom: `1px solid ${T.border0}`,
+                      background: stripe,
+                      transition: "background 0.1s",
+                    }}
+                  >
+                    {/* The collapsed row, always visible */}
+                    <div
+                      onClick={() => toggleExpand(row.app_id)}
+                      onMouseEnter={e => e.currentTarget.style.background = T.bg3}
+                      onMouseLeave={e => e.currentTarget.style.background = stripe}
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: gridTemplate,
+                        height: BASE_ROW_HEIGHT,
+                        cursor: "pointer",
+                        alignItems: "center",
+                      }}
+                    >
+                      <div style={{ padding: "0 12px", color: T.t1, fontWeight: 500 }}>
+                        {row.app_id}
+                      </div>
+                      <div style={{ padding: "0 12px", color: T.t2 }}>
+                        {row.target_qm}
+                      </div>
+                      <div style={{ padding: "0 12px" }}>
+                        <span onClick={e => { e.stopPropagation(); setFilterClass(row.migration_class); }}>
+                          <MigrationClassBadge migrationClass={row.migration_class} size="small" />
+                        </span>
+                      </div>
+                      <div style={{ padding: "0 12px" }}>
+                        {row.migration_independent ? (
+                          <span style={{ color: T.green, fontWeight: 600 }}>✓ yes</span>
+                        ) : (
+                          <span style={{ color: T.amber, fontWeight: 600 }}>⚠ no</span>
+                        )}
+                      </div>
+                      <div style={{ padding: "0 12px", color: T.t2, textAlign: "center" }}>
+                        {row.dependency_cluster?.length ?? 1}
+                      </div>
+                      <div style={{ padding: "0 12px", color: T.t2, textAlign: "right" }}>
+                        ~{row.estimated_drain_window_s}s
+                      </div>
+                      <div style={{ padding: "0 12px", color: T.cyan, textAlign: "right" }}>
+                        {isExpanded ? "▼ collapse" : "▶ details"}
+                      </div>
+                    </div>
+
+                    {/* Expanded sub-panel (only renders when expanded) */}
+                    {isExpanded && (
+                      <div style={{
+                        background: T.bg3,
+                        padding: "14px 18px",
+                        borderTop: `1px solid ${T.border1}`,
+                        fontSize: 12,
+                        color: T.t2,
+                        lineHeight: 1.6,
+                        height: EXPANDED_EXTRA,
+                        boxSizing: "border-box",
+                        overflow: "hidden",
+                      }}>
+                        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+                          <div>
+                            <div style={{
+                              fontSize: 10, fontWeight: 600, color: T.cyan,
+                              fontFamily: T.fontMono, letterSpacing: "0.06em",
+                              textTransform: "uppercase", marginBottom: 6,
+                            }}>Classification reason</div>
+                            <div style={{ fontStyle: "italic" }}>
+                              {row.migration_class_reason || "—"}
+                            </div>
+                          </div>
+                          <div>
+                            <div style={{
+                              fontSize: 10, fontWeight: 600, color: T.cyan,
+                              fontFamily: T.fontMono, letterSpacing: "0.06em",
+                              textTransform: "uppercase", marginBottom: 6,
+                            }}>Dependency cluster</div>
+                            <div>
+                              {row.dependency_cluster?.length === 1
+                                ? <span style={{ color: T.green }}>independent — {row.dependency_cluster[0]}</span>
+                                : (
+                                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                                    {row.dependency_cluster?.map(a => (
+                                      <span key={a} style={{
+                                        padding: "2px 6px",
+                                        borderRadius: 3,
+                                        background: T.bg2,
+                                        border: `1px solid ${T.border1}`,
+                                        fontSize: 11,
+                                        color: a === row.app_id ? T.cyan : T.t2,
+                                        fontWeight: a === row.app_id ? 600 : 400,
+                                      }}>{a}</span>
+                                    ))}
+                                  </div>
+                                )}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Footer hint — clarifies what virtualization is doing */}
+        {sorted.length > 0 && (
+          <div style={{
+            padding: "8px 16px",
+            background: T.bg3,
+            borderTop: `1px solid ${T.border0}`,
+            fontSize: 10,
+            fontFamily: T.fontMono,
+            color: T.t3,
+            display: "flex", justifyContent: "space-between",
+          }}>
+            <span>
+              showing rows {visibleRange.start + 1}–{Math.min(visibleRange.end, sorted.length)} of {sorted.length} (virtualized)
+            </span>
+            <span>scroll for more</span>
+          </div>
+        )}
+      </Card>
+
+    </div>
+  );
+}
+
 
 function ProgressBar({ value, max = 100, color = T.cyan, height = 4 }) {
   const pct = Math.min((value / max) * 100, 100);
@@ -3851,6 +4355,9 @@ export default function App() {
                   </div>
                 </Card>
               )}
+
+              {/* ── Item D: Migration Safety Analysis ── */}
+              <MigrationSafetyPanel migrationSafety={result.migration_safety} />
             </div>
           )}
 

@@ -52,6 +52,9 @@ class IntelliAIState(TypedDict):
     human_feedback: Optional[str]      # feedback from human rejection
     chat_history: Optional[list]       # full chat conversation [{role, content}] for revision context
     architect_method: Optional[str]    # "llm" or "rules_fallback" — tracks which path was used
+    migration_safety: Optional[dict]   # Item D: per-app migration_class + independence.
+                                       # See backend/migration/migration_safety.py for schema:
+                                       # {summary, per_app, method, notes}
 
     # ── Optimizer output ───────────────────────────────
     optimised_graph: Optional[Any]     # nx.DiGraph

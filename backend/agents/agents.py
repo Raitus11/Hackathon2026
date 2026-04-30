@@ -752,6 +752,31 @@ def architect_agent(state: dict) -> dict:
                 })
         messages.append({"agent": "ARCHITECT", "msg": msg})
 
+        # ── Item D: compute migration_safety on the final target_graph ───
+        # Mutates target_graph in place (writes per-app migration_class,
+        # migration_independent, dependency_cluster, estimated_drain_window_s
+        # onto each app node) and returns the topology-level safety dict.
+        try:
+            from backend.migration.migration_safety import compute_migration_safety
+            migration_safety = compute_migration_safety(target_graph, raw_data)
+            ms_summary = migration_safety["summary"]
+            messages.append({
+                "agent": "ARCHITECT",
+                "msg": (
+                    f"Migration safety: {ms_summary['total_apps']} apps classified — "
+                    f"by_class={ms_summary['by_class']}, "
+                    f"independent={ms_summary['independent_count']}, "
+                    f"max_cluster={ms_summary['max_dependency_cluster_size']}"
+                ),
+            })
+        except Exception as e:
+            logger.warning(f"ARCHITECT: migration_safety computation failed: {e}")
+            migration_safety = None
+            messages.append({
+                "agent": "ARCHITECT",
+                "msg": f"⚠ migration_safety computation failed: {e}",
+            })
+
         return {
             "target_graph": target_graph,
             "adrs": adrs,
@@ -759,6 +784,7 @@ def architect_agent(state: dict) -> dict:
             "architect_method": method,
             "feedback_directives": directives if directives else None,
             "messages": messages,
+            "migration_safety": migration_safety,
         }
     except Exception as e:
         logger.exception(f"ARCHITECT: Crashed — {e}")
@@ -3041,7 +3067,26 @@ def _generate_target_csvs(G: nx.DiGraph, state: dict) -> dict:
     csvs["MQ_Raw_Data_Target"] = _generate_unified_target_csv(G, state)
     logger.info("PROVISIONER: unified CSV done.")
 
+    # ── Item D: per-app migration classification CSV ──────────────────────
+    csvs["target_migration_classification"] = _generate_migration_csv(state)
+
     return csvs
+
+
+def _generate_migration_csv(state: dict) -> str:
+    """Per-app migration classification CSV for Item D evidence bundle.
+
+    Reads state["migration_safety"], populated by architect_agent.
+    Returns header-only CSV if migration_safety is missing (defensive).
+    """
+    safety = state.get("migration_safety")
+    if not safety:
+        return (
+            "app_id,target_qm,migration_class,migration_class_reason,"
+            "migration_independent,dependency_cluster,estimated_drain_window_s\n"
+        )
+    from backend.migration.migration_safety import to_csv_string
+    return to_csv_string(safety)
 
 
 def _generate_unified_target_csv(G: nx.DiGraph, state: dict) -> str:

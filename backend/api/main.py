@@ -269,6 +269,7 @@ def _build_response(session_id: str, result: dict) -> dict:
         "human_aborted":         result.get("human_aborted", False),
         "architect_method":      result.get("architect_method"),
         "migration_plan":        result.get("migration_plan"),
+        "migration_safety":      result.get("migration_safety"),  # Item D
         "topology_diff":         result.get("topology_diff"),
         "as_is_subgraphs":      result.get("as_is_subgraphs", []),
         "target_subgraphs":     result.get("target_subgraphs", []),
