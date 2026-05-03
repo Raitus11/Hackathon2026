@@ -854,6 +854,168 @@ function MigrationSafetyPanel({ migrationSafety }) {
 }
 
 
+function PhaseScopeModal({ open, onClose }) {
+  if (!open) return null;
+
+  // Items deliberately kept short. Order: most-likely-to-be-asked first.
+  // Each item has a one-line claim and a one-line "what we DO instead".
+  const items = [
+    {
+      label: "Real MQ pods on OCP",
+      not: "We do not provision running queue managers in Phase 1.",
+      do_:  "We produce target topology + MQSC scripts. Phase 2 deploys.",
+    },
+    {
+      label: "Live cutover execution",
+      not: "We do not quiesce, drain, or switch over real traffic.",
+      do_:  "We surface per-app drain windows and migration classes. Phase 2 executes.",
+    },
+    {
+      label: "Formal verification (TLA+)",
+      not: "We do not mechanically prove migration correctness in Phase 1.",
+      do_:  "We state PerAppRollbackLocality informally; Phase 2 specifies it in TLA+.",
+    },
+    {
+      label: "Provably optimal channel set",
+      not: "We do not return the global optimum.",
+      do_:  "Charikar 1999 2-approximation, with the bound stated in the Solver tab.",
+    },
+    {
+      label: "AI-driven channel selection",
+      not: "The LLM does not choose channels. AI assists the architect; deterministic engines do the load-bearing work.",
+      do_:  "Steiner solver picks channels. LLM proposes app→QM clustering. Constraint engine is authoritative.",
+    },
+    {
+      label: "SNA / SSL-pinning detection",
+      not: "Phase 1 cannot auto-detect SNA transports or CHLAUTH-pinned apps.",
+      do_:  "The taxonomy includes both classes. Phase 2 ingests CHLAUTH and SSLPEERMAP.",
+    },
+    {
+      label: "Cross-QM XA two-phase commit",
+      not: "Out of scope for Phase 1 and Phase 2.",
+      do_:  "Documented as a constraint; cutover scheduled in XA-quiescent windows.",
+    },
+  ];
+
+  // Stop propagation on the inner panel so clicking inside doesn't close
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed", inset: 0, zIndex: 1000,
+        background: "rgba(0,0,0,0.7)",
+        display: "flex", alignItems: "center", justifyContent: "center",
+        padding: 24,
+        animation: "fadeIn 0.2s ease-out",
+      }}
+    >
+      <div
+        onClick={e => e.stopPropagation()}
+        style={{
+          maxWidth: 760, width: "100%",
+          maxHeight: "85vh", overflowY: "auto",
+          background: T.bg1,
+          border: `1px solid ${T.border1}`,
+          borderRadius: T.r2,
+          boxShadow: T.shadow3,
+          animation: "fadeUp 0.3s ease-out",
+        }}
+      >
+        {/* Header */}
+        <div style={{
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          padding: "18px 22px",
+          borderBottom: `1px solid ${T.border1}`,
+          background: `${T.bg3}40`,
+        }}>
+          <div>
+            <div style={{
+              fontSize: 14, fontWeight: 600, color: T.t1,
+              fontFamily: T.fontDisplay,
+            }}>What We Are NOT Doing in Phase 1</div>
+            <div style={{
+              fontSize: 11, color: T.t3, marginTop: 3,
+              fontFamily: T.fontMono, letterSpacing: "0.04em",
+            }}>scope honesty · seven items</div>
+          </div>
+          <button
+            onClick={onClose}
+            style={{
+              padding: "6px 10px", fontSize: 14,
+              background: "transparent", border: `1px solid ${T.border1}`,
+              borderRadius: 4, color: T.t2, cursor: "pointer",
+              fontFamily: T.fontMono,
+            }}
+          >✕</button>
+        </div>
+
+        {/* Items */}
+        <div style={{ padding: "18px 22px" }}>
+          <p style={{
+            fontSize: 12, color: T.t3, lineHeight: 1.6, marginBottom: 18,
+            fontStyle: "italic",
+          }}>
+            Phase 1 produces a verifiable target topology, MQSC scripts,
+            and forensic evidence from a CSV. It does not execute migrations,
+            run real MQ pods, or formally verify rollback safety. Below is
+            the explicit list — what we don't do, and what we do instead.
+            If you ask "did you consider X?" and X isn't here, please tell us.
+          </p>
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            {items.map((item, i) => (
+              <div key={i} style={{
+                padding: "12px 14px",
+                background: T.bg2,
+                border: `1px solid ${T.border0}`,
+                borderRadius: T.r1,
+                borderLeft: `3px solid ${T.cyan}`,
+              }}>
+                <div style={{
+                  fontSize: 11, fontWeight: 600,
+                  fontFamily: T.fontMono,
+                  color: T.cyan,
+                  textTransform: "uppercase",
+                  letterSpacing: "0.06em",
+                  marginBottom: 6,
+                }}>{item.label}</div>
+                <div style={{
+                  fontSize: 12, color: T.t1, lineHeight: 1.5,
+                  marginBottom: 4,
+                }}>
+                  <span style={{ color: T.amber, fontWeight: 600 }}>NOT </span>
+                  {item.not}
+                </div>
+                <div style={{
+                  fontSize: 12, color: T.t2, lineHeight: 1.5,
+                  fontStyle: "italic",
+                }}>
+                  <span style={{ color: T.green, fontStyle: "normal", fontWeight: 600 }}>DO </span>
+                  {item.do_}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div style={{
+            marginTop: 18,
+            padding: "10px 14px",
+            background: `${T.bg3}80`,
+            border: `1px solid ${T.border0}`,
+            borderRadius: T.r1,
+            fontSize: 11, color: T.t3, lineHeight: 1.5,
+            fontFamily: T.fontMono,
+          }}>
+            Phase 1 is a defensible blueprint. Phase 2 executes it safely.
+            Conflating the two would weaken both.
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
 function ProgressBar({ value, max = 100, color = T.cyan, height = 4 }) {
   const pct = Math.min((value / max) * 100, 100);
   return (
@@ -2822,6 +2984,9 @@ export default function App() {
   // So we track the user's decision locally — this is the SOURCE OF TRUTH.
   const [userDecision, setUserDecision] = useState(null); // null | "approved" | "rejected" | "aborted"
 
+  // Phase 1 scope modal (Item A)
+  const [scopeModalOpen, setScopeModalOpen] = useState(false);
+
   // Inject styles once
   useEffect(() => {
     const existing = document.getElementById("intelliai-styles");
@@ -3745,13 +3910,26 @@ export default function App() {
                                 const mime = isJson ? "application/json" : "text/csv";
                                 const lines = content.trim().split("\n");
                                 const rowCount = isJson ? null : lines.length - 1;
-                                const displayName = name.startsWith("mqsc_") ? name.replace("mqsc_", "") + " (MQSC)" : name;
+                                // For mqsc_ keys: strip prefix; if it's a diff, also strip _diff
+                                // and tag visually so target/diff are unmistakable.
+                                const isMqsc = name.startsWith("mqsc_");
+                                const isDiff = isMqsc && name.endsWith("_diff");
+                                let displayName;
+                                if (isDiff) {
+                                  displayName = name.replace("mqsc_", "").replace(/_diff$/, "") + " (DIFF)";
+                                } else if (isMqsc) {
+                                  displayName = name.replace("mqsc_", "") + " (TARGET)";
+                                } else {
+                                  displayName = name;
+                                }
                                 return (
                                   <div key={name} style={{
                                     padding: "12px 16px",
                                     borderBottom: idx < group.files.length - 1 ? `1px solid ${T.border0}` : "none",
                                     display: "flex", alignItems: "center", justifyContent: "space-between",
                                     gap: 12,
+                                    // Subtle left border to visually distinguish diff rows
+                                    borderLeft: isDiff ? `3px solid ${T.green}` : isMqsc ? `3px solid ${T.amber}` : "none",
                                   }}>
                                     <div style={{ flex: 1, minWidth: 0 }}>
                                       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
@@ -3760,13 +3938,14 @@ export default function App() {
                                         </span>
                                         {rowCount != null && <Badge color={T.t3} style={{ fontSize: 9 }}>{rowCount} rows</Badge>}
                                         {isJson && <Badge color={T.cyan} style={{ fontSize: 9 }}>JSON</Badge>}
-                                        {name.startsWith("mqsc_") && <Badge color={T.amber} style={{ fontSize: 9 }}>MQSC</Badge>}
+                                        {isMqsc && !isDiff && <Badge color={T.amber} style={{ fontSize: 9 }}>MQSC · TARGET</Badge>}
+                                        {isDiff && <Badge color={T.green} style={{ fontSize: 9 }}>MQSC · DIFF</Badge>}
                                       </div>
                                       <div style={{ fontSize: 10, color: T.t4, fontFamily: T.fontMono, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                                         {lines[0]?.slice(0, 80)}{lines[0]?.length > 80 ? "…" : ""}
                                       </div>
                                     </div>
-                                    <DownloadButton label="Download" onClick={() => downloadFile(content, displayName.replace(" (MQSC)", "") + ext, mime)} />
+                                    <DownloadButton label="Download" onClick={() => downloadFile(content, displayName.replace(/ \((MQSC|TARGET|DIFF)\)/g, "") + ext, mime)} />
                                   </div>
                                 );
                               })}
@@ -4418,8 +4597,43 @@ export default function App() {
           {!result && tab !== "upload" && !loading && (
             <EmptyState icon="◇" message="No analysis run yet. Go to the Upload tab and upload your MQ Raw Data file." />
           )}
+
+          {/* ── Item A: Phase 1 Scope footer link ── */}
+          <div style={{
+            marginTop: 32, paddingTop: 16,
+            borderTop: `1px solid ${T.border0}`,
+            display: "flex", justifyContent: "flex-end",
+            fontSize: 10, fontFamily: T.fontMono,
+            color: T.t3, letterSpacing: "0.04em",
+          }}>
+            <button
+              onClick={() => setScopeModalOpen(true)}
+              style={{
+                background: "transparent",
+                border: "none",
+                color: T.t3,
+                cursor: "pointer",
+                fontSize: 10,
+                fontFamily: T.fontMono,
+                letterSpacing: "0.04em",
+                padding: "4px 6px",
+                textTransform: "uppercase",
+                transition: "color 0.15s",
+              }}
+              onMouseEnter={e => e.currentTarget.style.color = T.cyan}
+              onMouseLeave={e => e.currentTarget.style.color = T.t3}
+            >
+              · Phase 1 Scope · what we are NOT doing
+            </button>
+          </div>
         </div>
       </div>
+
+      {/* Phase 1 Scope modal — rendered at root so it overlays everything */}
+      <PhaseScopeModal
+        open={scopeModalOpen}
+        onClose={() => setScopeModalOpen(false)}
+      />
     </div>
   );
 }

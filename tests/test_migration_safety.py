@@ -6,18 +6,19 @@ Unit tests for backend/migration/migration_safety.py.
 Tests cover:
   - classify_app: TCP_CLIENT default, BINDINGS heuristic for mainframe hosting
   - compute_migration_safety: per-app dicts, summary, graph mutation, CSV export
+  - _classify_apps_pure: read-only sibling that does NOT mutate the graph
+  - Drain-window cap (Diego: prevent absurd estimates on outlier QMs)
+  - CSV injection defense (Aisha: OWASP formula injection)
   - Edge cases: empty graph, no app metadata
 """
-import sys
-import os
-sys.path.insert(0, "/home/claude/item_d")
-
 import networkx as nx
 
 from backend.migration.migration_safety import (
     classify_app,
     compute_migration_safety,
+    _classify_apps_pure,
     to_csv_string,
+    _csv_safe,
     CLASS_TCP_CLIENT,
     CLASS_BINDINGS,
     CLASS_SNA_OUT_OF_SCOPE,
@@ -275,8 +276,171 @@ def test_to_csv_string_empty():
     assert len(lines) == 1  # just the header
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Round 1 — Drain-window cap (Diego)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_drain_window_capped_at_120s():
+    """A QM with 50 outbound channels would compute to 10 + 5*50 = 260s
+    without the cap. With cap = 120, the result must be 120."""
+    G = nx.DiGraph()
+    G.add_node("QM_BUSY", type="qm")
+    G.add_node("APP_BUSY", type="app")
+    G.add_edge("APP_BUSY", "QM_BUSY", rel="connects_to")
+    # 50 outbound channels — uncapped formula = 260s
+    for i in range(50):
+        target = f"QM_TARGET_{i:02d}"
+        G.add_node(target, type="qm")
+        G.add_edge("QM_BUSY", target, rel="channel")
+
+    result = compute_migration_safety(G, {"app_metadata": {}})
+    drain = result["per_app"][0]["estimated_drain_window_s"]
+    assert drain == 120, f"Expected drain capped at 120s, got {drain}s"
+
+
+def test_drain_window_below_cap_unchanged():
+    """A QM with a few channels should produce a number below the cap,
+    and the cap should not artificially inflate it."""
+    G = nx.DiGraph()
+    G.add_node("QM_SMALL", type="qm")
+    G.add_node("APP_SMALL", type="app")
+    G.add_edge("APP_SMALL", "QM_SMALL", rel="connects_to")
+    # 3 outbound channels: 10 + 5*3 = 25s, well below 120 cap
+    for i in range(3):
+        target = f"QM_T{i}"
+        G.add_node(target, type="qm")
+        G.add_edge("QM_SMALL", target, rel="channel")
+
+    result = compute_migration_safety(G, {"app_metadata": {}})
+    drain = result["per_app"][0]["estimated_drain_window_s"]
+    assert drain == 25, f"Expected 25s for 3 channels, got {drain}s"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Round 1 — CSV injection defense (Aisha)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_csv_safe_neutralizes_formula_prefix():
+    """Cells starting with =, +, -, @ are formula triggers in Excel.
+    The sanitizer must prefix a single quote so Excel treats them as text."""
+    assert _csv_safe("=cmd|'/c calc'!A1").startswith("'=")
+    assert _csv_safe("+1+1").startswith("'+")
+    assert _csv_safe("-2*3").startswith("'-")
+    assert _csv_safe("@SUM(A1:A10)").startswith("'@")
+
+
+def test_csv_safe_passthrough_for_normal_values():
+    """Normal cells must NOT be modified."""
+    assert _csv_safe("APP_001") == "APP_001"
+    assert _csv_safe("QM_A042") == "QM_A042"
+    assert _csv_safe("TCP_CLIENT") == "TCP_CLIENT"
+    assert _csv_safe("Default: assumed TCP_CLIENT.") == "Default: assumed TCP_CLIENT."
+    # Numbers and bools still pass through as their str() form
+    assert _csv_safe(42) == "42"
+    assert _csv_safe(True) == "True"
+
+
+def test_csv_safe_handles_none_and_empty():
+    assert _csv_safe(None) == ""
+    assert _csv_safe("") == ""
+
+
+def test_to_csv_string_sanitizes_injected_classification_reason():
+    """Threat model: an attacker controls app_metadata.hosting_type which
+    flows through into migration_class_reason. They set it to a value
+    starting with '=' to inject a formula. The CSV writer must defang it.
+    """
+    G = nx.DiGraph()
+    G.add_node("QM_X", type="qm")
+    G.add_node("APP_EVIL", type="app")
+    G.add_edge("APP_EVIL", "QM_X", rel="connects_to")
+
+    # Even though the current heuristic doesn't propagate hosting_type
+    # verbatim into the reason, future Phase 2 paths might. Test that
+    # ANY '=' in a row value gets sanitized.
+    result = compute_migration_safety(G, {"app_metadata": {}})
+    # Inject an evil reason directly into the safety dict (simulating a
+    # future code path where reason flows from external data)
+    evil = "=cmd|'/c calc'!A1"
+    result["per_app"][0]["migration_class_reason"] = evil
+
+    csv_str = to_csv_string(result)
+    # The sanitized form (single-quote-prefixed) MUST appear
+    assert "'" + evil in csv_str, f"Sanitized form not found in CSV: {csv_str!r}"
+    # The cell, when split out, must START with a single quote — not '='
+    # (parse the CSV row to be sure)
+    import csv as csv_mod
+    from io import StringIO
+    rows = list(csv_mod.reader(StringIO(csv_str)))
+    # Header is row 0, evil app is row 1, reason is column 3
+    reason_cell = rows[1][3]
+    assert reason_cell.startswith("'="), (
+        f"Reason cell must be prefixed with single quote to neutralize the formula. "
+        f"Got: {reason_cell!r}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Round 1 — Pure function (Eleanor)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_classify_apps_pure_does_not_mutate_graph():
+    """_classify_apps_pure must be read-only on the graph. It returns the
+    safety dict but does NOT write migration_class etc. onto graph nodes.
+    """
+    G = _build_simple_graph()
+    raw = {"app_metadata": {"APP_A": {"hosting_type": "MAINFRAME"}}}
+
+    # Snapshot node attributes before
+    before = {n: dict(d) for n, d in G.nodes(data=True)}
+
+    result = _classify_apps_pure(G, raw)
+
+    # Result is correct
+    assert result["summary"]["total_apps"] == 3
+    assert any(r["migration_class"] == CLASS_BINDINGS for r in result["per_app"])
+
+    # But graph is UNCHANGED
+    after = {n: dict(d) for n, d in G.nodes(data=True)}
+    assert before == after, (
+        f"Graph nodes were mutated by _classify_apps_pure!\n"
+        f"Before: {before}\n"
+        f"After:  {after}"
+    )
+
+    # Specifically: APP_A node must NOT have migration_class
+    assert "migration_class" not in G.nodes["APP_A"]
+
+
+def test_compute_migration_safety_does_mutate_graph():
+    """The public compute_migration_safety MUST mutate (this is its job)."""
+    G = _build_simple_graph()
+    raw = {"app_metadata": {"APP_A": {"hosting_type": "MAINFRAME"}}}
+
+    compute_migration_safety(G, raw)
+
+    # APP_A node should now have migration_class
+    assert G.nodes["APP_A"]["migration_class"] == CLASS_BINDINGS
+
+
+def test_pure_and_annotating_return_same_dict():
+    """compute_migration_safety should return identical data to
+    _classify_apps_pure for the same input — they share the computation.
+    """
+    # Use two separate graph copies because compute_migration_safety mutates
+    G1 = _build_simple_graph()
+    G2 = _build_simple_graph()
+    raw = {"app_metadata": {}}
+
+    pure_result = _classify_apps_pure(G1, raw)
+    annotating_result = compute_migration_safety(G2, raw)
+
+    assert pure_result == annotating_result
+
+
 if __name__ == "__main__":
     # Run all tests
+    import sys
     import inspect
     tests = [(name, obj) for name, obj in globals().items()
              if name.startswith("test_") and callable(obj)]

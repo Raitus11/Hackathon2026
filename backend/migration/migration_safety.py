@@ -170,10 +170,15 @@ ALL_CLASSES = (CLASS_TCP_CLIENT, CLASS_BINDINGS, CLASS_SNA_OUT_OF_SCOPE, CLASS_P
 # BINDINGS with the heuristic reason.
 _MAINFRAME_HOSTING_TOKENS = ("MAINFRAME", "Z/OS", "ZOS", "Z OS")
 
-# Drain-window cost model (intentionally rough — see module docstring)
+# Drain-window cost model (intentionally rough — see module docstring).
+# Constants 10/5/2 are gut-tuned, not calibrated against production drain
+# rates. The cap exists to prevent absurd estimates on outlier QMs that
+# own hundreds of queues; operational planning for long-tail QMs happens
+# outside this estimate.
 _DRAIN_BASE_S = 10
 _DRAIN_PER_OUTBOUND_CHANNEL_S = 5
 _DRAIN_PER_LOCAL_QUEUE_S = 2
+_DRAIN_CAP_S = 120
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -267,12 +272,21 @@ def _compute_drain_window_s(
     qm_outbound: dict[str, list[str]],
     qm_local_q_count: dict[str, int],
 ) -> int:
-    """Rough drain-window estimate. See module docstring."""
-    return (
+    """Rough drain-window estimate, capped at 120s. See module docstring.
+
+    The cap exists because the formula scales linearly in channel/queue
+    count; on outlier QMs that own hundreds of queues, an uncapped
+    estimate would read as 400+ seconds and mislead an operator into
+    thinking single-app cutover takes half an hour. Long-tail QMs go
+    through scheduled migration windows, not flash cutover, and that
+    operational planning happens outside this estimate.
+    """
+    raw = (
         _DRAIN_BASE_S
         + _DRAIN_PER_OUTBOUND_CHANNEL_S * len(qm_outbound.get(qm_id, []))
         + _DRAIN_PER_LOCAL_QUEUE_S * qm_local_q_count.get(qm_id, 0)
     )
+    return min(raw, _DRAIN_CAP_S)
 
 
 def _compute_dependency_cluster(
@@ -295,16 +309,59 @@ def compute_migration_safety(
     G: nx.DiGraph,
     raw_data: Optional[dict] = None,
 ) -> dict:
-    """Compute the migration_safety block for the API response.
+    """Compute the migration_safety block AND annotate the graph.
 
-    Also writes per-app fields onto the graph nodes (mutates G in place):
-      G.nodes[app_id]["migration_class"]
-      G.nodes[app_id]["migration_class_reason"]
-      G.nodes[app_id]["migration_independent"]
-      G.nodes[app_id]["dependency_cluster"]
-      G.nodes[app_id]["estimated_drain_window_s"]
+    This is the **public** function callers use — it does both the pure
+    classification (returns the dict) and the side-effect (writes per-app
+    fields onto graph nodes). The split is intentional:
 
-    Returns the {summary, per_app, method, notes} dict to plumb into state.
+      - `_classify_apps_pure` is the pure computation: read-only, returns
+        the {summary, per_app, method, notes} dict. No mutation. Safe for
+        unit testing in isolation, safe to call multiple times, safe to
+        call on a graph snapshot you do not own.
+
+      - This function (`compute_migration_safety`) calls the pure one and
+        then writes the per-app fields onto graph node attributes for
+        downstream consumers (frontend, CSV export, evidence bundle).
+
+    The combined function is what `architect_agent` calls. Tests that
+    care about pure behavior call `_classify_apps_pure` directly.
+
+    Mutation surface (per app node `app_id` in G.nodes):
+      - migration_class
+      - migration_class_reason
+      - migration_independent
+      - dependency_cluster
+      - estimated_drain_window_s
+    """
+    safety = _classify_apps_pure(G, raw_data)
+
+    # Annotate graph nodes with the per-app fields
+    for row in safety.get("per_app", []):
+        app_id = row["app_id"]
+        if app_id in G.nodes:
+            G.nodes[app_id]["migration_class"] = row["migration_class"]
+            G.nodes[app_id]["migration_class_reason"] = row["migration_class_reason"]
+            G.nodes[app_id]["migration_independent"] = row["migration_independent"]
+            G.nodes[app_id]["dependency_cluster"] = row["dependency_cluster"]
+            G.nodes[app_id]["estimated_drain_window_s"] = row["estimated_drain_window_s"]
+
+    return safety
+
+
+def _classify_apps_pure(
+    G: nx.DiGraph,
+    raw_data: Optional[dict] = None,
+) -> dict:
+    """Pure classification: read G + raw_data, return the safety dict.
+
+    Does NOT mutate G. Does NOT write to disk. Read-only and idempotent.
+    Use this directly when you need the data without the side-effect
+    (e.g. in unit tests, in alternative renderers, in Phase 2 pipelines
+    that handle annotation differently).
+
+    Returns the same {summary, per_app, method, notes} dict that
+    `compute_migration_safety` returns.
     """
     raw_data = raw_data or {}
     app_metadata_all = raw_data.get("app_metadata", {}) or {}
@@ -344,14 +401,6 @@ def compute_migration_safety(
         independent = (len(cluster) == 1)
         drain_s = _compute_drain_window_s(app_id, qm_id, qm_outbound, qm_local_q_count)
 
-        # Mutate the graph node so UI / CSV / graph_to_dict pick this up
-        if app_id in G.nodes:
-            G.nodes[app_id]["migration_class"] = cls
-            G.nodes[app_id]["migration_class_reason"] = reason
-            G.nodes[app_id]["migration_independent"] = independent
-            G.nodes[app_id]["dependency_cluster"] = cluster
-            G.nodes[app_id]["estimated_drain_window_s"] = drain_s
-
         per_app.append({
             "app_id": app_id,
             "target_qm": qm_id,
@@ -384,12 +433,16 @@ def compute_migration_safety(
         "SNA_OUT_OF_SCOPE and PINNED_REVIEW classes exist in the taxonomy but "
         "are not auto-populated in Phase 1 — they require richer signal "
         "(CHLAUTH dumps, SSLPEERMAP rules, app-config audit) which Phase 2 "
-        "will ingest. Independence is verified at the blueprint level: under "
-        "strict 1:1 app-to-QM ownership, every app is independent of every "
-        "other app. Phase 2 verifies this as the PerAppRollbackLocality "
-        "invariant in TLA+. Drain-window estimates are rough budgets, not "
-        "live measurements — Phase 2 measures real drain rates via "
-        "DISPLAY QSTATUS during cutover."
+        "will ingest. Read counts of zero on those two classes as 'undetected, "
+        "not zero' — Phase 1 has no data to detect them. Independence is "
+        "verified at the blueprint level: under strict 1:1 app-to-QM ownership, "
+        "every app is independent of every other app *with respect to QM "
+        "locality only*. Two apps on different QMs can still share clustered "
+        "DLQs, common authorization namespaces, or CHLAUTH groupings — Phase 2 "
+        "ingests those signals to tighten the claim. Phase 2 verifies "
+        "PerAppRollbackLocality formally in TLA+. Drain-window estimates are "
+        "rough budgets capped at 120 seconds, not live measurements — Phase 2 "
+        "measures real drain rates via DISPLAY QSTATUS during cutover."
     )
 
     logger.info(
@@ -410,6 +463,29 @@ def compute_migration_safety(
 # CSV export
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _csv_safe(value) -> str:
+    """Defend against CSV-injection attacks.
+
+    A cell whose value starts with =, +, -, or @ is interpreted by Excel
+    (and by some other spreadsheet software) as a formula. If the cell
+    content originates from user-controlled data — for example an
+    `app_metadata` field harvested from a third-party CSV — an attacker
+    could supply `=cmd|'/c calc'!A1` which opens calc when an analyst
+    later opens our CSV in Excel.
+
+    Sanitization: prefix any such cell with a single quote. The single
+    quote is consumed by Excel as a "treat as text" hint and isn't
+    rendered in the visible cell, so analysts see the original value
+    minus the leading quote — but the formula is neutralized.
+
+    See OWASP "CSV Injection" (a.k.a. Formula Injection).
+    """
+    s = str(value) if value is not None else ""
+    if s and s[0] in ("=", "+", "-", "@"):
+        return "'" + s
+    return s
+
+
 def to_csv_string(safety: dict) -> str:
     """Serialize the per_app block as a CSV string.
 
@@ -418,6 +494,9 @@ def to_csv_string(safety: dict) -> str:
 
     dependency_cluster is rendered as a pipe-separated list of app_ids
     (not comma-separated, because we use comma as the field delimiter).
+
+    All cell values pass through `_csv_safe` to defend against CSV
+    injection — see that helper's docstring for the threat model.
     """
     import csv
     from io import StringIO
@@ -435,12 +514,12 @@ def to_csv_string(safety: dict) -> str:
     ])
     for row in safety.get("per_app", []):
         writer.writerow([
-            row["app_id"],
-            row["target_qm"],
-            row["migration_class"],
-            row["migration_class_reason"],
+            _csv_safe(row["app_id"]),
+            _csv_safe(row["target_qm"]),
+            _csv_safe(row["migration_class"]),
+            _csv_safe(row["migration_class_reason"]),
             "true" if row["migration_independent"] else "false",
-            "|".join(row["dependency_cluster"]),
+            _csv_safe("|".join(row["dependency_cluster"])),
             row["estimated_drain_window_s"],
         ])
     return out.getvalue()

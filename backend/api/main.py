@@ -625,6 +625,11 @@ def download_evidence_bundle(session_id: str):
                 v.get("rule") == "REQUIRED_PAIR_REACHABILITY"
                 for v in (state.get("constraint_violations") or [])
             ),
+            "migration_safety": {
+                "total_apps": ((state.get("migration_safety") or {}).get("summary") or {}).get("total_apps"),
+                "by_class": ((state.get("migration_safety") or {}).get("summary") or {}).get("by_class"),
+                "independent_count": ((state.get("migration_safety") or {}).get("summary") or {}).get("independent_count"),
+            },
         },
         "files": [
             "manifest.json",
@@ -637,6 +642,7 @@ def download_evidence_bundle(session_id: str):
             "audit_log.txt",
             "constraint_violations.json",
             "mqsc_commands.txt",
+            "target_migration_classification.csv",
         ],
         "provenance": {
             "generator": "IntelliAI Phase 1 — MQ-TITAN",
@@ -732,6 +738,29 @@ def download_evidence_bundle(session_id: str):
     else:
         mqsc_commands_txt = "* No MQSC scripts were generated in this session.\n"
 
+    # Migration classification CSV — comes from target_csvs (provisioner output).
+    # If provisioner ran, target_csvs has a key 'target_migration_classification'
+    # containing the CSV string. If not (e.g. session aborted before approval),
+    # we fall back to the per-app data still present in state["migration_safety"].
+    migration_csv = ""
+    target_csvs = state.get("target_csvs") or {}
+    if "target_migration_classification" in target_csvs:
+        migration_csv = target_csvs["target_migration_classification"]
+    elif state.get("migration_safety"):
+        # Provisioner didn't run, but architect produced migration_safety.
+        # Generate the CSV directly from the saved state.
+        try:
+            from backend.migration.migration_safety import to_csv_string
+            migration_csv = to_csv_string(state["migration_safety"])
+        except Exception as e:
+            migration_csv = f"# Failed to generate migration classification: {e}\n"
+    else:
+        migration_csv = (
+            "app_id,target_qm,migration_class,migration_class_reason,"
+            "migration_independent,dependency_cluster,estimated_drain_window_s\n"
+            "# No migration_safety data available for this session.\n"
+        )
+
     # Build all-content dict, sanitise once
     raw_files = {
         "manifest.json":              json.dumps(manifest, indent=2, default=str),
@@ -744,6 +773,7 @@ def download_evidence_bundle(session_id: str):
         "audit_log.txt":              audit_log_txt,
         "constraint_violations.json": json.dumps(sanitise(state.get("constraint_violations") or []), indent=2, default=str),
         "mqsc_commands.txt":          mqsc_commands_txt,
+        "target_migration_classification.csv": migration_csv,
     }
 
     # Write zip in memory
